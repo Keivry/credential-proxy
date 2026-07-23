@@ -102,6 +102,8 @@ class LlmMixin:
                                 """flush 内容作为 SSE 事件并清空 content_parts。"""
                                 nonlocal content_parts
                                 if c or fr:
+                                    if c:
+                                        c = self._restore(c, active_t2p)
                                     await resp.write(
                                         _mk_sse_event(c, fr).encode(),
                                     )
@@ -130,7 +132,7 @@ class LlmMixin:
                                         if payload.startswith(" "):
                                             payload = payload[1:]
 
-                                        # [DONE] 标记：先 flush 残留
+                                        # [DONE] 标记：先 flush 累积内容
                                         if payload.strip() == "[DONE]":
                                             joined = "".join(content_parts)
                                             await _flush(joined)
@@ -150,7 +152,7 @@ class LlmMixin:
                                             )
 
                                             if "content" not in delta:
-                                                # 非 content 事件：先 flush hold
+                                                # 非 content 事件：先 flush 累积内容
                                                 joined = "".join(content_parts)
                                                 await _flush(joined)
                                                 await resp.write(
@@ -188,6 +190,9 @@ class LlmMixin:
 
                                             if finish_reason:
                                                 joined = "".join(content_parts)
+                                                joined = self._restore(
+                                                    joined, active_t2p,
+                                                )
                                                 await resp.write(
                                                     _mk_sse_event(
                                                         joined, finish_reason,

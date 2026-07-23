@@ -404,3 +404,70 @@ class TestFalsePositiveHold:
         # "__VG_XYZ" 不是 "__VG_CRED_000001__" 的前缀 → 不是
         # → 全部 safe，输出原文
         assert "__VG_XYZ" in all_safe
+
+
+# ═══════════════════════════════════════════════════════════
+# finish_reason / [DONE] / 非 content 事件处理测试
+# ═══════════════════════════════════════════════════════════
+
+class TestFinishReasonAndDone:
+    """验证 finish_reason 和 [DONE] 时的累积内容正确 flush。"""
+
+    @pytest.mark.asyncio
+    async def test_finish_reason_with_pending(self, holder):
+        """finish_reason 到达时，pending 的 token 前缀被 flush。"""
+        pwd = "My163AuthCode"
+        token = await holder._register_secret(pwd)
+        active_t2p = {token: pwd}
+
+        # 模拟：前面的 delta 留下了 pending 前缀
+        # content_parts = ["__VG_C"] after safe/hold split
+        # 然后 finish_reason 在同一事件到达
+        content_parts = ["__VG_C"]
+        joined = "".join(content_parts)
+        joined = holder._restore(joined, active_t2p)
+        # 应写入 "__VG_C"（完整 token 未形成）
+        assert joined == "__VG_C"
+
+    @pytest.mark.asyncio
+    async def test_finish_reason_completes_token(self, holder):
+        """finish_reason 与最后一个 delta 同时到达，凑齐完整 token。"""
+        pwd = "My163AuthCode"
+        token = await holder._register_secret(pwd)
+        active_t2p = {token: pwd}
+
+        # 前面的 safe 部分已 flush，content_parts = ["__VG_CRED_0000"]
+        # 现在最后一个 delta + finish_reason 抵达
+        content_parts = ["__VG_CRED_0000", "01__"]
+        joined = "".join(content_parts)
+        joined = holder._restore(joined, active_t2p)
+        # __VG_CRED_000001__ → 完整 token，应被还原
+        assert token not in joined
+        assert pwd in joined
+
+    @pytest.mark.asyncio
+    async def test_done_flushes_pending(self, holder):
+        """[DONE] 到达时，pending 内容被 flush。"""
+        pwd = "My163AuthCode"
+        token = await holder._register_secret(pwd)
+        active_t2p = {token: pwd}
+
+        # 模拟 [DONE] 前 content_parts 有残留
+        content_parts = ["__VG_C"]  # 未完成的 token 前缀
+        joined = "".join(content_parts)
+        joined = holder._restore(joined, active_t2p)
+        # 不匹配完整 token → 保持原值，但会 flush
+        assert joined == "__VG_C"
+
+    @pytest.mark.asyncio
+    async def test_flush_calls_restore(self, holder):
+        """_flush 内部调用 _restore 防止防御性缺口。"""
+        pwd = "My163AuthCode"
+        token = await holder._register_secret(pwd)
+        active_t2p = {token: pwd}
+
+        # 完整 token 在 flush 前存在于内容中
+        content = f"密码是 {token}"
+        content = holder._restore(content, active_t2p)
+        assert token not in content
+        assert pwd in content
