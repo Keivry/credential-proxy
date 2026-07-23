@@ -123,13 +123,13 @@ class CredentialProxy(
         self.tpm_primary = os.path.join(TPM_DIR, "primary.ctx")
         self.tpm_seal_pub = os.path.join(TPM_DIR, "seal.pub")
         self.tpm_seal_priv = os.path.join(TPM_DIR, "seal.priv")
-        logger.info(f"TPM primary: {self.tpm_primary}")
+        logger.info("TPM primary: %s", self.tpm_primary)
 
         # ── LLM 代理配置 (LlmMixin 使用) ──
         self.proxies = _parse_proxy_env()
         self._shared_session = None  # 在 start_llm_proxies() 创建
         for port, url in sorted(self.proxies.items()):
-            logger.info(f"LLM 代理 → 0.0.0.0:{port} → {url}")
+            logger.info("LLM 代理 → 0.0.0.0:%d → %s", port, url)
 
     # ── 主循环 ──
 
@@ -142,7 +142,7 @@ class CredentialProxy(
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for r in results:
             if isinstance(r, Exception):
-                logger.error(f"服务启动失败: {r}")
+                logger.error("服务启动失败: %s", r)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -179,7 +179,7 @@ def main():
         if proxy._shutting_down:
             return
         proxy._shutting_down = True
-        logger.info(f"收到信号 {sig.name}，正在优雅关闭…")
+        logger.info("收到信号 %s，正在优雅关闭…", sig.name)
         if proxy.client is not None:
             await proxy._say("🔌 Proxy 正在关闭…")
         async with proxy._lock:
