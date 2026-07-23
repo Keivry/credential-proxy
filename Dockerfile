@@ -5,13 +5,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tpm2-tools \
     && rm -rf /var/lib/apt/lists/*
 
-# uv — 快速 Python 依赖管理
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+# uv — 快速 Python 依赖管理（锁定版本，避免 :latest 穿透缓存）
+COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /usr/local/bin/uv
 ENV UV_SYSTEM_PYTHON=1
 
-# 依赖（利用层缓存：uv sync 在源码之前）
+# 依赖（利用层缓存 + BuildKit cache mount 避免重复下载）
 COPY pyproject.toml uv.lock /tmp/deps/
-RUN cd /tmp/deps && uv sync --frozen --no-dev --no-install-project
+RUN --mount=type=cache,target=/root/.cache/uv \
+    cd /tmp/deps && uv sync --frozen --no-dev --no-install-project \
+    && rm -rf /tmp/deps
 
 # 源码
 COPY *.py /app/

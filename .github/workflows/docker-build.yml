@@ -9,7 +9,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/credential-proxy
 
 jobs:
   build:
@@ -21,6 +20,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Lowercase image name
+        run: |
+          echo "IMAGE_NAME=${GITHUB_REPOSITORY_OWNER,,}/credential-proxy" >> "$GITHUB_ENV"
 
       - name: Get version from pyproject.toml
         id: version
@@ -42,15 +45,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker meta
-        id: meta
+      - name: Docker meta (branch/PR push)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        id: meta_branch
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest
-            type=raw,value=${{ steps.version.outputs.version }}
             type=ref,event=branch
+            type=sha,format=short
+
+      - name: Docker meta (tag push)
+        if: startsWith(github.ref, 'refs/tags/')
+        id: meta_tag
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
@@ -61,7 +74,7 @@ jobs:
           context: .
           platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ startsWith(github.ref, 'refs/tags/') && steps.meta_tag.outputs.tags || steps.meta_branch.outputs.tags }}
+          labels: ${{ startsWith(github.ref, 'refs/tags/') && steps.meta_tag.outputs.labels || steps.meta_branch.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
