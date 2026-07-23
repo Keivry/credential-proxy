@@ -18,17 +18,11 @@ import sys
 import time
 from collections import OrderedDict
 
-from _token import TokenMixin, _make_token, TOKEN_PREFIX, TOKEN_SUFFIX, \
-    MAX_TOKEN_ENTRIES, SECRET_MIN_LENGTH, TOKEN_RE, TOKEN_STR_RE
+from _token import TokenMixin
 from _tpm import TpmMixin
-from _matrix import MatrixMixin, SYNC_TIMEOUT, MAX_RETRY_DELAY, \
-    REACTION_APPROVE, REACTION_REJECT, REACTIONS, \
-    CMD_LOCK, CMD_STATUS, CMD_FORGET, \
-    SSE_CLIENT_GONE, HOP_HEADERS
-from _credential import CredentialMixin, CREDENTIAL_API_PORT, \
-    UNLOCK_TIMEOUT, APPROVAL_TIMEOUT, RATE_LIMIT_INTERVAL, KP_FIELDS
-from _llm import LlmMixin, UPSTREAM_TOTAL_TIMEOUT, UPSTREAM_CONNECT_TIMEOUT, \
-    SSE_CHUNK_SIZE, SSE_MAX_BUF
+from _matrix import MatrixMixin
+from _credential import CredentialMixin, CREDENTIAL_API_PORT
+from _llm import LlmMixin
 
 logger = logging.getLogger("credential-proxy")
 
@@ -50,6 +44,8 @@ def _parse_proxy_env() -> dict[int, str]:
         except ValueError:
             continue
         proxies[port] = v.strip().rstrip("/")
+        if not proxies[port]:
+            del proxies[port]
     return proxies
 
 
@@ -176,7 +172,8 @@ def main():
             return
         proxy._shutting_down = True
         logger.info(f"收到信号 {sig.name}，正在优雅关闭…")
-        await proxy._say("🔌 Proxy 正在关闭…")
+        if proxy.client is not None:
+            await proxy._say("🔌 Proxy 正在关闭…")
         async with proxy._lock:
             proxy.master_password = None
             proxy._kp = None

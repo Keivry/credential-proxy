@@ -24,7 +24,7 @@ class LlmMixin:
         if not self.proxies:
             logger.info("LLM 代理已禁用（未设置 LLM_* 环境变量）")
             return
-        # 共享ClientSession：所有端口共用一个连接池
+        # 共享 ClientSession：所有端口共用一个连接池
         self._shared_session = ClientSession(
             timeout=ClientTimeout(
                 total=UPSTREAM_TOTAL_TIMEOUT,
@@ -64,95 +64,84 @@ class LlmMixin:
             headers = self._filter_hop_headers(dict(request.headers))
 
             try:
-                upstream_resp = await session.request(
+                # async with 确保上游响应在 SSE 客户端断连时正确释放连接
+                async with session.request(
                     request.method, target_url,
                     headers=headers, data=out_body,
-                )
+                ) as upstream_resp:
 
-                content_type = upstream_resp.content_type or ""
+                    content_type = upstream_resp.content_type or ""
 
-                if content_type.startswith("text/event-stream"):
-                    # ── SSE 流式 ──
-                    resp = web.StreamResponse(
-                        status=upstream_resp.status,
-                        headers=self._filter_hop_headers(
-                            dict(upstream_resp.headers),
-                        ),
-                    )
-                    await resp.prepare(request)
+                    if content_type.startswith("text/event-stream"):
+                        # ── SSE 流式 ──
+                        resp = web.StreamResponse(
+                            status=upstream_resp.status,
+                            headers=self._filter_hop_headers(
+                                dict(upstream_resp.headers),
+                            ),
+                        )
+                        await resp.prepare(request)
 
-                    byte_buf = b""
-                    try:
-                        async for chunk in upstream_resp.content.iter_chunked(
-                            SSE_CHUNK_SIZE,
-                        ):
-                            byte_buf += chunk
-                            if len(byte_buf) > SSE_MAX_BUF:
-                                logger.warning(
-                                    "SSE buf 超过 1MB 上限，强制截断"
-                                )
-                                nl = byte_buf.rfind(b"\n", -SSE_MAX_BUF // 2)
-                                byte_buf = (
-                                    byte_buf[nl + 1:] if nl >= 0
-                                    else byte_buf[-SSE_MAX_BUF // 2:]
-                                )
-                            while b"\n" in byte_buf:
-                                line_bytes, byte_buf = byte_buf.split(
-                                    b"\n", 1,
-                                )
-                                line = line_bytes.decode(
-                                    "utf-8", errors="replace",
-                                ).rstrip("\r")
-                                if line.startswith("data:"):
-                                    payload = line[5:]
-                                    if payload.startswith(" "):
-                                        payload = payload[1:]
-                                    restored = "data: " + self._restore(
-                                        payload, active_t2p,
-                                    )
-                                    await resp.write(
-                                        (restored + "\n").encode("utf-8"),
-                                    )
-                                else:
-                                    await resp.write(
-                                        (line + "\n").encode("utf-8"),
-                                    )
-                    except SSE_CLIENT_GONE as e:
-                        logger.debug(f"SSE 客户端断连: {e}")
-                    if byte_buf:
+                        byte_buf = b""
                         try:
-                            line = byte_buf.decode(
-                                "utf-8", errors="replace",
-                            )
-                            restored_line = self._restore(line, active_t2p)
-                            await resp.write(
-                                restored_line.encode("utf-8"),
-                            )
+                            async for chunk in upstream_resp.content.iter_chunked(
+                                SSE_CHUNK_SIZE,
+                            ):
+                                byte_buf += chunk
+                                # 先处理完整行，再检查缓冲区大小（防止截断丢数据）
+                                while b"\n" in byte_buf:
+                                    line_bytes, byte_buf = byte_buf.split(
+                                        b"\n", 1,
+                                    )
+                                    line = line_bytes.decode(
+                                        "utf-8", errors="replace",
+                                    ).rstrip("\r")
+                                    if line.startswith("data:"):
+                                        payload = line[5:]
+                                        if payload.startswith(" "):
+                                            payload = payload[1:]
+                                        restored = "data: " + self._restore(
+                                            payload, active_t2p,
+                                        )
+                                        await resp.write(
+                                            (restored + "\n").encode("utf-8"),
+                                        )
+                                    else:
+                                        await resp.write(
+                                            (line + "\n").encode("utf-8"),
+                                        )
+                                # 处理完后检查残余缓冲区
+                                if len(byte_buf) > SSE_MAX_BUF:
+                                    logger.warning(
+                                        "SSE 缓冲区超过 1MB 上限，丢弃残余数据"
+                                    )
+                                    byte_buf = b""
+                        except SSE_CLIENT_GONE as e:
+                            logger.debug(f"SSE 客户端断连: {e}")
+                        # 流结束后丢弃不完整的残余行
+                        try:
+                            await resp.write_eof()
                         except (ConnectionResetError,
                                 ConnectionAbortedError,
                                 BrokenPipeError):
                             logger.debug(
-                                "SSE 客户端已断连，跳过残余缓冲写入"
+                                "SSE write_eof 失败，客户端已断连"
                             )
-                    try:
-                        await resp.write_eof()
-                    except (ConnectionResetError,
-                            ConnectionAbortedError,
-                            BrokenPipeError):
-                        logger.debug("SSE write_eof 失败，客户端已断连")
-                    return resp
-                else:
-                    # ── 非流式 ──
-                    resp_body = await upstream_resp.read()
-                    resp_text = resp_body.decode("utf-8", errors="replace")
-                    out_text = self._restore(resp_text, active_t2p)
-                    return web.Response(
-                        body=out_text.encode("utf-8"),
-                        status=upstream_resp.status,
-                        headers=self._filter_hop_headers(
-                            dict(upstream_resp.headers),
-                        ),
-                    )
+                        return resp
+                    else:
+                        # ── 非流式 ──
+                        resp_body = await upstream_resp.read()
+                        resp_text = resp_body.decode(
+                            "utf-8", errors="replace",
+                        )
+                        out_text = self._restore(resp_text, active_t2p)
+                        return web.Response(
+                            body=out_text.encode("utf-8"),
+                            status=upstream_resp.status,
+                            headers=self._filter_hop_headers(
+                                dict(upstream_resp.headers),
+                            ),
+                        )
             except Exception:
                 logger.exception(
                     f"LLM 上游请求失败: {request.method} {target_url}"
@@ -161,7 +150,7 @@ class LlmMixin:
 
         app = web.Application()
         app.router.add_route("*", "/{tail:.*}", handler)
-        app.on_cleanup.append(lambda _app: session.close())
+        # 注意：不在此处注册 session.close() — _shared_session 由 shutdown() 统一关闭
         runner = web.AppRunner(app)
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", port).start()

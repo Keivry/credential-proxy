@@ -2,7 +2,6 @@
 import asyncio
 import logging
 import os
-import time
 
 from aiohttp.client_exceptions import ClientConnectionResetError
 from nio import AsyncClient, RoomMessageText, ReactionEvent
@@ -63,7 +62,7 @@ class MatrixMixin:
         except FileNotFoundError:
             pass
         except Exception:
-            logger.warning("读取 sync_token 失败", exc_info=True)
+            logger.exception("读取 sync_token 失败")
 
         retry_delay = 1
         while not self._shutting_down:
@@ -178,7 +177,9 @@ class MatrixMixin:
     # ── Messaging ──
 
     async def _say(self, text: str):
-        """发送纯文本通知。"""
+        """发送纯文本通知。client 未就绪时静默跳过。"""
+        if self.client is None:
+            return
         try:
             await self.client.room_send(
                 self.room_id, "m.room.message",
@@ -210,11 +211,11 @@ class MatrixMixin:
                     count += 1
                 except Exception:
                     logger.debug("_ask 添加 reaction 失败", exc_info=True)
-            if count < 2:
+            if count < len(REACTIONS):
                 logger.warning(
                     f"_ask 仅 {count}/{len(REACTIONS)} 个 reaction 成功"
+                    "，消息仍然可用"
                 )
-                return None
         return eid
 
     # ── Utilities ──
