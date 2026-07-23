@@ -16,6 +16,15 @@ SSE_CHUNK_SIZE = 4096           # SSE 流式块大小
 SSE_MAX_BUF = 1_048_576         # SSE 缓冲区上限 (1MB)
 
 
+def _mk_sse_event(content: str, finish_reason: str | None = None) -> str:
+    """构建 OpenAI 兼容的 SSE data 事件 JSON。"""
+    delta = {"content": content} if finish_reason is None else {}
+    event = json.dumps({
+        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    })
+    return f"data: {event}\n"
+
+
 class LlmMixin:
     """Mixin: LLM 反向代理，脱敏/还原。"""
 
@@ -86,8 +95,18 @@ class LlmMixin:
 
                         if active_t2p:
                             # ── JSON-aware 流式 token 还原（广义 Plan C） ──
-                            content_hold = ""  # 累积 delta.content，跨事件 token 匹配
+                            content_parts = []  # 累积 delta.content 片段
                             byte_buf = bytearray()
+
+                            async def _flush(c: str, fr: str | None = None):
+                                """flush 内容作为 SSE 事件并清空 content_parts。"""
+                                nonlocal content_parts
+                                if c or fr:
+                                    await resp.write(
+                                        _mk_sse_event(c, fr).encode(),
+                                    )
+                                content_parts = []
+
                             try:
                                 async for chunk in upstream_resp.content.iter_chunked(
                                     SSE_CHUNK_SIZE,
@@ -111,20 +130,10 @@ class LlmMixin:
                                         if payload.startswith(" "):
                                             payload = payload[1:]
 
-                                        # [DONE] 标记：先 flush 残留 hold
+                                        # [DONE] 标记：先 flush 残留
                                         if payload.strip() == "[DONE]":
-                                            if content_hold:
-                                                d_event = json.dumps({
-                                                    "choices": [{
-                                                        "index": 0,
-                                                        "delta": {"content": content_hold},
-                                                        "finish_reason": None,
-                                                    }],
-                                                })
-                                                await resp.write(
-                                                    f"data: {d_event}\n".encode(),
-                                                )
-                                                content_hold = ""
+                                            joined = "".join(content_parts)
+                                            await _flush(joined)
                                             await resp.write(
                                                 "data: [DONE]\n".encode(),
                                             )
@@ -141,87 +150,50 @@ class LlmMixin:
                                             )
 
                                             if "content" not in delta:
-                                                # 非 content 事件（role 等）：
-                                                # 先 flush hold，再原样转发
-                                                if content_hold:
-                                                    d_event = json.dumps({
-                                                        "choices": [{
-                                                            "index": 0,
-                                                            "delta": {"content": content_hold},
-                                                            "finish_reason": None,
-                                                        }],
-                                                    })
-                                                    await resp.write(
-                                                        f"data: {d_event}\n".encode(),
-                                                    )
-                                                    content_hold = ""
+                                                # 非 content 事件：先 flush hold
+                                                joined = "".join(content_parts)
+                                                await _flush(joined)
                                                 await resp.write(
                                                     (line + "\n").encode("utf-8"),
                                                 )
                                                 continue
 
-                                            # 累积 content
-                                            content_hold += delta["content"]
-                                            # 尝试将累积 buffer 中的 token 还原为密码
-                                            content_hold = self._restore(
-                                                content_hold, active_t2p,
+                                            # 追加 content 片段，还原 token
+                                            content_parts.append(delta["content"])
+                                            joined = "".join(content_parts)
+                                            joined = self._restore(
+                                                joined, active_t2p,
                                             )
 
-                                            # 确定安全的 flush 点
-                                            # 策略：找最后一个 "__"，检查后缀是否匹配
-                                            # active token 的前缀
-                                            last_us = content_hold.rfind("__")
-                                            safe = content_hold
-                                            hold = ""
+                                            # 找安全 flush 点
+                                            last_us = joined.rfind("__")
+                                            safe = joined
+                                            pending = ""
                                             if last_us >= 0:
-                                                suffix = content_hold[last_us:]
+                                                suffix = joined[last_us:]
                                                 maybe_prefix = any(
                                                     t.startswith(suffix)
                                                     for t in active_t2p
                                                 )
                                                 if maybe_prefix:
-                                                    safe = content_hold[:last_us]
-                                                    hold = suffix
+                                                    safe = joined[:last_us]
+                                                    pending = suffix
 
                                             # flush 安全部分
                                             if safe:
-                                                d_event = json.dumps({
-                                                    "choices": [{
-                                                        "index": 0,
-                                                        "delta": {"content": safe},
-                                                        "finish_reason": None,
-                                                    }],
-                                                })
                                                 await resp.write(
-                                                    f"data: {d_event}\n".encode(),
+                                                    _mk_sse_event(safe).encode(),
                                                 )
-                                            content_hold = hold
+                                            content_parts = [pending] if pending else []
 
-                                            # finish_reason 与最后一个 content delta 合并
                                             if finish_reason:
-                                                if content_hold:
-                                                    d_event = json.dumps({
-                                                        "choices": [{
-                                                            "index": 0,
-                                                            "delta": {"content": content_hold},
-                                                            "finish_reason": finish_reason,
-                                                        }],
-                                                    })
-                                                    await resp.write(
-                                                        f"data: {d_event}\n".encode(),
-                                                    )
-                                                    content_hold = ""
-                                                else:
-                                                    f_event = json.dumps({
-                                                        "choices": [{
-                                                            "index": 0,
-                                                            "delta": {},
-                                                            "finish_reason": finish_reason,
-                                                        }],
-                                                    })
-                                                    await resp.write(
-                                                        f"data: {f_event}\n".encode(),
-                                                    )
+                                                joined = "".join(content_parts)
+                                                await resp.write(
+                                                    _mk_sse_event(
+                                                        joined, finish_reason,
+                                                    ).encode(),
+                                                )
+                                                content_parts = []
 
                                         except (
                                             json.JSONDecodeError,
@@ -229,7 +201,11 @@ class LlmMixin:
                                             IndexError,
                                             TypeError,
                                         ):
-                                            # 格式不匹配 → 原样转发
+                                            logger.warning(
+                                                "SSE JSON 解析失败，"
+                                                "原样转发: %s...",
+                                                payload[:80],
+                                            )
                                             await resp.write(
                                                 (line + "\n").encode("utf-8"),
                                             )
@@ -250,18 +226,12 @@ class LlmMixin:
                             except SSE_CLIENT_GONE as e:
                                 logger.debug("SSE 客户端断连: %s", e)
 
-                            # 流结束：flush 残留 hold + 残余字节
-                            if content_hold:
+                            # 流结束：flush 残留
+                            joined = "".join(content_parts)
+                            if joined:
                                 try:
-                                    d_event = json.dumps({
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {"content": content_hold},
-                                            "finish_reason": None,
-                                        }],
-                                    })
                                     await resp.write(
-                                        f"data: {d_event}\n".encode(),
+                                        _mk_sse_event(joined).encode(),
                                     )
                                 except (
                                     ConnectionResetError,
@@ -274,8 +244,11 @@ class LlmMixin:
                                     residual = byte_buf.decode(
                                         "utf-8", errors="replace",
                                     )
+                                    restored = self._restore(
+                                        residual, active_t2p,
+                                    )
                                     await resp.write(
-                                        residual.encode("utf-8"),
+                                        restored.encode("utf-8"),
                                     )
                                 except (
                                     ConnectionResetError,
