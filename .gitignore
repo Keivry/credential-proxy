@@ -3,3 +3,9 @@ __pycache__/
 *.pyo
 .pytest_cache/
 .coverage
+.venv/
+sync_token
+tpm/*
+!tpm/.gitkeep
+db/*.kdbx
+db/*.key

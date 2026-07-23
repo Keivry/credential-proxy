@@ -1,7 +1,7 @@
 """LlmMixin — LLM API 反向代理：脱敏请求 → 上游 → 还原响应。"""
 import logging
 
-from aiohttp import web, ClientSession, ClientTimeout
+from aiohttp import ClientSession, ClientTimeout, web
 
 from _matrix import SSE_CLIENT_GONE
 from _token import TOKEN_RE
@@ -113,9 +113,15 @@ class LlmMixin:
                                 # 处理完后检查残余缓冲区
                                 if len(byte_buf) > SSE_MAX_BUF:
                                     logger.warning(
-                                        "SSE 缓冲区超过 1MB 上限，丢弃残余数据"
+                                        "SSE 缓冲区超过 1MB 上限，保留最后一个部分行"
                                     )
-                                    byte_buf = bytearray()
+                                    # 保留最后一个 \n 之后的数据（部分行），避免截断丢失数据
+                                    last_nl = byte_buf.rfind(b"\n")
+                                    if last_nl >= 0:
+                                        byte_buf = bytearray(byte_buf[last_nl + 1:])
+                                    # 如果退到只剩部分行仍然超 1MB，则硬截断
+                                    if len(byte_buf) > SSE_MAX_BUF:
+                                        byte_buf = bytearray()
                         except SSE_CLIENT_GONE as e:
                             logger.debug(f"SSE 客户端断连: {e}")
                         # 流结束后写入残余字节再 EOF
