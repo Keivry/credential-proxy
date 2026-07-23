@@ -74,6 +74,7 @@ class CredentialProxy(
         # ── 状态 ──
         self.master_password = None
         self._kp = None                     # KeePass 缓存
+        self._kp_semaphore = asyncio.Semaphore(1)  # 序列化 KeePass 访问
         self._lock = asyncio.Lock()         # 全局互斥锁
         self._shutting_down = False
         self._start_ts = int(time.time() * 1000)
@@ -173,7 +174,7 @@ def main():
         print("  ROOM_ID               Matrix 房间 ID", file=sys.stderr)
         print("  MATRIX_ACCESS_TOKEN   Matrix Bot 的 access token", file=sys.stderr)
         print("  CREDENTIAL_PORT       凭据 API 端口 (默认 8877)", file=sys.stderr)
-        print("  DATA_DIR              数据目录 (默认 /data)", file=sys.stderr)
+        print("  DATA_DIR              数据目录 (默认: 脚本所在目录 或 /data in Docker)", file=sys.stderr)
         print("  LLM_8878=https://api.opencode.ai", file=sys.stderr)
         print("  LLM_8879=https://api.deepseek.com", file=sys.stderr)
         sys.exit(1)

@@ -6,7 +6,7 @@ services:
     environment:
       - HOMESERVER=https://matrix.example.com
       - ROOM_ID=!yourroomid:matrix.example.com
-      - MATRIX_ACCESS_TOKEN=syt_yourtoken
+      - MATRIX_ACCESS_TOKEN=${MATRIX_ACCESS_TOKEN:?MATRIX_ACCESS_TOKEN is required}
       # 可选：
       # - CREDENTIAL_PORT=8877
       # - DATA_DIR=/data

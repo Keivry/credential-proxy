@@ -13,8 +13,7 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 COPY *.py /app/
 
 # 入口
-COPY docker-entrypoint.sh /
-RUN chmod +x /docker-entrypoint.sh
+COPY --chmod=+x docker-entrypoint.sh /
 
 WORKDIR /data
 VOLUME ["/data/tpm", "/data/db"]
