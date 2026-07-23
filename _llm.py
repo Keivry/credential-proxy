@@ -63,14 +63,18 @@ class LlmMixin:
 
             if body_text:
                 out_body = self._redact(body_text, snapshot_p2t).encode("utf-8")
-                # 收集本次请求实际使用的 token，仅还原这些（防 LLM 幻觉泄露）
-                used_tokens = set()
-                for m in TOKEN_RE.finditer(out_body):
-                    used_tokens.add(m.group().decode())
-                active_t2p = {
-                    t: p for t, p in snapshot_t2p.items()
-                    if t in used_tokens
-                }
+                # 快速路径：无 token 时不扫描
+                if snapshot_t2p and b"__VG_CRED_" in out_body:
+                    # 收集本次请求实际使用的 token，仅还原这些（防 LLM 幻觉泄露）
+                    used_tokens = set()
+                    for m in TOKEN_RE.finditer(out_body):
+                        used_tokens.add(m.group().decode())
+                    active_t2p = {
+                        t: p for t, p in snapshot_t2p.items()
+                        if t in used_tokens
+                    }
+                else:
+                    active_t2p = {}
             else:
                 out_body = b""
                 active_t2p = {}
@@ -99,19 +103,19 @@ class LlmMixin:
 
                         if active_t2p:
                             # ── JSON-aware 流式 token 还原（广义 Plan C） ──
-                            content_parts = []  # 累积 delta.content 片段
+                            content_buf = ""  # 累积 delta.content 片段，O(1) 单字符串追加
                             byte_buf = bytearray()
 
                             async def _flush(c: str, fr: str | None = None):
-                                """flush 内容作为 SSE 事件并清空 content_parts。"""
-                                nonlocal content_parts
+                                """flush 内容作为 SSE 事件并清空 content_buf。"""
+                                nonlocal content_buf
                                 if c or fr:
                                     if c:
                                         c = self._restore(c, active_t2p)
                                     await resp.write(
                                         _mk_sse_event(c, fr).encode(),
                                     )
-                                content_parts = []
+                                content_buf = ""
 
                             try:
                                 async for chunk in upstream_resp.content.iter_chunked(
@@ -138,8 +142,7 @@ class LlmMixin:
 
                                         # [DONE] 标记：先 flush 累积内容
                                         if payload.strip() == "[DONE]":
-                                            joined = "".join(content_parts)
-                                            await _flush(joined)
+                                            await _flush(content_buf)
                                             await resp.write(
                                                 "data: [DONE]\n".encode(),
                                             )
@@ -157,32 +160,30 @@ class LlmMixin:
 
                                             if "content" not in delta:
                                                 # 非 content 事件：先 flush 累积内容
-                                                joined = "".join(content_parts)
-                                                await _flush(joined)
+                                                await _flush(content_buf)
                                                 await resp.write(
                                                     (line + "\n").encode("utf-8"),
                                                 )
                                                 continue
 
                                             # 追加 content 片段，还原 token
-                                            content_parts.append(delta["content"])
-                                            joined = "".join(content_parts)
-                                            joined = self._restore(
-                                                joined, active_t2p,
+                                            content_buf += delta["content"]
+                                            restored = self._restore(
+                                                content_buf, active_t2p,
                                             )
 
                                             # 找安全 flush 点
-                                            last_us = joined.rfind("__")
-                                            safe = joined
+                                            last_us = restored.rfind("__")
+                                            safe = restored
                                             pending = ""
                                             if last_us >= 0:
-                                                suffix = joined[last_us:]
+                                                suffix = restored[last_us:]
                                                 maybe_prefix = any(
                                                     t.startswith(suffix)
                                                     for t in active_t2p
                                                 )
                                                 if maybe_prefix:
-                                                    safe = joined[:last_us]
+                                                    safe = restored[:last_us]
                                                     pending = suffix
 
                                             # flush 安全部分
@@ -190,19 +191,18 @@ class LlmMixin:
                                                 await resp.write(
                                                     _mk_sse_event(safe).encode(),
                                                 )
-                                            content_parts = [pending] if pending else []
+                                            content_buf = pending
 
                                             if finish_reason:
-                                                joined = "".join(content_parts)
-                                                joined = self._restore(
-                                                    joined, active_t2p,
+                                                content_buf = self._restore(
+                                                    content_buf, active_t2p,
                                                 )
                                                 await resp.write(
                                                     _mk_sse_event(
-                                                        joined, finish_reason,
+                                                        content_buf, finish_reason,
                                                     ).encode(),
                                                 )
-                                                content_parts = []
+                                                content_buf = ""
 
                                         except (
                                             json.JSONDecodeError,
@@ -236,12 +236,11 @@ class LlmMixin:
                                 logger.debug("SSE 客户端断连: %s", e)
 
                             # 流结束：flush 残留
-                            joined = "".join(content_parts)
-                            if joined:
-                                joined = self._restore(joined, active_t2p)
+                            if content_buf:
+                                content_buf = self._restore(content_buf, active_t2p)
                                 try:
                                     await resp.write(
-                                        _mk_sse_event(joined).encode(),
+                                        _mk_sse_event(content_buf).encode(),
                                     )
                                 except (
                                     ConnectionResetError,
