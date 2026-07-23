@@ -1,4 +1,5 @@
 """LlmMixin — LLM API 反向代理：脱敏请求 → 上游 → 还原响应。"""
+import json
 import logging
 
 from aiohttp import ClientSession, ClientTimeout, web
@@ -83,71 +84,286 @@ class LlmMixin:
                         )
                         await resp.prepare(request)
 
-                        byte_buf = bytearray()
-                        try:
-                            async for chunk in upstream_resp.content.iter_chunked(
-                                SSE_CHUNK_SIZE,
-                            ):
-                                byte_buf.extend(chunk)
-                                # 先处理完整行，再检查缓冲区大小（防止截断丢数据）
-                                while (idx := byte_buf.find(b"\n")) >= 0:
-                                    line_bytes = bytes(byte_buf[:idx])
-                                    del byte_buf[:idx + 1]
-                                    line = line_bytes.decode(
-                                        "utf-8", errors="replace",
-                                    ).rstrip("\r")
-                                    if line.startswith("data:"):
+                        if active_t2p:
+                            # ── JSON-aware 流式 token 还原（广义 Plan C） ──
+                            content_hold = ""  # 累积 delta.content，跨事件 token 匹配
+                            byte_buf = bytearray()
+                            try:
+                                async for chunk in upstream_resp.content.iter_chunked(
+                                    SSE_CHUNK_SIZE,
+                                ):
+                                    byte_buf.extend(chunk)
+                                    while (idx := byte_buf.find(b"\n")) >= 0:
+                                        line_bytes = bytes(byte_buf[:idx])
+                                        del byte_buf[:idx + 1]
+                                        line = line_bytes.decode(
+                                            "utf-8", errors="replace",
+                                        ).rstrip("\r")
+
+                                        # 非 data 行：直接透传
+                                        if not line.startswith("data:"):
+                                            await resp.write(
+                                                (line + "\n").encode("utf-8"),
+                                            )
+                                            continue
+
                                         payload = line[5:]
                                         if payload.startswith(" "):
                                             payload = payload[1:]
-                                        restored = "data: " + self._restore(
-                                            payload, active_t2p,
-                                        )
-                                        await resp.write(
-                                            (restored + "\n").encode("utf-8"),
-                                        )
-                                    else:
-                                        await resp.write(
-                                            (line + "\n").encode("utf-8"),
-                                        )
-                                # 处理完后检查残余缓冲区
-                                if len(byte_buf) > SSE_MAX_BUF:
-                                    logger.warning(
-                                        "SSE 缓冲区超过 1MB 上限，保留最后一个部分行",
-                                    )
-                                    # 保留最后一个 \n 之后的数据（部分行），避免截断丢失数据
-                                    last_nl = byte_buf.rfind(b"\n")
-                                    if last_nl >= 0:
-                                        byte_buf = bytearray(byte_buf[last_nl + 1:])
-                                    # 如果退到只剩部分行仍然超 1MB，则硬截断
+
+                                        # [DONE] 标记：先 flush 残留 hold
+                                        if payload.strip() == "[DONE]":
+                                            if content_hold:
+                                                d_event = json.dumps({
+                                                    "choices": [{
+                                                        "index": 0,
+                                                        "delta": {"content": content_hold},
+                                                        "finish_reason": None,
+                                                    }],
+                                                })
+                                                await resp.write(
+                                                    f"data: {d_event}\n".encode(),
+                                                )
+                                                content_hold = ""
+                                            await resp.write(
+                                                "data: [DONE]\n".encode(),
+                                            )
+                                            continue
+
+                                        # 解析 JSON，提取 delta content
+                                        try:
+                                            parsed = json.loads(payload)
+                                            choices = parsed.get("choices", [])
+                                            choice = choices[0] if choices else {}
+                                            delta = choice.get("delta", {})
+                                            finish_reason = choice.get(
+                                                "finish_reason",
+                                            )
+
+                                            if "content" not in delta:
+                                                # 非 content 事件（role 等）：
+                                                # 先 flush hold，再原样转发
+                                                if content_hold:
+                                                    d_event = json.dumps({
+                                                        "choices": [{
+                                                            "index": 0,
+                                                            "delta": {"content": content_hold},
+                                                            "finish_reason": None,
+                                                        }],
+                                                    })
+                                                    await resp.write(
+                                                        f"data: {d_event}\n".encode(),
+                                                    )
+                                                    content_hold = ""
+                                                await resp.write(
+                                                    (line + "\n").encode("utf-8"),
+                                                )
+                                                continue
+
+                                            # 累积 content
+                                            content_hold += delta["content"]
+                                            # 尝试将累积 buffer 中的 token 还原为密码
+                                            content_hold = self._restore(
+                                                content_hold, active_t2p,
+                                            )
+
+                                            # 确定安全的 flush 点
+                                            # 策略：找最后一个 "__"，检查后缀是否匹配
+                                            # active token 的前缀
+                                            last_us = content_hold.rfind("__")
+                                            safe = content_hold
+                                            hold = ""
+                                            if last_us >= 0:
+                                                suffix = content_hold[last_us:]
+                                                maybe_prefix = any(
+                                                    t.startswith(suffix)
+                                                    for t in active_t2p
+                                                )
+                                                if maybe_prefix:
+                                                    safe = content_hold[:last_us]
+                                                    hold = suffix
+
+                                            # flush 安全部分
+                                            if safe:
+                                                d_event = json.dumps({
+                                                    "choices": [{
+                                                        "index": 0,
+                                                        "delta": {"content": safe},
+                                                        "finish_reason": None,
+                                                    }],
+                                                })
+                                                await resp.write(
+                                                    f"data: {d_event}\n".encode(),
+                                                )
+                                            content_hold = hold
+
+                                            # finish_reason 与最后一个 content delta 合并
+                                            if finish_reason:
+                                                if content_hold:
+                                                    d_event = json.dumps({
+                                                        "choices": [{
+                                                            "index": 0,
+                                                            "delta": {"content": content_hold},
+                                                            "finish_reason": finish_reason,
+                                                        }],
+                                                    })
+                                                    await resp.write(
+                                                        f"data: {d_event}\n".encode(),
+                                                    )
+                                                    content_hold = ""
+                                                else:
+                                                    f_event = json.dumps({
+                                                        "choices": [{
+                                                            "index": 0,
+                                                            "delta": {},
+                                                            "finish_reason": finish_reason,
+                                                        }],
+                                                    })
+                                                    await resp.write(
+                                                        f"data: {f_event}\n".encode(),
+                                                    )
+
+                                        except (
+                                            json.JSONDecodeError,
+                                            KeyError,
+                                            IndexError,
+                                            TypeError,
+                                        ):
+                                            # 格式不匹配 → 原样转发
+                                            await resp.write(
+                                                (line + "\n").encode("utf-8"),
+                                            )
+
+                                    # 缓冲区溢出保护
                                     if len(byte_buf) > SSE_MAX_BUF:
-                                        byte_buf = bytearray()
-                        except SSE_CLIENT_GONE as e:
-                            logger.debug("SSE 客户端断连: %s", e)
-                        # 流结束后写入残余字节再 EOF
-                        if byte_buf:
-                            try:
-                                residual = byte_buf.decode(
-                                    "utf-8", errors="replace",
-                                )
-                                restored = self._restore(
-                                    residual, active_t2p,
-                                )
-                                await resp.write(
-                                    restored.encode("utf-8"),
-                                )
-                            except (ConnectionResetError,
+                                        logger.warning(
+                                            "SSE 缓冲区超过 1MB 上限，"
+                                            "保留最后一个部分行",
+                                        )
+                                        last_nl = byte_buf.rfind(b"\n")
+                                        if last_nl >= 0:
+                                            byte_buf = bytearray(
+                                                byte_buf[last_nl + 1:],
+                                            )
+                                        if len(byte_buf) > SSE_MAX_BUF:
+                                            byte_buf = bytearray()
+                            except SSE_CLIENT_GONE as e:
+                                logger.debug("SSE 客户端断连: %s", e)
+
+                            # 流结束：flush 残留 hold + 残余字节
+                            if content_hold:
+                                try:
+                                    d_event = json.dumps({
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {"content": content_hold},
+                                            "finish_reason": None,
+                                        }],
+                                    })
+                                    await resp.write(
+                                        f"data: {d_event}\n".encode(),
+                                    )
+                                except (
+                                    ConnectionResetError,
                                     ConnectionAbortedError,
-                                    BrokenPipeError):
-                                logger.debug("SSE 残余写入失败")
-                        try:
-                            await resp.write_eof()
-                        except (ConnectionResetError,
+                                    BrokenPipeError,
+                                ):
+                                    logger.debug("SSE 残余写入失败")
+                            if byte_buf:
+                                try:
+                                    residual = byte_buf.decode(
+                                        "utf-8", errors="replace",
+                                    )
+                                    await resp.write(
+                                        residual.encode("utf-8"),
+                                    )
+                                except (
+                                    ConnectionResetError,
+                                    ConnectionAbortedError,
+                                    BrokenPipeError,
+                                ):
+                                    logger.debug("SSE 残余写入失败")
+                            try:
+                                await resp.write_eof()
+                            except (
+                                ConnectionResetError,
                                 ConnectionAbortedError,
-                                BrokenPipeError):
-                            logger.debug(
-                                "SSE write_eof 失败，客户端已断连",
-                            )
+                                BrokenPipeError,
+                            ):
+                                logger.debug(
+                                    "SSE write_eof 失败，客户端已断连",
+                                )
+                        else:
+                            # ── Fast path: active_t2p 为空，逐行 text-level 还原 ──
+                            byte_buf = bytearray()
+                            try:
+                                async for chunk in upstream_resp.content.iter_chunked(
+                                    SSE_CHUNK_SIZE,
+                                ):
+                                    byte_buf.extend(chunk)
+                                    # 先处理完整行，再检查缓冲区（防截断丢数据）
+                                    while (idx := byte_buf.find(b"\n")) >= 0:
+                                        line_bytes = bytes(byte_buf[:idx])
+                                        del byte_buf[:idx + 1]
+                                        line = line_bytes.decode(
+                                            "utf-8", errors="replace",
+                                        ).rstrip("\r")
+                                        if line.startswith("data:"):
+                                            payload = line[5:]
+                                            if payload.startswith(" "):
+                                                payload = payload[1:]
+                                            restored = "data: " + self._restore(
+                                                payload, active_t2p,
+                                            )
+                                            await resp.write(
+                                                (restored + "\n").encode("utf-8"),
+                                            )
+                                        else:
+                                            await resp.write(
+                                                (line + "\n").encode("utf-8"),
+                                            )
+                                    if len(byte_buf) > SSE_MAX_BUF:
+                                        logger.warning(
+                                            "SSE 缓冲区超过 1MB 上限，"
+                                            "保留最后一个部分行",
+                                        )
+                                        last_nl = byte_buf.rfind(b"\n")
+                                        if last_nl >= 0:
+                                            byte_buf = bytearray(
+                                                byte_buf[last_nl + 1:],
+                                            )
+                                        if len(byte_buf) > SSE_MAX_BUF:
+                                            byte_buf = bytearray()
+                            except SSE_CLIENT_GONE as e:
+                                logger.debug("SSE 客户端断连: %s", e)
+                            # 残余字节 + EOF
+                            if byte_buf:
+                                try:
+                                    residual = byte_buf.decode(
+                                        "utf-8", errors="replace",
+                                    )
+                                    restored = self._restore(
+                                        residual, active_t2p,
+                                    )
+                                    await resp.write(
+                                        restored.encode("utf-8"),
+                                    )
+                                except (
+                                    ConnectionResetError,
+                                    ConnectionAbortedError,
+                                    BrokenPipeError,
+                                ):
+                                    logger.debug("SSE 残余写入失败")
+                            try:
+                                await resp.write_eof()
+                            except (
+                                ConnectionResetError,
+                                ConnectionAbortedError,
+                                BrokenPipeError,
+                            ):
+                                logger.debug(
+                                    "SSE write_eof 失败，客户端已断连",
+                                )
                         return resp
                     else:
                         # ── 非流式 ──
