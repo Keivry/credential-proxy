@@ -99,6 +99,8 @@ class CredentialMixin:
                 async with self._lock:
                     if self.unlock_event and not self.unlock_event.is_set():
                         self.unlock_event.set()
+                    self.unlock_event = None
+                    self._unlock_msg_id = None
                 return web.json_response(
                     {"error": "无法发送解锁消息"}, status=503,
                 )
