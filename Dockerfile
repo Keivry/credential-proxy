@@ -5,9 +5,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tpm2-tools \
     && rm -rf /var/lib/apt/lists/*
 
-# Python 依赖
-COPY requirements.txt /tmp/
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+# uv — 快速 Python 依赖管理
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+ENV UV_SYSTEM_PYTHON=1
+
+# 依赖（利用层缓存：uv sync 在源码之前）
+COPY pyproject.toml uv.lock /tmp/deps/
+RUN cd /tmp/deps && uv sync --frozen --no-dev --no-install-project
 
 # 源码
 COPY *.py /app/
