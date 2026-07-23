@@ -4,7 +4,7 @@ import logging
 import os
 
 from aiohttp.client_exceptions import ClientConnectionResetError
-from nio import AsyncClient, RoomMessageText, ReactionEvent
+from nio import AsyncClient, ReactionEvent, RoomMessageText
 
 logger = logging.getLogger("credential-proxy")
 
@@ -112,7 +112,7 @@ class MatrixMixin:
                 n_secrets = len(self.pwd_to_token)
             await self._say(
                 f"Proxy: {s} | 待审批: {n_pending}"
-                f" | LLM secrets: {n_secrets}"
+                f" | LLM secrets: {n_secrets}",
             )
         elif body == CMD_FORGET:
             async with self._lock:
@@ -153,7 +153,7 @@ class MatrixMixin:
                             lambda t, _logger=logger: (
                                 _logger.error("解锁任务异常", exc_info=t.exception())
                                 if t.exception() else None
-                            )
+                            ),
                         )
                         self._unlock_task = task
                         say_text = "⏳ TPM 解封中…"
@@ -209,7 +209,7 @@ class MatrixMixin:
                         "m.relates_to": {
                             "event_id": eid, "key": k,
                             "rel_type": "m.annotation",
-                        }
+                        },
                     })
                     count += 1
                 except Exception:

@@ -113,7 +113,7 @@ class LlmMixin:
                                 # 处理完后检查残余缓冲区
                                 if len(byte_buf) > SSE_MAX_BUF:
                                     logger.warning(
-                                        "SSE 缓冲区超过 1MB 上限，保留最后一个部分行"
+                                        "SSE 缓冲区超过 1MB 上限，保留最后一个部分行",
                                     )
                                     # 保留最后一个 \n 之后的数据（部分行），避免截断丢失数据
                                     last_nl = byte_buf.rfind(b"\n")
@@ -146,7 +146,7 @@ class LlmMixin:
                                 ConnectionAbortedError,
                                 BrokenPipeError):
                             logger.debug(
-                                "SSE write_eof 失败，客户端已断连"
+                                "SSE write_eof 失败，客户端已断连",
                             )
                         return resp
                     else:

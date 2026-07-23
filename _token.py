@@ -13,8 +13,8 @@ TOKEN_SUFFIX = "__"
 MAX_TOKEN_ENTRIES = 5000
 SECRET_MIN_LENGTH = 4
 # 用无界匹配防止 seq 溢出破坏 regex
-TOKEN_RE = _re.compile(rb'__VG_CRED_\d{4,}__')
-TOKEN_STR_RE = _re.compile(r'__VG_CRED_\d{4,}__')
+TOKEN_RE = _re.compile(rb"__VG_CRED_\d{4,}__")
+TOKEN_STR_RE = _re.compile(r"__VG_CRED_\d{4,}__")
 
 
 def _make_token(n: int) -> str:
@@ -66,15 +66,15 @@ class TokenMixin:
             repl = {pwd: token for pwd, token in mapping.items()}
             return pat.sub(lambda m: repl.get(m.group(0), m.group(0)), text)
         # 全集：使用版本缓存
-        if getattr(self, '_redact_cache_ver', -1) != self._token_seq:
+        if getattr(self, "_redact_cache_ver", -1) != self._token_seq:
             items = sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True)
             self._redact_cache_pat = _re.compile(
-                "|".join(_re.escape(pwd) for pwd, _ in items)
+                "|".join(_re.escape(pwd) for pwd, _ in items),
             )
             self._redact_cache_ver = self._token_seq
         repl = {pwd: token for pwd, token in mapping.items()}
         return self._redact_cache_pat.sub(
-            lambda m: repl.get(m.group(0), m.group(0)), text
+            lambda m: repl.get(m.group(0), m.group(0)), text,
         )
 
     def _restore(self, text: str, token_to_pwd: dict | None = None) -> str:
@@ -92,12 +92,12 @@ class TokenMixin:
             pat = _re.compile("|".join(_re.escape(tok) for tok, _ in items))
             return pat.sub(lambda m: mapping.get(m.group(0), m.group(0)), text)
         # 全集：使用版本缓存
-        if getattr(self, '_restore_cache_ver', -1) != self._token_seq:
+        if getattr(self, "_restore_cache_ver", -1) != self._token_seq:
             items = sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True)
             self._restore_cache_pat = _re.compile(
-                "|".join(_re.escape(tok) for tok, _ in items)
+                "|".join(_re.escape(tok) for tok, _ in items),
             )
             self._restore_cache_ver = self._token_seq
         return self._restore_cache_pat.sub(
-            lambda m: mapping.get(m.group(0), m.group(0)), text
+            lambda m: mapping.get(m.group(0), m.group(0)), text,
         )

@@ -19,11 +19,12 @@ import sys
 import time
 from collections import OrderedDict
 
+from _credential import _CREDENTIAL_API_PORT as CREDENTIAL_API_PORT
+from _credential import CredentialMixin
+from _llm import LlmMixin
+from _matrix import MatrixMixin
 from _token import TokenMixin
 from _tpm import TpmMixin
-from _matrix import MatrixMixin
-from _credential import CredentialMixin, _CREDENTIAL_API_PORT as CREDENTIAL_API_PORT
-from _llm import LlmMixin
 
 logger = logging.getLogger("credential-proxy")
 
