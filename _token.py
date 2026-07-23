@@ -34,9 +34,9 @@ class TokenMixin:
             if value in self.pwd_to_token:
                 self.pwd_to_token.move_to_end(value)
                 return self.pwd_to_token[value]
-            if TOKEN_STR_RE.fullmatch(value):
-                logger.warning("密码值匹配 token 格式，拒绝注册: %s...", value[:20])
-                raise ValueError("密码值不能匹配内部 token 格式")
+            if TOKEN_STR_RE.fullmatch(value) or value.startswith(TOKEN_PREFIX):
+                logger.warning("密码值匹配内部 token 格式或前缀，拒绝注册: %s...", value[:20])
+                raise ValueError("密码值不能匹配内部 token 格式或以 token 前缀开头")
             self._token_seq += 1
             token = _make_token(self._token_seq)
             if len(self.pwd_to_token) >= MAX_TOKEN_ENTRIES:
