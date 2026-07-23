@@ -1,7 +1,7 @@
 """TokenMixin — 凭据脱敏：注册、替换、还原。
 
 每个密码映射为一个 __VG_CRED_NNNNNN__ token。
-使用 OrderedDict + re.sub 单次替换，按长度降序防子串碰撞。
+使用 re.sub 单次替换，按长度降序防子串碰撞。
 """
 import logging
 import re as _re
@@ -55,22 +55,23 @@ class TokenMixin:
 
     def _redact(self, text: str, pwd_to_token: dict | None = None) -> str:
         """用 token 替换文本中的密码。按长度降序，re.sub 单次替换。
-        编译后的正则缓存在 self._redact_cache，仅 mapping 变更时重建。"""
+        显式 mapping 时不缓存（每次构建），全集时使用版本缓存。"""
         mapping = pwd_to_token if pwd_to_token is not None else self.pwd_to_token
         if not mapping:
             return text
-        # 使用传入的 mapping 构建 pattern（安全：快照场景下防新注册密码泄漏）
-        full = mapping
-        if not full:
-            return text
-        # 版本检查：token_seq 变化时重建缓存
+        # 显式 mapping：每次构建（快照场景，不缓存，防子集污染全集缓存）
+        if pwd_to_token is not None:
+            items = sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True)
+            pat = _re.compile("|".join(_re.escape(pwd) for pwd, _ in items))
+            repl = {pwd: token for pwd, token in mapping.items()}
+            return pat.sub(lambda m: repl.get(m.group(0), m.group(0)), text)
+        # 全集：使用版本缓存
         if getattr(self, '_redact_cache_ver', -1) != self._token_seq:
-            items = sorted(full.items(), key=lambda x: len(x[0]), reverse=True)
+            items = sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True)
             self._redact_cache_pat = _re.compile(
                 "|".join(_re.escape(pwd) for pwd, _ in items)
             )
             self._redact_cache_ver = self._token_seq
-        # 构建当前 mapping 的替换表
         repl = {pwd: token for pwd, token in mapping.items()}
         return self._redact_cache_pat.sub(
             lambda m: repl.get(m.group(0), m.group(0)), text

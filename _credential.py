@@ -18,7 +18,6 @@ CREDENTIAL_API_PORT = 8877
 UNLOCK_TIMEOUT = 300       # 解锁等待超时 (s)
 APPROVAL_TIMEOUT = 300     # 审批等待超时 (s)
 RATE_LIMIT_INTERVAL = 2.0  # 凭据请求最小间隔 (s)
-KP_FIELDS = {"password", "username", "url", "title"}
 
 
 class CredentialMixin:
@@ -233,7 +232,7 @@ class CredentialMixin:
     # ── Helpers ──
 
     async def _cleanup_request(self, req_id: str):
-        """安全清理审批��求及其关联的 approval 消息映射。
+        """安全清理审批请求及其关联的 approval 消息映射。
         调用者必须持有 self._lock。"""
         self.pending_requests.pop(req_id, None)
         for eid, rid in list(self.approval_msgs.items()):

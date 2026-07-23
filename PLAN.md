@@ -38,8 +38,14 @@
 - 双重 shutdown 加固：`proxy._shutting_down` 标志防止重复关闭
 - `approved` 三态判断显式化：`if approved is not True`（`None`/`False`/`True` 三态）
 
-### ✅ 阶段 6 — Mixin 类拆分
+### ��� 阶段 6 — Mixin 类拆分
 5 个 Mixin + 1 个主类，MRO: `CredentialProxy → TokenMixin, TpmMixin, MatrixMixin, CredentialMixin, LlmMixin → object`
+
+### ✅ 阶段 7 — 审核修复 (2026-07-23)
+- **关键 Bug**: `_llm.py` URL 构造 `upstream + path_qs` 在 upstream 含路径前���（如 `/v1`）时导致双��路径。改用 `match_info.tail` + `query_string`。
+- **废弃 API**: `_tpm.py` 中 `asyncio.get_event_loop()` 改为 `get_running_loop()`。
+- **死���码**: 移除 `_credential.py` 中未使用的 `KP_FIELDS` 常量。
+- **文档**: `proxy.py` 中 `LLM_*` 示例不再包含 `/v1` 路径前缀。
 
 ## 部署方式不变
 所有文件放同一目录，入口仍是 `python3 proxy.py <homeserver> <room_id> <access_token>`。
