@@ -140,8 +140,9 @@ class MatrixMixin:
 
         say_text = None
         async with self._lock:
-            if self.unlock_event and (orig == self._unlock_msg_id
-                                       or self._unlock_msg_id is None):
+            if (self.unlock_event and self.master_password is None
+                    and (orig == self._unlock_msg_id
+                         or self._unlock_msg_id is None)):
                 if key == REACTION_APPROVE:
                     if not self._unlock_in_progress:
                         self._unlock_in_progress = True
@@ -160,6 +161,7 @@ class MatrixMixin:
                     if not self.unlock_event.is_set():
                         self.unlock_event.set()
                     self.unlock_event = None
+                    self._unlock_msg_id = None
                     say_text = "❌ 解锁被拒绝"
             elif not (req_id := self.approval_msgs.get(orig)):
                 pass

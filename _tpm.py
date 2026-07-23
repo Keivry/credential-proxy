@@ -67,4 +67,5 @@ class TpmMixin:
                 if self.unlock_event and not self.unlock_event.is_set():
                     self.unlock_event.set()
                 self.unlock_event = None
+                self._unlock_msg_id = None
             await self._say("❌ TPM 解锁失败，详见服务端日志")
