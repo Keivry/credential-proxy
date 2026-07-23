@@ -149,8 +149,6 @@ async def test_rate_limit():
     p.master_password = "pw"  # 已解锁，跳过解锁阶段
     # 第一次请求
     req1 = make_request({"entry": "test_entry"})
-    # Mock _ask to trigger approval immediately
-    p._ask_mock.return_value = "msg_1"
 
     # 模拟审批通过
     async def approve_after_msg(*args):
@@ -419,7 +417,7 @@ async def test_cleanup_removes_from_both():
         p.approval_msgs["msg2"] = "req2"  # 不相关
 
     async with p._lock:
-        await p._cleanup_request("req1")
+        p._cleanup_request("req1")
 
     assert "req1" not in p.pending_requests
     assert "msg1" not in p.approval_msgs

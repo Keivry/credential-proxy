@@ -86,7 +86,6 @@ class CredentialProxy(
         self._unlock_msg_id = None
         self._unlock_in_progress = False
         self._unlock_generation = 0
-        self._unlock_task = None
 
         # ── 审批状态 ──
         self.pending_requests: dict = {}

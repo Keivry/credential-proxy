@@ -155,7 +155,6 @@ class MatrixMixin:
                                 if t.exception() else None
                             ),
                         )
-                        self._unlock_task = task
                         say_text = "⏳ TPM 解封中…"
                 else:
                     if not self.unlock_event.is_set():
