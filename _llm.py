@@ -17,8 +17,12 @@ SSE_MAX_BUF = 1_048_576         # SSE 缓冲区上限 (1MB)
 
 
 def _mk_sse_event(content: str, finish_reason: str | None = None) -> str:
-    """构建 OpenAI 兼容的 SSE data 事件 JSON。"""
-    delta = {"content": content} if finish_reason is None else {}
+    """Build OpenAI-compatible SSE data event JSON.
+    
+    Content is always included when non-empty — OpenAI allows
+    content + finish_reason in the same delta event.
+    """
+    delta = {"content": content} if content else {}
     event = json.dumps({
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
     })
