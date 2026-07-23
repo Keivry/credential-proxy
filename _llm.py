@@ -119,7 +119,14 @@ class LlmMixin:
                                     byte_buf = b""
                         except SSE_CLIENT_GONE as e:
                             logger.debug(f"SSE 客户端断连: {e}")
-                        # 流结束后丢弃不完整的残余行
+                        # 流结束后写入残余字节再 EOF
+                        if byte_buf:
+                            try:
+                                await resp.write(byte_buf)
+                            except (ConnectionResetError,
+                                    ConnectionAbortedError,
+                                    BrokenPipeError):
+                                logger.debug("SSE 残余写入失败")
                         try:
                             await resp.write_eof()
                         except (ConnectionResetError,

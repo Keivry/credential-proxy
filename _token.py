@@ -60,8 +60,8 @@ class TokenMixin:
         mapping = pwd_to_token if pwd_to_token is not None else self.pwd_to_token
         if not mapping:
             return text
-        # 使用完整的 self.pwd_to_token 构建 pattern（安全：不存在的匹配项会 fallback）
-        full = self.pwd_to_token
+        # 使用传入的 mapping 构建 pattern（安全：快照场景下防新注册密码泄漏）
+        full = mapping
         if not full:
             return text
         # 版本检查：token_seq 变化时重建缓存
