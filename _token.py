@@ -55,7 +55,8 @@ class TokenMixin:
 
     def _redact(self, text: str, pwd_to_token: dict | None = None) -> str:
         """用 token 替换文本中的密码。按长度降序，re.sub 单次替换。
-        显式 mapping 时不缓存（每次构建），全集时使用版本缓存。"""
+        显式 mapping 时不缓存（每次构建），全集时使用版本缓存。
+        """
         mapping = pwd_to_token if pwd_to_token is not None else self.pwd_to_token
         if not mapping:
             return text
@@ -65,16 +66,16 @@ class TokenMixin:
             pat = _re.compile("|".join(_re.escape(pwd) for pwd, _ in items))
             repl = {pwd: token for pwd, token in mapping.items()}
             return pat.sub(lambda m: repl.get(m.group(0), m.group(0)), text)
-        # 全集：使用版本缓存
+        # 全集：使用版本缓存（pattern + repl dict 同时缓存）
         if getattr(self, "_redact_cache_ver", -1) != self._token_seq:
             items = sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True)
             self._redact_cache_pat = _re.compile(
                 "|".join(_re.escape(pwd) for pwd, _ in items),
             )
+            self._redact_cache_repl = dict(mapping)
             self._redact_cache_ver = self._token_seq
-        repl = {pwd: token for pwd, token in mapping.items()}
         return self._redact_cache_pat.sub(
-            lambda m: repl.get(m.group(0), m.group(0)), text,
+            lambda m: self._redact_cache_repl.get(m.group(0), m.group(0)), text,
         )
 
     def _restore(self, text: str, token_to_pwd: dict | None = None) -> str:
@@ -97,7 +98,8 @@ class TokenMixin:
             self._restore_cache_pat = _re.compile(
                 "|".join(_re.escape(tok) for tok, _ in items),
             )
+            self._restore_cache_repl = dict(mapping)
             self._restore_cache_ver = self._token_seq
         return self._restore_cache_pat.sub(
-            lambda m: mapping.get(m.group(0), m.group(0)), text,
+            lambda m: self._restore_cache_repl.get(m.group(0), m.group(0)), text,
         )
