@@ -46,6 +46,8 @@ class TpmMixin:
             pw = await asyncio.get_event_loop().run_in_executor(
                 None, self._tpm_unseal,
             )
+            if not pw:
+                raise RuntimeError("TPM 解封返回空密码")
             async with self._lock:
                 if self._unlock_generation != generation:
                     return  # 过时的 unlock task

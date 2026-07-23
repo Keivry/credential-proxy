@@ -1,11 +1,15 @@
 """CredentialMixin — HTTP API：凭据查询（/credential）+ 健康检查（/health）。"""
 import asyncio
-import json
 import logging
 import time
 import uuid
 
 from aiohttp import web
+
+try:
+    from pykeepass import PyKeePass
+except ImportError:
+    PyKeePass = None
 
 logger = logging.getLogger("credential-proxy")
 
@@ -35,13 +39,13 @@ class CredentialMixin:
     # ── Health ──
 
     async def handle_health(self, _request) -> web.Response:
-        async with self._lock:
-            return web.json_response({
-                "status": "ok",
-                "unlocked": self.master_password is not None,
-                "pending": len(self.pending_requests),
-                "llm_secrets": len(self.pwd_to_token),
-            })
+        """健康检查端点（无锁 — 只读属性快照）。"""
+        return web.json_response({
+            "status": "ok",
+            "unlocked": self.master_password is not None,
+            "pending": len(self.pending_requests),
+            "llm_secrets": len(self.pwd_to_token),
+        })
 
     # ── Credential ──
 
@@ -57,22 +61,27 @@ class CredentialMixin:
 
         try:
             data = await request.json()
-        except (json.JSONDecodeError, Exception):
-            return web.json_response({"error": "invalid json"}, status=400)
+        except Exception:
+            return web.json_response({"error": "JSON 格式错误"}, status=400)
 
         entry_name = data.get("entry", "").strip()
         field = data.get("field", "").strip()
         use_token = data.get("token", True)
         if not entry_name:
-            return web.json_response({"error": "missing entry"}, status=400)
+            return web.json_response({"error": "缺少 entry 参数"}, status=400)
 
         # ── 解锁阶段 ──
         async with self._lock:
             if not self.master_password:
                 if not self.unlock_event:
+                    # 首次触发解锁：创建 Event 并请求审批
                     self.unlock_event = asyncio.Event()
                     need_ask = True
+                elif self._unlock_in_progress:
+                    # 解锁已在进行中：不重复发审批消息，只等待
+                    need_ask = False
                 else:
+                    # Event 存在但未进行中（可能上次解锁失败）：复用 Event
                     need_ask = False
                 unlock_evt = self.unlock_event
             else:
@@ -128,7 +137,8 @@ class CredentialMixin:
             async with self._lock:
                 req = self.pending_requests.get(req_id)
                 if req and req.get("approved") is True:
-                    pass  # 刚好在超时前被批准
+                    # 刚好在超时前被批准 — 继续正常流程
+                    pass
                 else:
                     await self._cleanup_request(req_id)
                     return web.json_response({"error": "审批超时"}, status=408)
@@ -141,8 +151,16 @@ class CredentialMixin:
                 return web.json_response({"error": "审批被拒绝"}, status=403)
 
         # ── 取凭据 ──
+        if self.kdbx_path is None:
+            return web.json_response(
+                {"error": "密码库未配置（db/ 目录下无 .kdbx 文件）"},
+                status=503,
+            )
         try:
-            from pykeepass import PyKeePass
+            if PyKeePass is None:
+                return web.json_response(
+                    {"error": "pykeepass 未安装"}, status=503,
+                )
             loop = asyncio.get_running_loop()
             kp = None
             async with self._lock:
