@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.coverage
+.venv/
+.git/
+.gitignore
+sync_token
+tpm/*
+!tpm/.gitkeep
+db/*.kdbx
+db/*.key
+test_*.py
+docker-compose.yml
