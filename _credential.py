@@ -15,7 +15,11 @@ except ImportError:
 logger = logging.getLogger("credential-proxy")
 
 # ── Constants ──
-_CREDENTIAL_API_PORT = int(os.environ.get("CREDENTIAL_PORT", "8877"))
+_CREDENTIAL_PORT_RAW = os.environ.get("CREDENTIAL_PORT", "8877")
+try:
+    _CREDENTIAL_API_PORT = int(_CREDENTIAL_PORT_RAW)
+except (ValueError, TypeError):
+    _CREDENTIAL_API_PORT = 8877
 UNLOCK_TIMEOUT = 300       # 解锁等待超时 (s)
 APPROVAL_TIMEOUT = 300     # 审批等待超时 (s)
 RATE_LIMIT_INTERVAL = 2.0  # 凭据请求最小间隔 (s)
@@ -161,27 +165,27 @@ class CredentialMixin:
                     {"error": "pykeepass 未安装"}, status=503,
                 )
             loop = asyncio.get_running_loop()
-            # 锁外获取 KeePass 缓存引用；若未缓存则在锁外构造（避免 IO 阻塞锁）
-            async with self._lock:
-                kp = self._kp
-            if kp is None:
-                kp = await loop.run_in_executor(
-                    None,
-                    lambda: PyKeePass(
-                        self.kdbx_path, password=mp,
-                        keyfile=self.keyfile_path,
-                    ),
-                )
-                # 缓存写入用锁保护（与 _kp 读取互斥）
+            # _kp_semaphore 序列化所有 KeePass 访问（PyKeePass 非线程安全）
+            async with self._kp_semaphore:
                 async with self._lock:
-                    if self._kp is None:
-                        self._kp = kp
-                    else:
-                        kp = self._kp  # 其他协程已缓存，用已有的
-            entry = await loop.run_in_executor(
-                None,
-                lambda: kp.find_entries(title=entry_name, first=True),
-            )
+                    kp = self._kp
+                if kp is None:
+                    kp = await loop.run_in_executor(
+                        None,
+                        lambda: PyKeePass(
+                            self.kdbx_path, password=mp,
+                            keyfile=self.keyfile_path,
+                        ),
+                    )
+                    async with self._lock:
+                        if self._kp is None:
+                            self._kp = kp
+                        else:
+                            kp = self._kp
+                entry = await loop.run_in_executor(
+                    None,
+                    lambda: kp.find_entries(title=entry_name, first=True),
+                )
             if not entry:
                 return web.json_response(
                     {"error": f"未找到 {entry_name}"}, status=404,
