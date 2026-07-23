@@ -49,7 +49,7 @@ class CredentialProxy:
         self.homeserver = homeserver
         self.room_id = room_id
         self.access_token = access_token
-        self.master_password = None
+        self.master_password = None  # stored as bytearray for explicit zeroing
         self.kdbx_path = None
         self.keyfile_path = None
         self.pending_requests = {}
@@ -59,6 +59,7 @@ class CredentialProxy:
         self._lock = asyncio.Lock()
         self._unlock_in_progress = False
         self._unlock_task = None
+        self._unlock_generation = 0
         self._runners = []
         self._kp = None  # KeePass cache
         self._shutting_down = False
@@ -105,6 +106,9 @@ class CredentialProxy:
             if value in self.pwd_to_token:
                 self.pwd_to_token.move_to_end(value)
                 return self.pwd_to_token[value]
+            if re.match(r'__VG_CRED_\d{4}__', value):
+                logger.error(f"密码值匹配 token 格式，拒绝注册: {value[:20]}...")
+                raise ValueError("密码值不能匹配内部 token 格式")
             self._token_seq += 1
             token = _make_token(self._token_seq)
             if len(self.pwd_to_token) >= MAX_TOKEN_ENTRIES:
@@ -184,7 +188,7 @@ class CredentialProxy:
             logger.warning("读取 sync_token 失败", exc_info=True)
 
         retry_delay = 1
-        while True:
+        while not self._shutting_down:
             try:
                 resp = await self.client.sync(timeout=30000, since=since, full_state=False)
                 retry_delay = 1
@@ -207,7 +211,7 @@ class CredentialProxy:
         b = event.body.strip()
         if b == "lock proxy":
             async with self._lock:
-                self.master_password = None
+                self.master_password = None  # stored as bytearray for explicit zeroing
                 if self.unlock_event and not self.unlock_event.is_set():
                     self.unlock_event.set()
                 self.unlock_event = None
@@ -256,7 +260,9 @@ class CredentialProxy:
                 if key == "✅":
                     if not self._unlock_in_progress:
                         self._unlock_in_progress = True
-                        task = asyncio.create_task(self._do_unlock())
+                        self._unlock_generation += 1
+                        gen = self._unlock_generation
+                        task = asyncio.create_task(self._do_unlock(gen))
                         task.add_done_callback(lambda t: t.exception())
                         self._unlock_task = task
                         say_text = "⏳ TPM 解封中…"
@@ -279,12 +285,12 @@ class CredentialProxy:
         if say_text:
             await self._say(say_text)
 
-    async def _do_unlock(self):
+    async def _do_unlock(self, generation=0):
         try:
             pw = await asyncio.get_event_loop().run_in_executor(None, self._tpm_unseal)
             async with self._lock:
-                if not self._unlock_in_progress:
-                    return
+                if self._unlock_generation != generation:
+                    return  # 过时的 unlock task，已被新实例替代
                 self.master_password = pw
                 self._kp = None  # 密码变更，清缓存
                 self._unlock_in_progress = False
@@ -514,8 +520,14 @@ class CredentialProxy:
 
             if body_text:
                 out_body = self._redact(body_text, snapshot_p2t).encode("utf-8")
+                # 收集本次请求实际使用的 token，仅还原这些（防 LLM 幻觉泄露）
+                used_tokens = set()
+                for token in re.finditer(rb'__VG_CRED_\d{4}__', out_body):
+                    used_tokens.add(token.group().decode())
+                active_t2p = {t: p for t, p in snapshot_t2p.items() if t in used_tokens}
             else:
                 out_body = b""
+                active_t2p = {}
 
             # 透传 Hermes 的所有 header（含 Authorization）
             headers = {}
@@ -544,31 +556,26 @@ class CredentialProxy:
                     )
                     await resp.prepare(request)
 
-                    buf = ""
+                    byte_buf = b""
                     MAX_BUF = 1_048_576  # 1MB
                     try:
                         async for chunk in upstream_resp.content.iter_chunked(4096):
-                            chunk_text = chunk.decode(
-                                "utf-8", errors="replace"
-                            )
-                            buf += chunk_text
-                            if len(buf.encode("utf-8")) > MAX_BUF:
+                            byte_buf += chunk
+                            if len(byte_buf) > MAX_BUF:
                                 logger.warning(
                                     "SSE buf 超过 1MB 上限，强制截断"
                                 )
-                                # 截断到最近换行符，保持行完整性
-                                char_cut = max(0, len(buf) - MAX_BUF // 2)
-                                nl = buf.find("\n", char_cut)
-                                buf = buf[nl + 1:] if nl >= 0 else buf[-MAX_BUF // 2:]
-                            while "\n" in buf:
-                                line, buf = buf.split("\n", 1)
-                                line = line.rstrip("\r")
+                                nl = byte_buf.rfind(b"\n", -MAX_BUF // 2)
+                                byte_buf = byte_buf[nl + 1:] if nl >= 0 else byte_buf[-MAX_BUF // 2:]
+                            while b"\n" in byte_buf:
+                                line_bytes, byte_buf = byte_buf.split(b"\n", 1)
+                                line = line_bytes.decode("utf-8", errors="replace").rstrip("\r")
                                 if line.startswith("data:"):
                                     payload = line[5:]
                                     if payload.startswith(" "):
                                         payload = payload[1:]
                                     restored = "data: " + self._restore(
-                                        payload, snapshot_t2p
+                                        payload, active_t2p
                                     )
                                     await resp.write(
                                         (restored + "\n").encode("utf-8")
@@ -585,10 +592,11 @@ class CredentialProxy:
                         asyncio.TimeoutError,
                     ) as e:
                         logger.debug(f"SSE 客户端断连: {e}")
-                    if buf:
+                    if byte_buf:
                         try:
-                            restored_buf = self._restore(buf, snapshot_t2p)
-                            await resp.write(restored_buf.encode("utf-8"))
+                            line = byte_buf.decode("utf-8", errors="replace")
+                            restored_line = self._restore(line, active_t2p)
+                            await resp.write(restored_line.encode("utf-8"))
                         except (
                             ConnectionResetError,
                             ConnectionAbortedError,
@@ -609,7 +617,7 @@ class CredentialProxy:
                     resp_text = resp_body.decode(
                         "utf-8", errors="replace"
                     )
-                    out_text = self._restore(resp_text, snapshot_t2p)
+                    out_text = self._restore(resp_text, active_t2p)
                     return web.Response(
                         body=out_text.encode("utf-8"),
                         status=upstream_resp.status,
