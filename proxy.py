@@ -111,11 +111,11 @@ class CredentialProxy(
                     self.keyfile_path = os.path.join(DB_DIR, f)
             if len(kdbx_files) > 1:
                 logger.warning(
-                    f"DB_DIR 中发现 {len(kdbx_files)} 个 .kdbx 文件，"
-                    f"使用字母序最后一个: {kdbx_files[-1]}"
+                    "DB_DIR 中发现 %d 个 .kdbx 文件，使用字母序最后一个: %s",
+                    len(kdbx_files), kdbx_files[-1],
                 )
         if self.kdbx_path:
-            logger.info(f"密码库: {self.kdbx_path}")
+            logger.info("密码库: %s", self.kdbx_path)
         else:
             logger.warning("未找到 .kdbx 文件，凭据获取将不可用")
 
