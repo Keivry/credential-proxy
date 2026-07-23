@@ -21,13 +21,13 @@ class TpmMixin:
             r = subprocess.run(
                 ["tpm2_load", "-C", self.tpm_primary, "-u", self.tpm_seal_pub,
                  "-r", self.tpm_seal_priv, "-c", seal_ctx],
-                capture_output=True, text=True,
+                capture_output=True, text=True, timeout=30,
             )
             if r.returncode != 0:
                 raise RuntimeError(f"tpm2_load 失败: {r.stderr.strip()}")
             r2 = subprocess.run(
                 ["tpm2_unseal", "-c", seal_ctx],
-                capture_output=True, text=True,
+                capture_output=True, text=True, timeout=30,
             )
             if r2.returncode != 0:
                 raise RuntimeError(f"tpm2_unseal 失败: {r2.stderr.strip()}")

@@ -60,6 +60,7 @@ class CredentialMixin:
             self._last_credential_request = now
 
             # 解锁阶段（与频率限制共享同一次锁）
+            need_ask = False
             if not self.master_password:
                 if not self.unlock_event:
                     # 首次触发解锁：创建 Event 并请求审批
@@ -67,9 +68,6 @@ class CredentialMixin:
                     need_ask = True
                 elif self._unlock_in_progress:
                     # 解锁已在进行中：不重复发审批消息，只等待
-                    need_ask = False
-                else:
-                    # Event 存在但未进行中（可能上次解锁失败）：复用 Event
                     need_ask = False
                 unlock_evt = self.unlock_event
             else:
@@ -163,18 +161,23 @@ class CredentialMixin:
                     {"error": "pykeepass 未安装"}, status=503,
                 )
             loop = asyncio.get_running_loop()
-            kp = None
+            # 锁外获取 KeePass 缓存引用；若未缓存则在锁外构造（避免 IO 阻塞锁）
             async with self._lock:
                 kp = self._kp
-                if kp is None:
-                    kp = await loop.run_in_executor(
-                        None,
-                        lambda: PyKeePass(
-                            self.kdbx_path, password=mp,
-                            keyfile=self.keyfile_path,
-                        ),
-                    )
-                    self._kp = kp
+            if kp is None:
+                kp = await loop.run_in_executor(
+                    None,
+                    lambda: PyKeePass(
+                        self.kdbx_path, password=mp,
+                        keyfile=self.keyfile_path,
+                    ),
+                )
+                # 缓存写入用锁保护（与 _kp 读取互斥）
+                async with self._lock:
+                    if self._kp is None:
+                        self._kp = kp
+                    else:
+                        kp = self._kp  # 其他协程已缓存，用已有的
             entry = await loop.run_in_executor(
                 None,
                 lambda: kp.find_entries(title=entry_name, first=True),

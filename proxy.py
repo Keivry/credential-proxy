@@ -155,17 +155,24 @@ def main():
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
-    if len(sys.argv) < 4:
+    if len(sys.argv) < 3:
         print(
-            f"用法: {sys.argv[0]} <homeserver> <room_id> <access_token>",
+            f"用法: {sys.argv[0]} <homeserver> <room_id>",
             file=sys.stderr,
         )
-        print("\nLLM 代理通过环境变量配置：", file=sys.stderr)
+        print("\\n环境变量：", file=sys.stderr)
+        print("  MATRIX_ACCESS_TOKEN   Matrix Bot 的 access token", file=sys.stderr)
         print("  LLM_8878=https://api.opencode.ai/v1", file=sys.stderr)
         print("  LLM_8879=https://api.deepseek.com/v1", file=sys.stderr)
         sys.exit(1)
 
-    proxy = CredentialProxy(sys.argv[1], sys.argv[2], sys.argv[3])
+    # access_token 从环境变量读取（避免 ps aux 泄露）
+    access_token = os.environ.get("MATRIX_ACCESS_TOKEN", "")
+    if not access_token:
+        print("错误: 请设置 MATRIX_ACCESS_TOKEN 环境变量", file=sys.stderr)
+        sys.exit(1)
+
+    proxy = CredentialProxy(sys.argv[1], sys.argv[2], access_token)
 
     async def shutdown(sig):
         if proxy._shutting_down:
