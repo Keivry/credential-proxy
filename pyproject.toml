@@ -12,7 +12,7 @@ dependencies = [
     "aiohttp>=3.9",
     "matrix-nio>=0.7",
     "pykeepass>=4.0",
-    "brotli",
+    "brotli>=1.0",
 ]
 
 [project.urls]

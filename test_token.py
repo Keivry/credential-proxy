@@ -191,7 +191,7 @@ async def test_redact_special_chars():
 @pytest.mark.asyncio
 async def test_restore_single():
     t = TestToken()
-    token = await t._register_secret("my_pwd")
+    _ = await t._register_secret("my_pwd")
     redacted = t._redact("use my_pwd here")
     restored = t._restore(redacted)
     assert restored == "use my_pwd here"
