@@ -234,6 +234,7 @@ class LlmMixin:
                             # 流结束：flush 残留
                             joined = "".join(content_parts)
                             if joined:
+                                joined = self._restore(joined, active_t2p)
                                 try:
                                     await resp.write(
                                         _mk_sse_event(joined).encode(),
