@@ -1,0 +1,27 @@
+services:
+  credential-proxy:
+    build: .
+    container_name: credential-proxy
+    restart: unless-stopped
+    environment:
+      - HOMESERVER=https://matrix.example.com
+      - ROOM_ID=!yourroomid:matrix.example.com
+      - MATRIX_ACCESS_TOKEN=syt_yourtoken
+      # 可选：
+      # - CREDENTIAL_PORT=8877
+      # - DATA_DIR=/data
+      # LLM 脱敏代理（可选）：
+      # - LLM_8878=https://api.opencode.ai
+      # - LLM_8879=https://api.deepseek.com
+    ports:
+      - "8877:8877"
+      # LLM 代理端口（可选）：
+      # - "8878:8878"
+      # - "8879:8879"
+    volumes:
+      - /path/to/tpm-sealed:/data/tpm:ro
+      - /path/to/keepass-db:/data/db:ro
+    devices:
+      - /dev/tpmrm0:/dev/tpmrm0
+    # Podman 兼容（无 device cgroup，需 --device 参数）：
+    # 直接用 podman/docker run 而非 compose 的 device 字段
