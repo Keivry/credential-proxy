@@ -9,7 +9,7 @@
   _llm.py        — LlmMixin        LLM 反向代理
 
 入口: python proxy.py <homeserver> <room_id>
-LLM 代理通过环境变量配置: LLM_8878=https://api.opencode.ai/v1
+LLM 代理通过环境变量配置: LLM_8878=https://api.opencode.ai
 MATRIX_ACCESS_TOKEN 环境变量提供 Matrix Bot 的 access token
 """
 import asyncio
@@ -163,8 +163,8 @@ def main():
         )
         print("\\n环境变量：", file=sys.stderr)
         print("  MATRIX_ACCESS_TOKEN   Matrix Bot 的 access token", file=sys.stderr)
-        print("  LLM_8878=https://api.opencode.ai/v1", file=sys.stderr)
-        print("  LLM_8879=https://api.deepseek.com/v1", file=sys.stderr)
+        print("        LLM_8878=https://api.opencode.ai", file=sys.stderr)
+        print("        LLM_8879=https://api.deepseek.com", file=sys.stderr)
         sys.exit(1)
 
     # access_token 从环境变量读取（避免 ps aux 泄露）

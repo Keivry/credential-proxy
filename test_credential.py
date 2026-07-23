@@ -6,7 +6,7 @@ Mock: aiohttp Request, Matrix _ask/_say, TPM _tpm_unseal, KeePass PyKeePass。
 import asyncio
 import sys
 import types
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 

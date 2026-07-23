@@ -43,7 +43,8 @@ class TpmMixin:
     async def _do_unlock(self, generation: int = 0):
         """后台任务：TPM 解封 → 设置 master_password。"""
         try:
-            pw = await asyncio.get_event_loop().run_in_executor(
+            loop = asyncio.get_running_loop()
+            pw = await loop.run_in_executor(
                 None, self._tpm_unseal,
             )
             if not pw:
@@ -51,7 +52,7 @@ class TpmMixin:
             async with self._lock:
                 if self._unlock_generation != generation:
                     self._unlock_in_progress = False
-                    return  # 过时��� unlock task
+                    return  # 过时的 unlock task
                 self.master_password = pw
                 self._kp = None  # 密码变更，清 KeePass 缓存
                 self._unlock_in_progress = False
