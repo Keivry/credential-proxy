@@ -1,6 +1,7 @@
 """LlmMixin — LLM API 反向代理：脱敏请求 → 上游 → 还原响应。"""
 import json
 import logging
+import re as _re
 
 from aiohttp import ClientSession, ClientTimeout, web
 
@@ -14,6 +15,8 @@ UPSTREAM_TOTAL_TIMEOUT = 600    # 上游总超时 (s)
 UPSTREAM_CONNECT_TIMEOUT = 30   # 上游连接超时 (s)
 SSE_CHUNK_SIZE = 4096           # SSE 流式块大小
 SSE_MAX_BUF = 1_048_576         # SSE 缓冲区上限 (1MB)
+# 流末清理：匹配不完整 token 前缀（已还原的完整 token 不会被此匹配）
+_PARTIAL_TOKEN_RE = _re.compile(r"__VG_CRED_\d*$")
 
 
 def _mk_sse_event(content: str, finish_reason: str | None = None) -> str:
@@ -249,19 +252,21 @@ class LlmMixin:
                             except SSE_CLIENT_GONE as e:
                                 logger.debug("SSE 客户端断连: %s", e)
 
-                            # 流结束：flush 残留
+                            # 流结束：flush 残留（含 partial token 前缀清理）
                             if content_buf:
                                 content_buf = self._restore(content_buf, active_t2p)
-                                try:
-                                    await resp.write(
-                                        _mk_sse_event(content_buf).encode(),
-                                    )
-                                except (
-                                    ConnectionResetError,
-                                    ConnectionAbortedError,
-                                    BrokenPipeError,
-                                ):
-                                    logger.debug("SSE 残余写入失败")
+                                content_buf = _PARTIAL_TOKEN_RE.sub("", content_buf)
+                                if content_buf:
+                                    try:
+                                        await resp.write(
+                                            _mk_sse_event(content_buf).encode(),
+                                        )
+                                    except (
+                                        ConnectionResetError,
+                                        ConnectionAbortedError,
+                                        BrokenPipeError,
+                                    ):
+                                        logger.debug("SSE 残余写入失败")
                             if byte_buf:
                                 try:
                                     residual = byte_buf.decode(
