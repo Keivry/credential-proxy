@@ -22,6 +22,7 @@ services:
       - /path/to/tpm-sealed:/data/tpm:ro
       - /path/to/keepass-db:/data/db:ro
     devices:
+      - /dev/tpm0:/dev/tpm0
       - /dev/tpmrm0:/dev/tpmrm0
     # Podman 兼容（无 device cgroup，需 --device 参数）：
     # 直接用 podman/docker run 而非 compose 的 device 字段
