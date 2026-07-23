@@ -52,7 +52,7 @@ class LlmMixin:
         session = self._shared_session  # 共享会话
 
         async def handler(request):
-            target_url = upstream + request.path_qs
+            target_url = upstream.rstrip("/") + "/" + request.path_qs.lstrip("/")
             body = await request.read()
             body_text = body.decode("utf-8", errors="replace") if body else ""
 
@@ -122,17 +122,21 @@ class LlmMixin:
                                     SSE_CHUNK_SIZE,
                                 ):
                                     byte_buf.extend(chunk)
-                                    while (idx := byte_buf.find(b"\n")) >= 0:
-                                        line_bytes = bytes(byte_buf[:idx])
-                                        del byte_buf[:idx + 1]
+                                    pos = 0
+                                    while (idx := byte_buf.find(
+                                        b"\n", pos,
+                                    )) >= 0:
+                                        line_bytes = bytes(byte_buf[pos:idx])
+                                        pos = idx + 1
                                         line = line_bytes.decode(
                                             "utf-8", errors="replace",
                                         ).rstrip("\r")
 
-                                        # 非 data 行：直接透传
+                                        # 非 data 行：还原后透传（防 token 泄漏）
                                         if not line.startswith("data:"):
                                             await resp.write(
-                                                (line + "\n").encode("utf-8"),
+                                                (self._restore(line, active_t2p)
+                                                 + "\n").encode("utf-8"),
                                             )
                                             continue
 
@@ -159,10 +163,11 @@ class LlmMixin:
                                             )
 
                                             if "content" not in delta:
-                                                # 非 content 事件：先 flush 累积内容
+                                                # 非 content 事件：先 flush 累积内容，再还原后写出
                                                 await _flush(content_buf)
                                                 await resp.write(
-                                                    (line + "\n").encode("utf-8"),
+                                                    (self._restore(line, active_t2p)
+                                                     + "\n").encode("utf-8"),
                                                 )
                                                 continue
 
@@ -212,12 +217,21 @@ class LlmMixin:
                                         ):
                                             logger.warning(
                                                 "SSE JSON 解析失败，"
-                                                "原样转发: %s...",
+                                                "还原后转发: %s...",
                                                 payload[:80],
                                             )
                                             await resp.write(
-                                                (line + "\n").encode("utf-8"),
+                                                (self._restore(line, active_t2p)
+                                                 + "\n").encode("utf-8"),
                                             )
+
+                                    # Trim processed portion (O(1) memmove vs O(n²) del)
+                                    if pos > 0:
+                                        byte_buf = (
+                                            bytearray(byte_buf[pos:])
+                                            if pos < len(byte_buf)
+                                            else bytearray()
+                                        )
 
                                     # 缓冲区溢出保护
                                     if len(byte_buf) > SSE_MAX_BUF:
@@ -284,9 +298,12 @@ class LlmMixin:
                                 ):
                                     byte_buf.extend(chunk)
                                     # 先处理完整行，再检查缓冲区（防截断丢数据）
-                                    while (idx := byte_buf.find(b"\n")) >= 0:
-                                        line_bytes = bytes(byte_buf[:idx])
-                                        del byte_buf[:idx + 1]
+                                    pos = 0
+                                    while (idx := byte_buf.find(
+                                        b"\n", pos,
+                                    )) >= 0:
+                                        line_bytes = bytes(byte_buf[pos:idx])
+                                        pos = idx + 1
                                         line = line_bytes.decode(
                                             "utf-8", errors="replace",
                                         ).rstrip("\r")
@@ -304,6 +321,13 @@ class LlmMixin:
                                             await resp.write(
                                                 (line + "\n").encode("utf-8"),
                                             )
+                                    # Trim processed portion
+                                    if pos > 0:
+                                        byte_buf = (
+                                            bytearray(byte_buf[pos:])
+                                            if pos < len(byte_buf)
+                                            else bytearray()
+                                        )
                                     if len(byte_buf) > SSE_MAX_BUF:
                                         logger.warning(
                                             "SSE 缓冲区超过 1MB 上限，"

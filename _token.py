@@ -35,7 +35,7 @@ class TokenMixin:
                 self.pwd_to_token.move_to_end(value)
                 return self.pwd_to_token[value]
             if TOKEN_STR_RE.fullmatch(value) or value.startswith(TOKEN_PREFIX):
-                logger.warning("密码值匹配内部 token 格式或前缀，拒绝注册: %s...", value[:20])
+                logger.warning("密码值匹配内部 token 格式或前缀，拒绝注册（值已截断不记录）")
                 raise ValueError("密码值不能匹配内部 token 格式或以 token 前缀开头")
             self._token_seq += 1
             token = _make_token(self._token_seq)
@@ -75,8 +75,11 @@ class TokenMixin:
             self._redact_cache_repl = dict(mapping)
             self._redact_cache_ver = self._token_seq
         return self._redact_cache_pat.sub(
-            lambda m: self._redact_cache_repl.get(m.group(0), m.group(0)), text,
+            self._redact_cache_repl_func, text,
         )
+
+    def _redact_cache_repl_func(self, m):
+        return self._redact_cache_repl.get(m.group(0), m.group(0))
 
     def _restore(self, text: str, token_to_pwd: dict | None = None) -> str:
         """将 token 还原为原始密码。
@@ -101,5 +104,8 @@ class TokenMixin:
             self._restore_cache_repl = dict(mapping)
             self._restore_cache_ver = self._token_seq
         return self._restore_cache_pat.sub(
-            lambda m: self._restore_cache_repl.get(m.group(0), m.group(0)), text,
+            self._restore_cache_repl_func, text,
         )
+
+    def _restore_cache_repl_func(self, m):
+        return self._restore_cache_repl.get(m.group(0), m.group(0))
