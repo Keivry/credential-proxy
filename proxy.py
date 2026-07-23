@@ -106,7 +106,7 @@ class CredentialProxy:
             if value in self.pwd_to_token:
                 self.pwd_to_token.move_to_end(value)
                 return self.pwd_to_token[value]
-            if re.match(r'__VG_CRED_\d{4}__', value):
+            if re.fullmatch(r'__VG_CRED_\d{4}__', value):
                 logger.error(f"密码值匹配 token 格式，拒绝注册: {value[:20]}...")
                 raise ValueError("密码值不能匹配内部 token 格式")
             self._token_seq += 1
@@ -426,6 +426,7 @@ class CredentialProxy:
             async with self._lock:
                 self.pending_requests.pop(req_id, None)
             return web.json_response({"error": "无法发送审批消息"}, status=503)
+        # 立即建立映射，防 reaction 在加锁前到达
         async with self._lock:
             self.approval_msgs[msg_id] = req_id
         try:
