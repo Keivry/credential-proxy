@@ -363,7 +363,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.9" },
-    { name = "brotli" },
+    { name = "brotli", specifier = ">=1.0" },
     { name = "matrix-nio", specifier = ">=0.7" },
     { name = "pykeepass", specifier = ">=4.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
