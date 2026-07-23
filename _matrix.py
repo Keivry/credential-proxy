@@ -48,7 +48,7 @@ class MatrixMixin:
             logger.exception("Matrix whoami 失败，bot 不可用")
             return
         self.client.user_id = whoami.user_id
-        logger.info(f"Bot: {self.client.user_id}")
+        logger.info("Bot: %s", self.client.user_id)
         self.client.add_event_callback(self.on_text, RoomMessageText)
         self.client.add_event_callback(self.on_reaction, ReactionEvent)
 
@@ -80,7 +80,7 @@ class MatrixMixin:
                     except Exception:
                         logger.debug("保存 sync_token 失败", exc_info=True)
             except Exception:
-                logger.exception(f"Matrix sync 失败，{retry_delay}s 后重试")
+                logger.exception("Matrix sync 失败，%ds 后重试", retry_delay)
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, MAX_RETRY_DELAY)
 
@@ -216,8 +216,8 @@ class MatrixMixin:
                     logger.debug("_ask 添加 reaction 失败", exc_info=True)
             if count < len(REACTIONS):
                 logger.warning(
-                    f"_ask 仅 {count}/{len(REACTIONS)} 个 reaction 成功"
-                    "，消息仍然可用"
+                    "_ask 仅 %d/%d 个 reaction 成功，消息仍然可用",
+                    count, len(REACTIONS),
                 )
         return eid
 
