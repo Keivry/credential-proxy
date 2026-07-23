@@ -86,11 +86,20 @@ class TokenMixin:
         mapping = token_to_pwd if token_to_pwd is not None else self.token_to_pwd
         if not mapping:
             return text
-        # 显式 mapping：每次构建（subset 场景，不缓存）
+        # 显式 mapping：使用 id 缓存（同一 stream 中 active_t2p 不变）
         if token_to_pwd is not None:
-            items = sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True)
-            pat = _re.compile("|".join(_re.escape(tok) for tok, _ in items))
-            return pat.sub(lambda m: mapping.get(m.group(0), m.group(0)), text)
+            cache_key = id(token_to_pwd)
+            if getattr(self, "_restore_sub_key", 0) != cache_key:
+                items = sorted(
+                    mapping.items(), key=lambda x: len(x[0]), reverse=True,
+                )
+                self._restore_sub_pat = _re.compile(
+                    "|".join(_re.escape(tok) for tok, _ in items),
+                )
+                self._restore_sub_key = cache_key
+            return self._restore_sub_pat.sub(
+                lambda m: mapping.get(m.group(0), m.group(0)), text,
+            )
         # 全集：使用版本缓存
         if getattr(self, "_restore_cache_ver", -1) != self._token_seq:
             items = sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True)
