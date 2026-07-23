@@ -33,7 +33,7 @@ class CredentialMixin:
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", port).start()
         self._runners.append(runner)
-        logger.info(f"Credential API → 0.0.0.0:{port}")
+        logger.info("Credential API → 0.0.0.0:%d", port)
 
     # ── Health ──
 

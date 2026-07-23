@@ -123,7 +123,7 @@ class LlmMixin:
                                     if len(byte_buf) > SSE_MAX_BUF:
                                         byte_buf = bytearray()
                         except SSE_CLIENT_GONE as e:
-                            logger.debug(f"SSE 客户端断连: {e}")
+                            logger.debug("SSE 客户端断连: %s", e)
                         # 流结束后写入残余字节再 EOF
                         if byte_buf:
                             try:
@@ -165,7 +165,7 @@ class LlmMixin:
                         )
             except Exception:
                 logger.exception(
-                    f"LLM 上游请求失败: {request.method} {target_url}"
+                    "LLM 上���请求失败: %s %s", request.method, target_url,
                 )
                 raise
 
@@ -176,4 +176,4 @@ class LlmMixin:
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", port).start()
         self._runners.append(runner)
-        logger.info(f"LLM 代理 → 0.0.0.0:{port} → {upstream}")
+        logger.info("LLM 代理 → 0.0.0.0:%d → %s", port, upstream)
