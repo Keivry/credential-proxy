@@ -110,7 +110,12 @@ class CredentialMixin:
         if unlock_evt is not None:
             try:
                 await asyncio.wait_for(unlock_evt.wait(), timeout=UNLOCK_TIMEOUT)
-            except asyncio.TimeoutError:
+            except TimeoutError:
+                async with self._lock:
+                    if self.unlock_event and not self.unlock_event.is_set():
+                        self.unlock_event.set()
+                    self.unlock_event = None
+                    self._unlock_msg_id = None
                 return web.json_response({"error": "解锁超时"}, status=408)
 
         # ── 审批阶段 ──
@@ -129,7 +134,7 @@ class CredentialMixin:
         )
         if msg_id is None:
             async with self._lock:
-                await self._cleanup_request(req_id)
+                self._cleanup_request(req_id)
             return web.json_response(
                 {"error": "无法发送审批消息"}, status=503,
             )
@@ -138,20 +143,20 @@ class CredentialMixin:
 
         try:
             await asyncio.wait_for(evt.wait(), timeout=APPROVAL_TIMEOUT)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             async with self._lock:
                 req = self.pending_requests.get(req_id)
                 if req and req.get("approved") is True:
                     # 刚好在超时前被批准 — 继续正常流程
                     pass
                 else:
-                    await self._cleanup_request(req_id)
+                    self._cleanup_request(req_id)
                     return web.json_response({"error": "审批超时"}, status=408)
 
         async with self._lock:
             req = self.pending_requests.get(req_id)
             approved = req.get("approved") if req else None
-            await self._cleanup_request(req_id)
+            self._cleanup_request(req_id)
             if approved is not True:
                 return web.json_response({"error": "审批被拒绝"}, status=403)
 
@@ -238,7 +243,7 @@ class CredentialMixin:
 
     # ── Helpers ──
 
-    async def _cleanup_request(self, req_id: str):
+    def _cleanup_request(self, req_id: str):
         """安全清理审批请求及其关联的 approval 消息映射。
         调用者必须持有 self._lock。"""
         self.pending_requests.pop(req_id, None)
