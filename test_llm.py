@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import json
 import sys
 import types
 from collections import OrderedDict
@@ -471,3 +472,60 @@ class TestFinishReasonAndDone:
         content = holder._restore(content, active_t2p)
         assert token not in content
         assert pwd in content
+
+
+# ═══════════════════════════════════════════════════════════
+# _mk_sse_event 直接单元测试
+# ═══════════════════════════════════════════════════════════
+
+from _llm import _mk_sse_event
+
+
+class TestMkSseEvent:
+    """验证 _mk_sse_event 的 SSE 输出格式和边界。"""
+
+    def test_content_only(self):
+        result = _mk_sse_event("hello")
+        assert result.startswith("data: ")
+        assert result.endswith("\n")
+        payload = json.loads(result[6:].rstrip("\n"))
+        assert payload["choices"][0]["delta"] == {"content": "hello"}
+        assert payload["choices"][0]["finish_reason"] is None
+
+    def test_content_with_finish_reason(self):
+        """修复后：content 和 finish_reason 可共存。"""
+        result = _mk_sse_event("hello", "stop")
+        payload = json.loads(result[6:].rstrip("\n"))
+        assert payload["choices"][0]["delta"] == {"content": "hello"}
+        assert payload["choices"][0]["finish_reason"] == "stop"
+
+    def test_empty_content_with_finish_reason(self):
+        """空 content + finish_reason → delta={}（OpenAI 终端事件）。"""
+        result = _mk_sse_event("", "stop")
+        payload = json.loads(result[6:].rstrip("\n"))
+        assert payload["choices"][0]["delta"] == {}
+        assert payload["choices"][0]["finish_reason"] == "stop"
+
+    def test_empty_content_no_finish(self):
+        result = _mk_sse_event("")
+        payload = json.loads(result[6:].rstrip("\n"))
+        assert payload["choices"][0]["delta"] == {}
+        assert payload["choices"][0]["finish_reason"] is None
+
+    def test_falsy_content_zero(self):
+        """content='0' 是 truthy 字符串，不应被误判为空。"""
+        result = _mk_sse_event("0", "stop")
+        payload = json.loads(result[6:].rstrip("\n"))
+        assert payload["choices"][0]["delta"] == {"content": "0"}
+        assert payload["choices"][0]["finish_reason"] == "stop"
+
+    def test_sse_format_structure(self):
+        """验证 SSE data: 前缀和 JSON 结构完整性。"""
+        result = _mk_sse_event("text")
+        assert result.startswith("data: ")
+        assert result.endswith("\n")
+        # 应包含完整 JSON
+        data = result[6:].strip()
+        parsed = json.loads(data)
+        assert "choices" in parsed
+        assert isinstance(parsed["choices"], list)
