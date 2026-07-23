@@ -9,9 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=ghcr.io/astral-sh/uv:0.11.6 /uv /usr/local/bin/uv
 
 # 依赖（Export locked deps → pip install to system Python）
-COPY pyproject.toml uv.lock /tmp/deps/
+COPY pyproject.toml uv.lock README.md /tmp/deps/
 RUN --mount=type=cache,target=/root/.cache/uv \
-    cd /tmp/deps && uv export --frozen --no-dev --no-hashes -o requirements.txt \
+    cd /tmp/deps && uv export --frozen --no-dev --no-hashes --no-emit-project -o requirements.txt \
     && uv pip install --system --no-cache -r requirements.txt \
     && rm -rf /tmp/deps
 
