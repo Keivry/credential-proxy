@@ -140,7 +140,8 @@ class MatrixMixin:
 
         say_text = None
         async with self._lock:
-            if self.unlock_event and orig == self._unlock_msg_id:
+            if self.unlock_event and (orig == self._unlock_msg_id
+                                       or self._unlock_msg_id is None):
                 if key == REACTION_APPROVE:
                     if not self._unlock_in_progress:
                         self._unlock_in_progress = True

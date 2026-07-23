@@ -83,17 +83,16 @@ class LlmMixin:
                         )
                         await resp.prepare(request)
 
-                        byte_buf = b""
+                        byte_buf = bytearray()
                         try:
                             async for chunk in upstream_resp.content.iter_chunked(
                                 SSE_CHUNK_SIZE,
                             ):
-                                byte_buf += chunk
+                                byte_buf.extend(chunk)
                                 # 先处理完整行，再检查缓冲区大小（防止截断丢数据）
-                                while b"\n" in byte_buf:
-                                    line_bytes, byte_buf = byte_buf.split(
-                                        b"\n", 1,
-                                    )
+                                while (idx := byte_buf.find(b"\n")) >= 0:
+                                    line_bytes = bytes(byte_buf[:idx])
+                                    del byte_buf[:idx + 1]
                                     line = line_bytes.decode(
                                         "utf-8", errors="replace",
                                     ).rstrip("\r")
@@ -116,7 +115,7 @@ class LlmMixin:
                                     logger.warning(
                                         "SSE 缓冲区超过 1MB 上限，丢弃残余数据"
                                     )
-                                    byte_buf = b""
+                                    byte_buf = bytearray()
                         except SSE_CLIENT_GONE as e:
                             logger.debug(f"SSE 客户端断连: {e}")
                         # 流结束后写入残余字节再 EOF
