@@ -3,7 +3,7 @@ import logging
 
 from aiohttp import web, ClientSession, ClientTimeout
 
-from _matrix import SSE_CLIENT_GONE, HOP_HEADERS
+from _matrix import SSE_CLIENT_GONE
 from _token import TOKEN_RE
 
 logger = logging.getLogger("credential-proxy")
@@ -122,7 +122,15 @@ class LlmMixin:
                         # 流结束后写入残余字节再 EOF
                         if byte_buf:
                             try:
-                                await resp.write(byte_buf)
+                                residual = byte_buf.decode(
+                                    "utf-8", errors="replace",
+                                )
+                                restored = self._restore(
+                                    residual, active_t2p,
+                                )
+                                await resp.write(
+                                    restored.encode("utf-8"),
+                                )
                             except (ConnectionResetError,
                                     ConnectionAbortedError,
                                     BrokenPipeError):

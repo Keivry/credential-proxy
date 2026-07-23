@@ -8,8 +8,9 @@
   _credential.py — CredentialMixin 凭据 HTTP API
   _llm.py        — LlmMixin        LLM 反向代理
 
-入口: python proxy.py <homeserver> <room_id> <access_token>
+入口: python proxy.py <homeserver> <room_id>
 LLM 代理通过环境变量配置: LLM_8878=https://api.opencode.ai/v1
+MATRIX_ACCESS_TOKEN 环境变量提供 Matrix Bot 的 access token
 """
 import asyncio
 import logging
