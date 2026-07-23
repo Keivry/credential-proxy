@@ -165,7 +165,7 @@ class LlmMixin:
                         )
             except Exception:
                 logger.exception(
-                    "LLM 上���请求失败: %s %s", request.method, target_url,
+                    "LLM 上游请求失败: %s %s", request.method, target_url,
                 )
                 raise
 

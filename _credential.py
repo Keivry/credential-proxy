@@ -1,6 +1,7 @@
 """CredentialMixin — HTTP API：凭据查询（/credential）+ 健康检查（/health）。"""
 import asyncio
 import logging
+import os
 import time
 import uuid
 
@@ -14,7 +15,7 @@ except ImportError:
 logger = logging.getLogger("credential-proxy")
 
 # ── Constants ──
-CREDENTIAL_API_PORT = 8877
+_CREDENTIAL_API_PORT = int(os.environ.get("CREDENTIAL_PORT", "8877"))
 UNLOCK_TIMEOUT = 300       # 解锁等待超时 (s)
 APPROVAL_TIMEOUT = 300     # 审批等待超时 (s)
 RATE_LIMIT_INTERVAL = 2.0  # 凭据请求最小间隔 (s)
@@ -25,7 +26,7 @@ class CredentialMixin:
 
     # ── API startup ──
 
-    async def start_credential_api(self, port: int = CREDENTIAL_API_PORT):
+    async def start_credential_api(self, port: int = _CREDENTIAL_API_PORT):
         app = web.Application()
         app.router.add_post("/credential", self.handle_credential)
         app.router.add_get("/health", self.handle_health)

@@ -22,15 +22,16 @@ from collections import OrderedDict
 from _token import TokenMixin
 from _tpm import TpmMixin
 from _matrix import MatrixMixin
-from _credential import CredentialMixin, CREDENTIAL_API_PORT
+from _credential import CredentialMixin, _CREDENTIAL_API_PORT as CREDENTIAL_API_PORT
 from _llm import LlmMixin
 
 logger = logging.getLogger("credential-proxy")
 
 # ── 目录常量 ──
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TPM_DIR = os.path.join(BASE_DIR, "tpm")
-DB_DIR = os.path.join(BASE_DIR, "db")
+DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
+TPM_DIR = os.environ.get("TPM_DIR", os.path.join(DATA_DIR, "tpm"))
+DB_DIR = os.environ.get("DB_DIR", os.path.join(DATA_DIR, "db"))
 
 
 # ── 环境变量解析 ──
@@ -76,7 +77,7 @@ class CredentialProxy(
         self._lock = asyncio.Lock()         # 全局互斥锁
         self._shutting_down = False
         self._start_ts = int(time.time() * 1000)
-        self._base_dir = BASE_DIR
+        self._base_dir = DATA_DIR
 
         # ── 解锁状态 ──
         self.unlock_event = None            # asyncio.Event
@@ -156,15 +157,25 @@ def main():
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
-    if len(sys.argv) < 3:
+    # homeserver / room_id: 环境变量优先，CLI 参数作为后备
+    homeserver = os.environ.get("HOMESERVER", "")
+    room_id = os.environ.get("ROOM_ID", "")
+    if len(sys.argv) >= 3:
+        homeserver = homeserver or sys.argv[1]
+        room_id = room_id or sys.argv[2]
+    if not homeserver or not room_id:
         print(
-            f"用法: {sys.argv[0]} <homeserver> <room_id>",
+            "错误: 请设置 HOMESERVER + ROOM_ID 环境变量，或传命令行参数",
             file=sys.stderr,
         )
         print("\\n环境变量：", file=sys.stderr)
+        print("  HOMESERVER            Matrix homeserver URL", file=sys.stderr)
+        print("  ROOM_ID               Matrix 房间 ID", file=sys.stderr)
         print("  MATRIX_ACCESS_TOKEN   Matrix Bot 的 access token", file=sys.stderr)
-        print("        LLM_8878=https://api.opencode.ai", file=sys.stderr)
-        print("        LLM_8879=https://api.deepseek.com", file=sys.stderr)
+        print("  CREDENTIAL_PORT       凭据 API 端口 (默认 8877)", file=sys.stderr)
+        print("  DATA_DIR              数据目录 (默认 /data)", file=sys.stderr)
+        print("  LLM_8878=https://api.opencode.ai", file=sys.stderr)
+        print("  LLM_8879=https://api.deepseek.com", file=sys.stderr)
         sys.exit(1)
 
     # access_token 从环境变量读取（避免 ps aux 泄露）
@@ -173,7 +184,7 @@ def main():
         print("错误: 请设置 MATRIX_ACCESS_TOKEN 环境变量", file=sys.stderr)
         sys.exit(1)
 
-    proxy = CredentialProxy(sys.argv[1], sys.argv[2], access_token)
+    proxy = CredentialProxy(homeserver, room_id, access_token)
 
     async def shutdown(sig):
         if proxy._shutting_down:
