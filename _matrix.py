@@ -119,7 +119,7 @@ class MatrixMixin:
                 n = len(self.pwd_to_token)
                 self.pwd_to_token.clear()
                 self.token_to_pwd.clear()
-            await self._say(f"🧹 已清除 {n} 个 LLM 密碼映射")
+            await self._say(f"🧹 已清除 {n} 个 LLM 密码映射")
 
     # ── Reaction handling ──
 

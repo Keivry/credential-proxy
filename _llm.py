@@ -42,9 +42,10 @@ class LlmMixin:
             body = await request.read()
             body_text = body.decode("utf-8", errors="replace") if body else ""
 
-            # 拍快照防 "forget secrets" 竞态
-            snapshot_p2t = dict(self.pwd_to_token)
-            snapshot_t2p = dict(self.token_to_pwd)
+            # 拍快照防 "forget secrets" 竞态（需持锁，防快照不一致）
+            async with self._lock:
+                snapshot_p2t = dict(self.pwd_to_token)
+                snapshot_t2p = dict(self.token_to_pwd)
 
             if body_text:
                 out_body = self._redact(body_text, snapshot_p2t).encode("utf-8")

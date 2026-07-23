@@ -24,13 +24,13 @@ class TpmMixin:
                 capture_output=True, text=True,
             )
             if r.returncode != 0:
-                raise RuntimeError(f"tpm2_load: {r.stderr.strip()}")
+                raise RuntimeError(f"tpm2_load 失败: {r.stderr.strip()}")
             r2 = subprocess.run(
                 ["tpm2_unseal", "-c", seal_ctx],
                 capture_output=True, text=True,
             )
             if r2.returncode != 0:
-                raise RuntimeError(f"tpm2_unseal: {r2.stderr.strip()}")
+                raise RuntimeError(f"tpm2_unseal 失败: {r2.stderr.strip()}")
             return r2.stdout.rstrip("\n\r")
         finally:
             try:
@@ -50,7 +50,8 @@ class TpmMixin:
                 raise RuntimeError("TPM 解封返回空密码")
             async with self._lock:
                 if self._unlock_generation != generation:
-                    return  # 过时的 unlock task
+                    self._unlock_in_progress = False
+                    return  # 过时��� unlock task
                 self.master_password = pw
                 self._kp = None  # 密码变更，清 KeePass 缓存
                 self._unlock_in_progress = False
