@@ -50,7 +50,7 @@ class CredentialMixin:
     # ── Credential ──
 
     async def handle_credential(self, request) -> web.Response:
-        # 频率限制
+        # 频率限制 + 解锁状态检查（合并为一次锁）
         async with self._lock:
             now = time.monotonic()
             if now - self._last_credential_request < RATE_LIMIT_INTERVAL:
@@ -59,19 +59,7 @@ class CredentialMixin:
                 )
             self._last_credential_request = now
 
-        try:
-            data = await request.json()
-        except Exception:
-            return web.json_response({"error": "JSON 格式错误"}, status=400)
-
-        entry_name = data.get("entry", "").strip()
-        field = data.get("field", "").strip()
-        use_token = data.get("token", True)
-        if not entry_name:
-            return web.json_response({"error": "缺少 entry 参数"}, status=400)
-
-        # ── 解锁阶段 ──
-        async with self._lock:
+            # 解锁阶段（与频率限制共享同一次锁）
             if not self.master_password:
                 if not self.unlock_event:
                     # 首次触发解锁：创建 Event 并请求审批
@@ -87,6 +75,18 @@ class CredentialMixin:
             else:
                 unlock_evt = None
                 need_ask = False
+
+        # JSON 解析与参数提取（在锁外执行）
+        try:
+            data = await request.json()
+        except Exception:
+            return web.json_response({"error": "JSON 格式错误"}, status=400)
+
+        entry_name = data.get("entry", "").strip()
+        field = data.get("field", "").strip()
+        use_token = data.get("token", True)
+        if not entry_name:
+            return web.json_response({"error": "缺少 entry 参数"}, status=400)
 
         if need_ask:
             msg_id = await self._ask(
@@ -124,7 +124,8 @@ class CredentialMixin:
             f"🔑 凭据请求: {entry_name}\n点 ✅ 批准 或 ❎ 拒绝",
         )
         if msg_id is None:
-            await self._cleanup_request(req_id)
+            async with self._lock:
+                await self._cleanup_request(req_id)
             return web.json_response(
                 {"error": "无法发送审批消息"}, status=503,
             )
@@ -229,9 +230,9 @@ class CredentialMixin:
     # ── Helpers ──
 
     async def _cleanup_request(self, req_id: str):
-        """安全清理审批请求及其关联的 approval 消息映射。"""
-        async with self._lock:
-            self.pending_requests.pop(req_id, None)
-            for eid, rid in list(self.approval_msgs.items()):
-                if rid == req_id:
-                    self.approval_msgs.pop(eid, None)
+        """安全清理审批��求及其关联的 approval 消息映射。
+        调用者必须持有 self._lock。"""
+        self.pending_requests.pop(req_id, None)
+        for eid, rid in list(self.approval_msgs.items()):
+            if rid == req_id:
+                self.approval_msgs.pop(eid, None)

@@ -13,9 +13,9 @@ TOKEN_PREFIX = "__VG_CRED_"
 TOKEN_SUFFIX = "__"
 MAX_TOKEN_ENTRIES = 5000
 SECRET_MIN_LENGTH = 4
-# 用 6 位数字防止 seq 溢出破坏 regex（seq 理论上可超过 9999）
-TOKEN_RE = _re.compile(rb'__VG_CRED_\d{4,6}__')
-TOKEN_STR_RE = _re.compile(r'__VG_CRED_\d{4,6}__')
+# 用无界匹配防止 seq 溢出破坏 regex
+TOKEN_RE = _re.compile(rb'__VG_CRED_\d{4,}__')
+TOKEN_STR_RE = _re.compile(r'__VG_CRED_\d{4,}__')
 
 
 def _make_token(n: int) -> str:
@@ -55,15 +55,27 @@ class TokenMixin:
     # ── Redact / Restore ──
 
     def _redact(self, text: str, pwd_to_token: dict | None = None) -> str:
-        """用 token 替换文本中的密码。按长度降序，re.sub 单次替换。"""
+        """用 token 替换文本中的密码。按长度降序，re.sub 单次替换。
+        编译后的正则缓存在 self._redact_cache，仅 mapping 变更时重建。"""
         mapping = pwd_to_token if pwd_to_token is not None else self.pwd_to_token
         if not mapping:
             return text
-        # 按长度降序、转义正则特殊字符、构建替换模式
-        items = sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True)
-        pattern = _re.compile("|".join(_re.escape(pwd) for pwd, _ in items))
-        repl = {pwd: token for pwd, token in items}
-        return pattern.sub(lambda m: repl[m.group(0)], text)
+        # 使用完整的 self.pwd_to_token 构建 pattern（安全：不存在的匹配项会 fallback）
+        full = self.pwd_to_token
+        if not full:
+            return text
+        # 版本检查：token_seq 变化时重建缓存
+        if getattr(self, '_redact_cache_ver', -1) != self._token_seq:
+            items = sorted(full.items(), key=lambda x: len(x[0]), reverse=True)
+            self._redact_cache_pat = _re.compile(
+                "|".join(_re.escape(pwd) for pwd, _ in items)
+            )
+            self._redact_cache_ver = self._token_seq
+        # 构建当前 mapping 的替换表
+        repl = {pwd: token for pwd, token in mapping.items()}
+        return self._redact_cache_pat.sub(
+            lambda m: repl.get(m.group(0), m.group(0)), text
+        )
 
     def _restore(self, text: str, token_to_pwd: dict | None = None) -> str:
         """将 token 还原为原始密码。"""
