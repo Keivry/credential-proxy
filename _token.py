@@ -5,7 +5,6 @@
 """
 import logging
 import re as _re
-from collections import OrderedDict
 
 logger = logging.getLogger("credential-proxy")
 
@@ -78,10 +77,26 @@ class TokenMixin:
         )
 
     def _restore(self, text: str, token_to_pwd: dict | None = None) -> str:
-        """将 token 还原为原始密码。"""
+        """将 token 还原为原始密码。
+
+        使用 re.sub 单次替换 + 缓存编译的正则。
+        显式 mapping 时不缓存（每次构建），全集时使用版本缓存。
+        """
         mapping = token_to_pwd if token_to_pwd is not None else self.token_to_pwd
         if not mapping:
             return text
-        for token, pwd in mapping.items():
-            text = text.replace(token, pwd)
-        return text
+        # 显式 mapping：每次构建（subset 场景，不缓存）
+        if token_to_pwd is not None:
+            items = sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True)
+            pat = _re.compile("|".join(_re.escape(tok) for tok, _ in items))
+            return pat.sub(lambda m: mapping.get(m.group(0), m.group(0)), text)
+        # 全集：使用版本缓存
+        if getattr(self, '_restore_cache_ver', -1) != self._token_seq:
+            items = sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True)
+            self._restore_cache_pat = _re.compile(
+                "|".join(_re.escape(tok) for tok, _ in items)
+            )
+            self._restore_cache_ver = self._token_seq
+        return self._restore_cache_pat.sub(
+            lambda m: mapping.get(m.group(0), m.group(0)), text
+        )
