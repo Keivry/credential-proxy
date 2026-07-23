@@ -1,0 +1,5 @@
+aiohttp>=3.9
+nio>=0.7
+pykeepass>=4.0
+pytest>=7.0
+pytest-asyncio>=0.21
