@@ -37,8 +37,12 @@ class CredentialMixin:
     async def _check_auto_approve(
         self, entry_name: str, field: str | None, auth: dict,
     ) -> tuple[bool | None, object | None, str]:
-        """默认实现：不执行自动放行。RegistryMixin 覆盖此方法。"""
+        """默认实现（async）：不执行自动放行。RegistryMixin 覆盖此方法。"""
         return None, None, ""
+
+    async def _say(self, text: str) -> None:
+        """默认实现：日志记录。MatrixMixin 覆盖此方法发送 Matrix 消息。"""
+        logger.info('[say] %s', text)
 
     def _check_auto_rate_limit(self, reg_name: str) -> bool:
         """默认实现：不限速。RegistryMixin 覆盖此方法。"""

@@ -309,6 +309,10 @@ class RegistryMixin:
     # ── 自动放行频率限制 ──
 
     def _check_auto_rate_limit(self, reg_name: str) -> bool:
+        """检查自动放行频率限制。
+
+        仅在 on_reaction 持有 self._lock 时调用。
+        单条 dict 写入在 CPython GIL 下安全。"""
         now = time.monotonic()
         last = self._auto_rate_limits.get(reg_name, 0.0)
         if now - last < AUTO_RATE_INTERVAL:
@@ -388,7 +392,7 @@ class RegistryMixin:
 
     def _load_token_registry(self, path: str):
         """从文件加载注册表（Token + Caller），含完整性校验。
-        
+
         仅在 __init__ 中单线程调用（构造函数阶段未启动协程），
         因此不获取 self._lock。后续写入始终在锁内进行。"""
         self._token_registry_path = path
