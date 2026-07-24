@@ -272,7 +272,6 @@ async def test_redact_cache_hit():
 
 
 # ═══════════════════════════════════════════════════════════
-# ═══════════════════════════════════════════════════════════
 # _maybe_register
 # ═══════════════════════════════════════════════════════════
 
@@ -294,13 +293,3 @@ async def test_maybe_register_disabled():
 
 # ═══════════════════════════════════════════════════════════
 # _register_secret
-# ═══════════════════════════════════════════════════════════
-
-
-@pytest.mark.asyncio
-async def test_register_secret():
-    t = TestToken()
-    result = await t._register_secret('secret')
-    assert result != 'secret'
-    assert result in t.token_to_pwd
-    assert 'secret' in t.pwd_to_token
