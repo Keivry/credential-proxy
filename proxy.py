@@ -23,7 +23,7 @@ from collections import OrderedDict
 
 from _credential import _CREDENTIAL_API_PORT as CREDENTIAL_API_PORT
 from _credential import CredentialMixin
-from _llm import LlmMixin
+from _llm import LlmMixin, parse_llm_proxy_env
 from _matrix import MatrixMixin
 from _registry import RegistryMixin
 from _token import TokenMixin
@@ -36,23 +36,6 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get('DATA_DIR', BASE_DIR)
 TPM_DIR = os.environ.get('TPM_DIR', os.path.join(DATA_DIR, 'tpm'))
 DB_DIR = os.environ.get('DB_DIR', os.path.join(DATA_DIR, 'db'))
-
-
-# ── 环境变量解析 ──
-def _parse_proxy_env() -> dict[int, str]:
-    """从 LLM_<PORT>=<URL> 环境变量读取上游配置。"""
-    proxies: dict[int, str] = {}
-    for k, v in os.environ.items():
-        if not k.startswith('LLM_'):
-            continue
-        try:
-            port = int(k[4:])
-        except ValueError:
-            continue
-        proxies[port] = v.strip().rstrip('/')
-        if not proxies[port]:
-            del proxies[port]
-    return proxies
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -178,7 +161,7 @@ class CredentialProxy(
         self._load_token_registry(self._token_registry_path)
 
         # ── LLM 代理配置 (LlmMixin 使用) ──
-        self.proxies = _parse_proxy_env()
+        self.proxies = parse_llm_proxy_env()
         self._shared_session = None  # 在 start_llm_proxies() 创建
         for port, url in sorted(self.proxies.items()):
             logger.info('LLM 代理 → 0.0.0.0:%d → %s', port, url)
@@ -220,7 +203,7 @@ def main():
             '错误: 请设置 HOMESERVER + ROOM_ID 环境变量，或传命令行参数',
             file=sys.stderr,
         )
-        print('\\n环境变量：', file=sys.stderr)
+        print('环境变量：', file=sys.stderr)
         print('  HOMESERVER            Matrix homeserver URL', file=sys.stderr)
         print('  ROOM_ID               Matrix 房间 ID', file=sys.stderr)
         print('  MATRIX_ACCESS_TOKEN   Matrix Bot 的 access token', file=sys.stderr)

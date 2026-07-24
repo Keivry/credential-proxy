@@ -11,19 +11,31 @@ import (
 )
 
 // Register 注册当前脚本到 Proxy
-// Usage: get register --entry <条目> --name <名称> [--desc <描述>] [--auto]
+// Usage: get register --entry <条目> --name <名称> [--desc <描述>] [--auto] [--fields <字段1,字段2>]
 func Register(args []string) {
 	fs := flag.NewFlagSet("register", flag.ExitOnError)
 	name := fs.String("name", "", "注册名称（必填）")
 	entry := fs.String("entry", "", "允许访问的条目（必填，逗号分隔）")
 	desc := fs.String("desc", "", "程序用途描述")
 	auto := fs.Bool("auto", false, "启用自动放行")
+	fields := fs.String("fields", "", "允许的字段名（逗号分隔，默认全部属性）")
 	fs.Parse(args)
 
 	if *name == "" || *entry == "" {
-		fmt.Fprintln(os.Stderr, "用法: get register --name <名称> --entry <条目> [--desc <描述>] [--auto]")
+		fmt.Fprintln(os.Stderr, "用法: get register --name <名称> --entry <条目> [--desc <描述>] [--auto] [--fields <字段1,字段2>]")
 		fs.PrintDefaults()
 		os.Exit(1)
+	}
+
+	// 解析允许的字段列表
+	var allowedFields []string
+	if *fields != "" {
+		for _, f := range strings.Split(*fields, ",") {
+			f = strings.TrimSpace(f)
+			if f != "" {
+				allowedFields = append(allowedFields, f)
+			}
+		}
 	}
 
 	// 读取调用者信息
@@ -34,12 +46,16 @@ func Register(args []string) {
 		os.Exit(1)
 	}
 
-	// 构建 entries 字典（每个条目允许全部字段）
+	// 构建 entries 字典
 	entries := make(map[string][]string)
 	for _, e := range strings.Split(*entry, ",") {
 		e = strings.TrimSpace(e)
 		if e != "" {
-			entries[e] = []string{}
+			if len(allowedFields) > 0 {
+				entries[e] = allowedFields
+			} else {
+				entries[e] = []string{} // 空 slice = 全部属性
+			}
 		}
 	}
 

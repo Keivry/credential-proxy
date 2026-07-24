@@ -19,26 +19,10 @@ import os
 import sys
 from collections import OrderedDict
 
-from _llm import LlmMixin
+from _llm import LlmMixin, parse_llm_proxy_env
 from _token import TokenMixin
 
 logger = logging.getLogger('llm-proxy')
-
-
-def _parse_proxy_env() -> dict[int, str]:
-    """从 LLM_<PORT>=<URL> 环境变量读取上游配置。"""
-    proxies: dict[int, str] = {}
-    for k, v in os.environ.items():
-        if not k.startswith('LLM_'):
-            continue
-        try:
-            port = int(k[4:])
-        except ValueError:
-            continue
-        proxies[port] = v.strip().rstrip('/')
-        if not proxies[port]:
-            del proxies[port]
-    return proxies
 
 
 class LlmOnlyProxy(TokenMixin, LlmMixin):
@@ -49,7 +33,7 @@ class LlmOnlyProxy(TokenMixin, LlmMixin):
         self.pwd_to_token = OrderedDict()
         self.token_to_pwd: dict = {}
         self._token_seq = 0
-        self.proxies = _parse_proxy_env()
+        self.proxies = parse_llm_proxy_env()
         self._shared_session = None
         self._runners: list = []
 

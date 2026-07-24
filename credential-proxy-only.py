@@ -21,26 +21,10 @@ import sys
 from collections import OrderedDict
 
 from _credential import CredentialMixin
-from _llm import LlmMixin
+from _llm import LlmMixin, parse_llm_proxy_env
 from _token import TokenMixin
 
 logger = logging.getLogger('credential-proxy')
-
-
-def _parse_proxy_env() -> dict[int, str]:
-    """从 LLM_<PORT>=<URL> 环境变量读取上游配置。"""
-    proxies: dict[int, str] = {}
-    for k, v in os.environ.items():
-        if not k.startswith('LLM_'):
-            continue
-        try:
-            port = int(k[4:])
-        except ValueError:
-            continue
-        proxies[port] = v.strip().rstrip('/')
-        if not proxies[port]:
-            del proxies[port]
-    return proxies
 
 
 class CredentialProxyOnly(TokenMixin, CredentialMixin, LlmMixin):
@@ -56,7 +40,7 @@ class CredentialProxyOnly(TokenMixin, CredentialMixin, LlmMixin):
         self._token_seq = 0
 
         # ── LLM 代理 ──
-        self.proxies = _parse_proxy_env()
+        self.proxies = parse_llm_proxy_env()
         self._shared_session = None
         self._runners: list = []
 
@@ -82,7 +66,12 @@ class CredentialProxyOnly(TokenMixin, CredentialMixin, LlmMixin):
         self._base_dir = os.path.dirname(os.path.abspath(__file__))
         self._shutting_down = False
 
-        cred_port = int(os.environ.get('CREDENTIAL_API_PORT', '9876'))
+        cred_port_raw = os.environ.get('CREDENTIAL_API_PORT', '9876')
+        try:
+            cred_port = int(cred_port_raw)
+        except (ValueError, TypeError):
+            logger.warning('CREDENTIAL_API_PORT 值无效: %r，使用默认 9876', cred_port_raw)
+            cred_port = 9876
         logger.info('Credential API → 0.0.0.0:%d', cred_port)
         self._cred_port = cred_port
 

@@ -19,8 +19,8 @@ services:
       # - "8878:8878"
       # - "8879:8879"
     volumes:
-      - /path/to/tpm-sealed:/data/tpm:ro
-      - /path/to/keepass-db:/data/db:ro
+      - ${TPM_HOST_PATH:-/path/to/tpm-sealed}:/data/tpm:ro
+      - ${DB_HOST_PATH:-/path/to/keepass-db}:/data/db:ro
     devices:
       - /dev/tpm0:/dev/tpm0
       - /dev/tpmrm0:/dev/tpmrm0

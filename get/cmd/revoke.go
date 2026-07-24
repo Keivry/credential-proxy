@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+
+	"github.com/keivry/credential-proxy/get/internal"
 )
 
 // Revoke 吊销注册
@@ -20,20 +22,75 @@ func Revoke(args []string) {
 		os.Exit(1)
 	}
 
-	fmt.Fprintf(os.Stderr, "⚠️  吊销请求: %s 的自动放行权限\n", *name)
-	fmt.Fprintln(os.Stderr, "请在 Matrix 中确认吊销")
+	if err := internal.RevokeCaller(*name); err != nil {
+		fmt.Fprintln(os.Stderr, "吊销失败:", err)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stderr, "✅ 已吊销: %s\n", *name)
 }
 
 // ListRegistrations 列出所有注册
 // Usage: get list
 func ListRegistrations(args []string) {
-	fmt.Fprintln(os.Stderr, "列出注册功能需要 Proxy API 支持，请使用:")
-	fmt.Fprintln(os.Stderr, "  curl http://127.0.0.1:8877/registrations")
+	regs, err := internal.ListRegistrations()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "查询失败:", err)
+		os.Exit(1)
+	}
+	if len(regs) == 0 {
+		fmt.Println("（无注册）")
+		return
+	}
+	for _, r := range regs {
+		mode := r.AllowMode
+		if mode == "auto" {
+			mode = "自动放行"
+		} else {
+			mode = "普通授权"
+		}
+		status := "✅ 已启用"
+		if !r.Enabled {
+			status = "❌ 已禁用"
+		}
+		fmt.Printf("  %s (%s) — %s — %s\n", r.Name, r.Type, status, mode)
+		for entry, fields := range r.Entries {
+			if len(fields) == 0 {
+				fmt.Printf("    · %s → 全部属性\n", entry)
+			} else {
+				fmt.Printf("    · %s → %s\n", entry, joinStrings(fields, ", "))
+			}
+		}
+	}
+}
+
+func joinStrings(items []string, sep string) string {
+	if len(items) == 0 {
+		return ""
+	}
+	s := ""
+	for _, it := range items {
+		if s != "" {
+			s += sep
+		}
+		s += it
+	}
+	return s
 }
 
 // Status 查询 Proxy 状态
 // Usage: get status
 func Status(args []string) {
-	fmt.Fprintln(os.Stderr, "查询 Proxy 状态功能需要 Proxy API 支持，请使用:")
-	fmt.Fprintln(os.Stderr, "  curl http://127.0.0.1:8877/health")
+	st, err := internal.FetchStatus()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "查询失败:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("状态: %s\n", st.Status)
+	if st.Unlocked {
+		fmt.Println("解锁: ✅ 已解锁")
+	} else {
+		fmt.Println("解锁: 🔒 未解锁")
+	}
+	fmt.Printf("待审批: %d\n", st.Pending)
+	fmt.Printf("LLM 凭据: %d\n", st.LlmSecrets)
 }

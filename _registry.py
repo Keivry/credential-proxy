@@ -1,6 +1,7 @@
 """RegistryMixin — Token/Caller 注册表管理 + 认证降级链。"""
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -245,7 +246,7 @@ class RegistryMixin:
     # 统一认证降级链
     # ═══════════════════════════════════════════════════════════
 
-    def _check_auto_approve(
+    async def _check_auto_approve(
         self, entry_name: str, field: str | None, auth: dict,
     ):
         """检查是否可自动放行。
@@ -258,34 +259,35 @@ class RegistryMixin:
                 approve=False → 明确拒绝（条目不在白名单）
                 approve=None  → 无匹配，继续 Matrix 审批
         """
-        # ── 优先级 1: Caller 哈希校验 ──
-        caller_hash = auth.get("caller_hash", "")
-        caller_path = auth.get("caller_path", "")
-        if caller_hash:
-            reg = self._find_caller_by_hash(caller_hash, caller_path)
-            if reg:
-                if not self._check_entry_allowed_caller(reg, entry_name, field):
-                    return False, reg, (
-                        f"Caller '{reg.name}' 无权访问 {entry_name}"
-                    )
+        async with self._lock:
+            # ── 优先级 1: Caller 哈希校验 ──
+            caller_hash = auth.get("caller_hash", "")
+            caller_path = auth.get("caller_path", "")
+            if caller_hash:
+                reg = self._find_caller_by_hash(caller_hash, caller_path)
+                if reg:
+                    if not self._check_entry_allowed_caller(reg, entry_name, field):
+                        return False, reg, (
+                            f"Caller '{reg.name}' 无权访问 {entry_name}"
+                        )
+                    return True, reg, ""
+                # 哈希不匹配但路径匹配？→ 哈希变更
+                path_reg = self._find_caller_by_path(caller_path)
+                if path_reg and path_reg.enabled:
+                    # 返回特殊状态让调用者处理哈希变更
+                    return None, path_reg, "hash_mismatch"
+
+            # ── 优先级 2: Token 校验 ──
+            token = auth.get("token", "")
+            if token:
+                reg = self._lookup_token(token)
+                if not reg or not reg.enabled:
+                    return None, None, ""
+                if not self._check_entry_allowed(reg, entry_name, field):
+                    return False, reg, f"Token '{reg.name}' 无权访问 {entry_name}"
                 return True, reg, ""
-            # 哈希不匹配但路径匹配？→ 哈希变更
-            path_reg = self._find_caller_by_path(caller_path)
-            if path_reg and path_reg.enabled:
-                # 返回特殊状态让调用者处理哈希变更
-                return None, path_reg, "hash_mismatch"
 
-        # ── 优先级 2: Token 校验 ──
-        token = auth.get("token", "")
-        if token:
-            reg = self._lookup_token(token)
-            if not reg or not reg.enabled:
-                return None, None, ""
-            if not self._check_entry_allowed(reg, entry_name, field):
-                return False, reg, f"Token '{reg.name}' 无权访问 {entry_name}"
-            return True, reg, ""
-
-        return None, None, ""
+            return None, None, ""
 
     # ── 通用条目检查（Token）──
 
@@ -385,7 +387,10 @@ class RegistryMixin:
     # ═══════════════════════════════════════════════════════════
 
     def _load_token_registry(self, path: str):
-        """从文件加载注册表（Token + Caller）。"""
+        """从文件加载注册表（Token + Caller），含完整性校验。
+        
+        仅在 __init__ 中单线程调用（构造函数阶段未启动协程），
+        因此不获取 self._lock。后续写入始终在锁内进行。"""
         self._token_registry_path = path
         try:
             with open(path) as f:
@@ -393,6 +398,17 @@ class RegistryMixin:
         except (FileNotFoundError, json.JSONDecodeError):
             logger.info("注册表不存在或损坏（%s），使用空注册表", path)
             return
+
+        # 完整性校验（向后兼容：旧文件无 integrity 字段时跳过）
+        stored_integrity = data.pop("integrity", None)
+        if stored_integrity is not None:
+            computed = self._compute_registry_integrity(data)
+            if stored_integrity != computed:
+                logger.warning(
+                    "注册表完整性校验失败（%s），可能被篡改，使用空注册表",
+                    path,
+                )
+                return
 
         for t in data.get("tokens", []):
             reg = RegisteredToken(
@@ -417,6 +433,7 @@ class RegistryMixin:
                 script_hash=c.get("script_hash", ""),
                 script_hash_old=c.get("script_hash_old", ""),
                 hash_change_at=c.get("hash_change_at", 0.0),
+                hash_change_notified=c.get("hash_change_notified", False),
                 entries=c.get("allowed_entries", {}),
                 allow_mode=c.get("allow_mode", "manual"),
                 can_auto_unlock=c.get("can_auto_unlock", False),
@@ -457,6 +474,7 @@ class RegistryMixin:
                 "script_hash": c.script_hash,
                 "script_hash_old": c.script_hash_old,
                 "hash_change_at": c.hash_change_at,
+                "hash_change_notified": c.hash_change_notified,
                 "allowed_entries": c.entries,
                 "allow_mode": c.allow_mode,
                 "can_auto_unlock": c.can_auto_unlock,
@@ -469,13 +487,24 @@ class RegistryMixin:
             "tokens": tokens,
             "callers": callers,
         }
+        data["integrity"] = self._compute_registry_integrity(data)
         tmp_path = self._token_registry_path + ".tmp"
         with open(tmp_path, "w") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.flush()
-            os.fsync(f.fileno())
+            # fsync 在线程池执行，不阻塞事件循环
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, os.fsync, f.fileno())
         os.chmod(tmp_path, 0o600)
         os.rename(tmp_path, self._token_registry_path)
+
+    @staticmethod
+    def _compute_registry_integrity(data: dict) -> str:
+        """计算注册表数据的 SHA256 完整性哈希。
+        data 不应包含 integrity 字段（加载时已 pop，保存时也先构建再添加）。
+        """
+        raw = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     # ═══════════════════════════════════════════════════════════
     # 注册消息构建

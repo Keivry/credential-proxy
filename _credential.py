@@ -34,7 +34,7 @@ class CredentialMixin:
 
     # ── 自动放行默认实现 (RegistryMixin 在生产代码中覆盖) ──
 
-    def _check_auto_approve(
+    async def _check_auto_approve(
         self, entry_name: str, field: str | None, auth: dict,
     ) -> tuple[bool | None, object | None, str]:
         """默认实现：不执行自动放行。RegistryMixin 覆盖此方法。"""
@@ -85,11 +85,16 @@ class CredentialMixin:
         app = web.Application()
         app.router.add_post('/credential', self.handle_credential)
         app.router.add_get('/health', self.handle_health)
-        app.router.add_post('/register', self.handle_register)
-        app.router.add_post('/register-caller', self.handle_register_caller)
-        app.router.add_post('/revoke', self.handle_revoke)
-        app.router.add_post('/revoke/emergency', self.handle_revoke_emergency)
-        app.router.add_post('/approve-hash-change', self.handle_approve_hash_change)
+        app.router.add_get('/registrations', self.handle_registrations)
+        # 仅当 RegistryMixin 可用时才注册 registry 相关路由
+        # （CredentialMixin 的 handler 内部调用 _register_token 等 RegistryMixin 方法）
+        has_registry = hasattr(self, '_register_token')
+        if has_registry:
+            app.router.add_post('/register', self.handle_register)
+            app.router.add_post('/register-caller', self.handle_register_caller)
+            app.router.add_post('/revoke', self.handle_revoke)
+            app.router.add_post('/revoke/emergency', self.handle_revoke_emergency)
+            app.router.add_post('/approve-hash-change', self.handle_approve_hash_change)
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         await web.TCPSite(runner, '0.0.0.0', port).start()
@@ -109,9 +114,52 @@ class CredentialMixin:
             }
         )
 
+    # ── Registrations listing ──
+
+    async def handle_registrations(self, _request) -> web.Response:
+        """列出所有 Token 和 Caller 注册（RegistryMixin 未加载时返回空列表）。"""
+        items = []
+        async with self._lock:
+            if hasattr(self, '_token_registry'):
+                for t in self._token_registry.values():
+                    items.append({
+                        'name': t.name,
+                        'type': 'token',
+                        'entries': t.entries,
+                        'allow_mode': t.allow_mode,
+                        'enabled': t.enabled,
+                    })
+            if hasattr(self, '_caller_registry'):
+                for c in self._caller_registry.values():
+                    items.append({
+                        'name': c.name,
+                        'type': 'caller',
+                        'entries': c.entries,
+                        'allow_mode': c.allow_mode,
+                        'enabled': c.enabled,
+                        'script_path': c.script_path,
+                    })
+        return web.json_response({'registrations': items})
+
     # ── Credential ──
 
     async def handle_credential(self, request) -> web.Response:
+        """处理凭据查询请求。
+
+        流程：
+        1. JSON 解析与参数提取（无锁）
+        2. caller_hash 强制校验（方案A）
+        3. 自动放行检查（Caller 哈希 > Token > Matrix 审批）
+        4. 解锁流程（等待 TPM 解封或 Matrix ✅）
+        5. Matrix 审批流程
+        6. KeePass 查询并返回（脱敏或原始值）
+
+        Body:
+            entry (str): KeePass 条目名（必填）
+            field (str, optional): 要获取的字段名
+            token (bool, optional): 默认 true（返回脱敏值）
+            auth (dict, optional): {caller_hash, caller_path, token}
+        """
         # ── JSON 解析与参数提取（无锁，尽早执行）──
         try:
             data = await request.json()
@@ -135,7 +183,7 @@ class CredentialMixin:
             }, status=403)
 
         # ── 自动放行检查 ──
-        approve, reg, reason = self._check_auto_approve(
+        approve, reg, reason = await self._check_auto_approve(
             entry_name, field, auth,
         )
         if approve is True:
@@ -271,6 +319,9 @@ class CredentialMixin:
                 if req and req.get('approved') is True:
                     # 刚好在超时前被批准 — 继续正常流程
                     pass
+                elif req and req.get('approved') is False:
+                    self._cleanup_request(req_id)
+                    return web.json_response({'error': '审批被拒绝'}, status=403)
                 else:
                     self._cleanup_request(req_id)
                     return web.json_response({'error': '审批超时'}, status=408)

@@ -25,6 +25,22 @@ _PARTIAL_TOKEN_RE = _re.compile(r'__VG_CRED_\d*$')
 _DEBUG_DIR = os.environ.get('CREDENTIAL_PROXY_DEBUG_DIR', '')
 
 
+def parse_llm_proxy_env() -> dict[int, str]:
+    """从 LLM_<PORT>=<URL> 环境变量读取上游配置。"""
+    proxies: dict[int, str] = {}
+    for k, v in os.environ.items():
+        if not k.startswith('LLM_'):
+            continue
+        try:
+            port = int(k[4:])
+        except ValueError:
+            continue
+        proxies[port] = v.strip().rstrip('/')
+        if not proxies[port]:
+            del proxies[port]
+    return proxies
+
+
 def _extract_conv_id(data: dict) -> str | None:
     """从 SSE data JSON 中提取 conversation ID。
 

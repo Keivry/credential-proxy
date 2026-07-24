@@ -43,7 +43,8 @@ func usage() {
   get status                                Proxy 状态
 
 环境变量:
-  CREDENTIAL_TOKEN  自动放行 Token
-  PROXY_URL         Proxy 地址（默认 http://127.0.0.1:8877）
+  CREDENTIAL_TOKEN   自动放行 Token
+  PROXY_URL          Proxy 地址（默认 http://127.0.0.1:8877）
+  PROXY_HTTP_TIMEOUT HTTP 超时秒数（默认 30）
 `)
 }

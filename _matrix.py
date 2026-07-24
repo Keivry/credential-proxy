@@ -4,7 +4,6 @@ import asyncio
 import logging
 import os
 
-from aiohttp.client_exceptions import ClientConnectionResetError
 from nio import AsyncClient, ReactionEvent, RoomMessageText
 
 logger = logging.getLogger('credential-proxy')
@@ -21,31 +20,8 @@ CMD_LOCK = 'lock proxy'
 CMD_STATUS = 'status'
 CMD_FORGET = 'forget secrets'
 
-# 客户端断连时 SSE 写入可能抛出的异常
-SSE_CLIENT_GONE = (
-    ConnectionResetError,
-    ConnectionAbortedError,
-    BrokenPipeError,
-    ClientConnectionResetError,
-    asyncio.TimeoutError,
-)
-
-# 透传时需剥离的逐跳头
-HOP_HEADERS = frozenset(
-    {
-        'host',
-        'transfer-encoding',
-        'content-length',
-        'content-encoding',
-        'connection',
-        'keep-alive',
-        'te',
-    }
-)
-
 
 class MatrixMixin:
-    """Mixin: Matrix bot 生命周期、消息处理、审批交互。"""
 
     # ── Bot lifecycle ──
 
@@ -215,7 +191,8 @@ class MatrixMixin:
                             pending["reg_id"], pending["new_hash"], key,
                         ),
                     )
-                    name = self._caller_registry.get(hc_id, {}).name if hasattr(self, '_caller_registry') else ''
+                    reg_obj = self._caller_registry.get(hc_id) if hasattr(self, '_caller_registry') else None
+                    name = reg_obj.name if reg_obj else ''
                     action = {
                         "🔓": "保持自动放行",
                         "✅": "降级为普通授权",
@@ -298,13 +275,6 @@ class MatrixMixin:
                 logger.warning(
                     '_ask 仅 %d/%d 个 reaction 成功，消息仍然可用',
                     count,
-                    len(REACTIONS),
+                    len(reactions),
                 )
         return eid
-
-    # ── Utilities ──
-
-    @staticmethod
-    def _filter_hop_headers(headers: dict) -> dict:
-        """过滤逐跳头，返回可安全透传的 headers。"""
-        return {k: v for k, v in headers.items() if k.lower() not in HOP_HEADERS}
