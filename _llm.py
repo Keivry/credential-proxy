@@ -38,8 +38,9 @@ def _extract_conv_id(data: dict) -> str | None:
 
 
 def _save_request_body(conv_id: str, body: bytes) -> None:
-    """保存原始请求 JSON body 到 debug 目录，以 conversation ID 命名。
+    """保存脱敏后的请求 body 到 debug 目录，以 conversation ID 命名。
 
+    保存的是 redact 后的 out_body（不含明文凭据）。
     仅在 LLM 对话 endpoint 且 CREDENTIAL_PROXY_DEBUG_DIR 设置时调用。
     单次写入 request.json，不追加，不保存上游响应。
     """
@@ -171,7 +172,7 @@ class LlmMixin:
                 else:
                     active_t2p = {}
             else:
-                out_body = b''
+                out_body = body
                 active_t2p = {}
 
             # 透传 Hermes headers（过滤逐跳头）
@@ -262,11 +263,9 @@ class LlmMixin:
 
                                             # 保存原始 SSE payload 到 response.jsonl
                                             if resp_log_path:
-                                                asyncio.create_task(
-                                                    _save_response_line(
-                                                        resp_log_path,
-                                                        payload,
-                                                    ),
+                                                await _save_response_line(
+                                                    resp_log_path,
+                                                    payload,
                                                 )
 
                                             # 首次成功解析 SSE data 时提取 conversation ID 保存原始请求
@@ -276,18 +275,16 @@ class LlmMixin:
                                             ):
                                                 conv_id = _extract_conv_id(parsed)
                                                 if conv_id:
-                                                    _save_request_body(conv_id, body)
+                                                    _save_request_body(conv_id, out_body)
                                                     _debug_saved = True
                                                     resp_log_path = os.path.join(
                                                         _DEBUG_DIR,
                                                         conv_id,
                                                         'response.jsonl',
                                                     )
-                                                    asyncio.create_task(
-                                                        _save_response_line(
-                                                            resp_log_path,
-                                                            payload,
-                                                        ),
+                                                    await _save_response_line(
+                                                        resp_log_path,
+                                                        payload,
                                                     )
 
                                             choices = parsed.get('choices', [])
@@ -330,6 +327,10 @@ class LlmMixin:
                                                         content_buf = self._restore(
                                                             content_buf,
                                                             active_t2p,
+                                                        )
+                                                        content_buf = _PARTIAL_TOKEN_RE.sub(
+                                                            '',
+                                                            content_buf,
                                                         )
                                                         await resp.write(
                                                             _mk_sse_event(
@@ -384,6 +385,10 @@ class LlmMixin:
                                                     content_buf,
                                                     active_t2p,
                                                 )
+                                                content_buf = _PARTIAL_TOKEN_RE.sub(
+                                                    '',
+                                                    content_buf,
+                                                )
                                                 await resp.write(
                                                     _mk_sse_event(
                                                         content_buf,
@@ -424,11 +429,9 @@ class LlmMixin:
                                                     parsed = json.loads(sanitized)
                                                     reconstructed = True
                                                     if resp_log_path:
-                                                        asyncio.create_task(
-                                                            _save_response_line(
-                                                                resp_log_path,
-                                                                sanitized,
-                                                            ),
+                                                        await _save_response_line(
+                                                            resp_log_path,
+                                                            sanitized,
                                                         )
                                                     break
                                                 except json.JSONDecodeError:
@@ -514,13 +517,9 @@ class LlmMixin:
                                                 ).encode('utf-8'),
                                             )
 
-                                    # Trim processed portion (O(1) memmove vs O(n²) del)
+                                    # Trim processed portion (in-place, avoid new allocation)
                                     if pos > 0:
-                                        byte_buf = (
-                                            bytearray(byte_buf[pos:])
-                                            if pos < len(byte_buf)
-                                            else bytearray()
-                                        )
+                                        del byte_buf[:pos]
 
                                     # 缓冲区溢出保护
                                     if len(byte_buf) > SSE_MAX_BUF:
@@ -609,6 +608,13 @@ class LlmMixin:
                                             payload = line[5:]
                                             payload = payload.removeprefix(' ')
 
+                                            if resp_log_path:
+                                                # 后续 event 保存 response 行
+                                                await _save_response_line(
+                                                    resp_log_path,
+                                                    payload,
+                                                )
+
                                             # 首次 data 事件提取 conversation ID 保存原始请求
                                             if (
                                                 _debug_save_eligible
@@ -618,30 +624,21 @@ class LlmMixin:
                                                     _parsed = json.loads(payload)
                                                     _cid = _extract_conv_id(_parsed)
                                                     if _cid:
-                                                        _save_request_body(_cid, body)
+                                                        _save_request_body(_cid, out_body)
                                                         _debug_saved = True
                                                         resp_log_path = os.path.join(
                                                             _DEBUG_DIR,
                                                             _cid,
                                                             'response.jsonl',
                                                         )
-                                                        asyncio.create_task(
-                                                            _save_response_line(
-                                                                resp_log_path,
-                                                                payload,
-                                                            ),
+                                                        # 首个 event 单独保存（此时 resp_log_path 刚设好）
+                                                        # 上面的 generic save 因 resp_log_path=None 已跳过
+                                                        await _save_response_line(
+                                                            resp_log_path,
+                                                            payload,
                                                         )
                                                 except json.JSONDecodeError:
                                                     pass
-
-                                            if resp_log_path:
-                                                # 非首个 event 也保存 response 行
-                                                asyncio.create_task(
-                                                    _save_response_line(
-                                                        resp_log_path,
-                                                        payload,
-                                                    ),
-                                                )
 
                                             restored = 'data: ' + self._restore(
                                                 payload,
@@ -656,11 +653,7 @@ class LlmMixin:
                                             )
                                     # Trim processed portion
                                     if pos > 0:
-                                        byte_buf = (
-                                            bytearray(byte_buf[pos:])
-                                            if pos < len(byte_buf)
-                                            else bytearray()
-                                        )
+                                        del byte_buf[:pos]
                                     if len(byte_buf) > SSE_MAX_BUF:
                                         logger.warning(
                                             'SSE 缓冲区超过 1MB 上限，'
@@ -715,7 +708,7 @@ class LlmMixin:
                                 resp_json = json.loads(resp_body)
                                 conv_id = resp_json.get('id')
                                 if conv_id:
-                                    _save_request_body(conv_id, body)
+                                    _save_request_body(conv_id, out_body)
                                     _debug_saved = True
                                     # 非流式 response 写为完整 response.json
                                     resp_path = os.path.join(
@@ -723,11 +716,9 @@ class LlmMixin:
                                         conv_id,
                                         'response.json',
                                     )
-                                    asyncio.create_task(
-                                        _save_response_line(
-                                            resp_path,
-                                            resp_body.decode('utf-8', errors='replace'),
-                                        ),
+                                    await _save_response_line(
+                                        resp_path,
+                                        resp_body.decode('utf-8', errors='replace'),
                                     )
                             except json.JSONDecodeError:
                                 pass
@@ -746,7 +737,7 @@ class LlmMixin:
                         )
             except Exception:
                 if _debug_save_eligible and not _debug_saved:
-                    _save_request_body(f'failed-{req_id}', body)
+                    _save_request_body(f'failed-{req_id}', out_body)
                 logger.exception(
                     'LLM 上游请求失败: %s %s',
                     request.method,
