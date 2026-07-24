@@ -61,7 +61,12 @@ class CredentialProxyOnly(TokenMixin, CredentialMixin, LlmMixin):
         self._runners: list = []
 
         # ── Credential API 状态 ──
-        self.master_password = os.environ.get('CREDENTIAL_MASTER_PASSWORD', 'dev-mode')
+        self.master_password = os.environ.get('CREDENTIAL_MASTER_PASSWORD')
+        if not self.master_password:
+            logger.warning(
+                'CREDENTIAL_MASTER_PASSWORD 未设置，'
+                '凭据功能将不可用（解锁流程无 TPM 后端）'
+            )
         self.kdbx_path: str | None = None
         self.keyfile_path: str | None = None
         self._kp = None
