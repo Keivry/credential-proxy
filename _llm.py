@@ -275,7 +275,9 @@ class LlmMixin:
                                             ):
                                                 conv_id = _extract_conv_id(parsed)
                                                 if conv_id:
-                                                    _save_request_body(conv_id, out_body)
+                                                    _save_request_body(
+                                                        conv_id, out_body
+                                                    )
                                                     _debug_saved = True
                                                     resp_log_path = os.path.join(
                                                         _DEBUG_DIR,
@@ -328,9 +330,11 @@ class LlmMixin:
                                                             content_buf,
                                                             active_t2p,
                                                         )
-                                                        content_buf = _PARTIAL_TOKEN_RE.sub(
-                                                            '',
-                                                            content_buf,
+                                                        content_buf = (
+                                                            _PARTIAL_TOKEN_RE.sub(
+                                                                '',
+                                                                content_buf,
+                                                            )
                                                         )
                                                         await resp.write(
                                                             _mk_sse_event(
@@ -632,7 +636,9 @@ class LlmMixin:
                                                     _parsed = json.loads(payload)
                                                     _cid = _extract_conv_id(_parsed)
                                                     if _cid:
-                                                        _save_request_body(_cid, out_body)
+                                                        _save_request_body(
+                                                            _cid, out_body
+                                                        )
                                                         _debug_saved = True
                                                         resp_log_path = os.path.join(
                                                             _DEBUG_DIR,
