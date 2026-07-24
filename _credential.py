@@ -90,7 +90,7 @@ class CredentialMixin:
         app.router.add_post('/revoke', self.handle_revoke)
         app.router.add_post('/revoke/emergency', self.handle_revoke_emergency)
         app.router.add_post('/approve-hash-change', self.handle_approve_hash_change)
-        runner = web.AppRunner(app)
+        runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         await web.TCPSite(runner, '0.0.0.0', port).start()
         self._runners.append(runner)

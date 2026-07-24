@@ -762,7 +762,7 @@ class LlmMixin:
         app = web.Application()
         app.router.add_route('*', '/{tail:.*}', handler)
         # 注意：不在此处注册 session.close() — _shared_session 由 shutdown() 统一关闭
-        runner = web.AppRunner(app)
+        runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         await web.TCPSite(runner, '0.0.0.0', port).start()
         self._runners.append(runner)
