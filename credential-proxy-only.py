@@ -85,18 +85,14 @@ class CredentialProxyOnly(TokenMixin, CredentialMixin, LlmMixin):
             logger.info('LLM 代理 → 0.0.0.0:%d → %s', port, url)
 
     async def _ask(self, text: str) -> str | None:
-        """免 Matrix 审批：直接返回虚拟消息 ID（自动批准）。"""
+        """免 Matrix 审批：自动批准 pending_requests 中的所有请求。"""
+        async with self._lock:
+            for req_id, req in self.pending_requests.items():
+                if req.get('approved') is None:
+                    req['approved'] = True
+                    req['event'].set()
         logger.info('Credential API 自动批准: %s', text.split('\n')[0])
         return 'auto-approved'
-
-    async def _wait_approval(
-        self,
-        req_id: str,
-        _timeout: float = 300,
-    ) -> bool:
-        """免 Matrix 审批：始终批准。"""
-        logger.info('Credential API 自动批准请求 %s', req_id)
-        return True
 
     async def run(self):
         tasks = []
