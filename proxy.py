@@ -24,6 +24,7 @@ from _credential import _CREDENTIAL_API_PORT as CREDENTIAL_API_PORT
 from _credential import CredentialMixin
 from _llm import LlmMixin
 from _matrix import MatrixMixin
+from _registry import RegistryMixin
 from _token import TokenMixin
 from _tpm import TpmMixin
 
@@ -64,6 +65,7 @@ class CredentialProxy(
     MatrixMixin,
     CredentialMixin,
     LlmMixin,
+    RegistryMixin,
 ):
     """凭据代理：TPM 解锁 → Matrix 审批 → KeePass 查询 → LLM 脱敏代理。"""
 
@@ -93,6 +95,15 @@ class CredentialProxy(
         self.pending_requests: dict = {}
         self.approval_msgs: dict = {}
         self._runners: list = []  # aiohttp AppRunner 列表
+
+        # ── Token 注册表 (RegistryMixin 使用) ──
+        self._token_registry: dict = {}
+        self._token_registry_path = ''
+        self._registrations_by_name: dict = {}
+        self._registration_pending: dict = {}
+        self._registration_msgs: dict = {}
+        self._auto_rate_limits: dict = {}
+        self._auto_unlock_event = None
 
         # ── 凭据频率限制 ──
         self._last_credential_request = 0.0
@@ -129,6 +140,10 @@ class CredentialProxy(
         self.tpm_seal_pub = os.path.join(TPM_DIR, 'seal.pub')
         self.tpm_seal_priv = os.path.join(TPM_DIR, 'seal.priv')
         logger.info('TPM primary: %s', self.tpm_primary)
+
+        # ── Token 注册表 (RegistryMixin 使用) ──
+        self._token_registry_path = os.path.join(DATA_DIR, 'token_registry.json')
+        self._load_token_registry(self._token_registry_path)
 
         # ── LLM 代理配置 (LlmMixin 使用) ──
         self.proxies = _parse_proxy_env()

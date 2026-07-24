@@ -14,7 +14,9 @@ SYNC_TIMEOUT = 30000  # Matrix sync timeout (ms)
 MAX_RETRY_DELAY = 60  # 重试退避上限 (s)
 REACTION_APPROVE = '✅'
 REACTION_REJECT = '❎'
+REACTION_AUTO_UNLOCK = '🔓'
 REACTIONS = (REACTION_APPROVE, REACTION_REJECT)
+ALL_REACTIONS = (REACTION_APPROVE, REACTION_REJECT, REACTION_AUTO_UNLOCK)
 CMD_LOCK = 'lock proxy'
 CMD_STATUS = 'status'
 CMD_FORGET = 'forget secrets'
@@ -155,11 +157,12 @@ class MatrixMixin:
         relates_to = event.source.get('content', {}).get('m.relates_to', {})
         orig = relates_to.get('event_id', '')
         key = relates_to.get('key', '')
-        if not orig or key not in REACTIONS:
+        if not orig or key not in ALL_REACTIONS:
             return
 
         say_text = None
         async with self._lock:
+            # ── 1. 解锁分支 ──
             if (
                 self.unlock_event
                 and self.master_password is None
@@ -185,6 +188,22 @@ class MatrixMixin:
                     self.unlock_event = None
                     self._unlock_msg_id = None
                     say_text = '❌ 解锁被拒绝'
+
+            # ── 2. 注册审批分支 ──
+            elif reg_id := self._registration_msgs.get(orig):
+                reg_pending = self._registration_pending.get(reg_id)
+                if reg_pending and reg_pending.get("approved") is None:
+                    reg_pending["approved"] = key  # 存储实际 reaction（🔓/✅/❎）
+                    reg_pending["event"].set()
+                    name = reg_pending.get("name", "?")
+                    action = {
+                        REACTION_AUTO_UNLOCK: "自动放行",
+                        REACTION_APPROVE: "普通授权",
+                        REACTION_REJECT: "拒绝",
+                    }.get(key, key)
+                    say_text = f'{key} 注册审批: {name} → {action}'
+
+            # ── 3. 凭据审批分支 ──
             elif (
                 not (req_id := self.approval_msgs.get(orig))
                 or not (req := self.pending_requests.get(req_id))
@@ -219,8 +238,16 @@ class MatrixMixin:
         except Exception:
             logger.debug('_say 发送失败', exc_info=True)
 
-    async def _ask(self, text: str) -> str | None:
-        """发送审批消息并预加 ✅❎ reaction，返回 event_id。"""
+    async def _ask(
+        self, text: str, reactions: tuple[str, ...] | None = None,
+    ) -> str | None:
+        """发送审批消息并预加 reaction，返回 event_id。
+
+        默认使用 REACTIONS (✅/❎)。
+        reactions 参数允许自定义 reaction 列表（如 ('🔓', '✅', '❎')）。
+        """
+        if reactions is None:
+            reactions = REACTIONS
         resp = await self.client.room_send(
             self.room_id,
             'm.room.message',
@@ -231,7 +258,7 @@ class MatrixMixin:
         )
         if eid:
             count = 0
-            for k in REACTIONS:
+            for k in reactions:
                 try:
                     await self.client.room_send(
                         self.room_id,
@@ -247,7 +274,7 @@ class MatrixMixin:
                     count += 1
                 except Exception:
                     logger.debug('_ask 添加 reaction 失败', exc_info=True)
-            if count < len(REACTIONS):
+            if count < len(reactions):
                 logger.warning(
                     '_ask 仅 %d/%d 个 reaction 成功，消息仍然可用',
                     count,
