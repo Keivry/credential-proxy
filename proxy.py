@@ -68,10 +68,20 @@ class CredentialProxy(
                 logger.info('mlockall OK — 进程内存已锁定，防止 swap')
             else:
                 err = ctypes.get_errno()
-                logger.warning(
-                    'mlockall 失败 (errno=%d)，密码可能被 swap。'
-                    '容器中需添加 CAP_IPC_LOCK 或 --cap-add=ipc_lock', err,
-                )
+                if err == 1:  # EPERM
+                    logger.warning(
+                        'mlockall 失败 (errno=1 EPERM)。'
+                        '容器中需添加 CAP_IPC_LOCK 或 --cap-add=ipc_lock',
+                    )
+                elif err == 12:  # ENOMEM
+                    logger.warning(
+                        'mlockall 失败 (errno=12 ENOMEM)。'
+                        '容器中需添加 ulimits memlock=-1:-1',
+                    )
+                else:
+                    logger.warning(
+                        'mlockall 失败 (errno=%d)，密码可能被 swap 到磁盘', err,
+                    )
         except Exception:
             logger.warning('mlockall 不可用，密码可能被 swap 到磁盘')
 

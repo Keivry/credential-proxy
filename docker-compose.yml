@@ -3,6 +3,12 @@ services:
     build: .
     container_name: credential-proxy
     restart: unless-stopped
+    cap_add:
+      - IPC_LOCK  # mlockall 所需
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1   # 防止 mlockall(ENOMEM)
     environment:
       - HOMESERVER=https://matrix.example.com
       - ROOM_ID=!yourroomid:matrix.example.com
