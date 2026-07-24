@@ -1,5 +1,6 @@
 """LlmMixin — LLM API 反向代理：脱敏请求 → 上游 → 还原响应。"""
 
+import asyncio
 import json
 import logging
 import os
@@ -51,6 +52,21 @@ def _save_request_body(conv_id: str, body: bytes) -> None:
             f.write(body)
     except OSError as exc:
         logger.debug('保存调试请求失败: %s', exc)
+
+
+async def _save_response_line(resp_log_path: str, payload: str) -> None:
+    """追加一行原始 payload 到 response.jsonl。
+
+    通过 run_in_executor 异步写入，不阻塞 SSE 流式转发。
+    """
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _append_jsonl_line, resp_log_path, payload)
+
+
+def _append_jsonl_line(path: str, line: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'a', encoding='utf-8') as f:
+        f.write(line + '\n')
 
 
 def _mk_sse_event(content: str, finish_reason: str | None = None) -> str:
@@ -187,6 +203,7 @@ class LlmMixin:
                                 ''  # 累积 delta.content 片段，O(1) 单字符串追加
                             )
                             byte_buf = bytearray()
+                            resp_log_path = None
 
                             async def _flush(c: str, fr: str | None = None):
                                 """flush 内容作为 SSE 事件并清空 content_buf。"""
@@ -243,6 +260,15 @@ class LlmMixin:
                                         try:
                                             parsed = json.loads(payload)
 
+                                            # 保存原始 SSE payload 到 response.jsonl
+                                            if resp_log_path:
+                                                asyncio.create_task(
+                                                    _save_response_line(
+                                                        resp_log_path,
+                                                        payload,
+                                                    ),
+                                                )
+
                                             # 首次成功解析 SSE data 时提取 conversation ID 保存原始请求
                                             if (
                                                 _debug_save_eligible
@@ -252,6 +278,17 @@ class LlmMixin:
                                                 if conv_id:
                                                     _save_request_body(conv_id, body)
                                                     _debug_saved = True
+                                                    resp_log_path = os.path.join(
+                                                        _DEBUG_DIR,
+                                                        conv_id,
+                                                        'response.jsonl',
+                                                    )
+                                                    asyncio.create_task(
+                                                        _save_response_line(
+                                                            resp_log_path,
+                                                            payload,
+                                                        ),
+                                                    )
 
                                             choices = parsed.get('choices', [])
                                             choice = choices[0] if choices else {}
@@ -386,6 +423,13 @@ class LlmMixin:
                                                     )
                                                     parsed = json.loads(sanitized)
                                                     reconstructed = True
+                                                    if resp_log_path:
+                                                        asyncio.create_task(
+                                                            _save_response_line(
+                                                                resp_log_path,
+                                                                sanitized,
+                                                            ),
+                                                        )
                                                     break
                                                 except json.JSONDecodeError:
                                                     continue
@@ -541,6 +585,7 @@ class LlmMixin:
                         else:
                             # ── Fast path: active_t2p 为空，逐行 text-level 还原 ──
                             byte_buf = bytearray()
+                            resp_log_path = None
                             try:
                                 async for chunk in upstream_resp.content.iter_chunked(
                                     SSE_CHUNK_SIZE,
@@ -575,8 +620,28 @@ class LlmMixin:
                                                     if _cid:
                                                         _save_request_body(_cid, body)
                                                         _debug_saved = True
+                                                        resp_log_path = os.path.join(
+                                                            _DEBUG_DIR,
+                                                            _cid,
+                                                            'response.jsonl',
+                                                        )
+                                                        asyncio.create_task(
+                                                            _save_response_line(
+                                                                resp_log_path,
+                                                                payload,
+                                                            ),
+                                                        )
                                                 except json.JSONDecodeError:
                                                     pass
+
+                                            if resp_log_path:
+                                                # 非首个 event 也保存 response 行
+                                                asyncio.create_task(
+                                                    _save_response_line(
+                                                        resp_log_path,
+                                                        payload,
+                                                    ),
+                                                )
 
                                             restored = 'data: ' + self._restore(
                                                 payload,
@@ -652,6 +717,18 @@ class LlmMixin:
                                 if conv_id:
                                     _save_request_body(conv_id, body)
                                     _debug_saved = True
+                                    # 非流式 response 写为完整 response.json
+                                    resp_path = os.path.join(
+                                        _DEBUG_DIR,
+                                        conv_id,
+                                        'response.json',
+                                    )
+                                    asyncio.create_task(
+                                        _save_response_line(
+                                            resp_path,
+                                            resp_body.decode('utf-8', errors='replace'),
+                                        ),
+                                    )
                             except json.JSONDecodeError:
                                 pass
 
