@@ -272,7 +272,28 @@ async def test_redact_cache_hit():
 
 
 # ═══════════════════════════════════════════════════════════
-# _register_secret（_maybe_register 已清理，始终注册）
+# ═══════════════════════════════════════════════════════════
+# _maybe_register
+# ═══════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_maybe_register_enabled():
+    t = TestToken()
+    result = await t._maybe_register('secret', use_token=True)
+    assert result != 'secret'
+    assert result in t.token_to_pwd
+
+
+@pytest.mark.asyncio
+async def test_maybe_register_disabled():
+    t = TestToken()
+    result = await t._maybe_register('plaintxt', use_token=False)
+    assert result == 'plaintxt'
+    assert 'plaintxt' not in t.pwd_to_token
+
+
+# ═══════════════════════════════════════════════════════════
+# _register_secret
 # ═══════════════════════════════════════════════════════════
 
 

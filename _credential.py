@@ -91,6 +91,7 @@ class CredentialMixin:
 
         entry_name = data.get('entry', '').strip()
         field = data.get('field', '').strip()
+        use_token = data.get('token', True)  # 默认 tokenized，传 false 获取原始值
         if not entry_name:
             return web.json_response({'error': '缺少 entry 参数'}, status=400)
 
@@ -132,12 +133,22 @@ class CredentialMixin:
             evt = asyncio.Event()
             self.pending_requests[req_id] = {
                 'entry': entry_name,
+                'field': field,
+                'use_token': use_token,
                 'approved': None,
                 'event': evt,
             }
 
+        # 构建审批提示：展示条目 + 属性 + 是否原始值
+        desc = entry_name
+        if field:
+            desc += f' - {field}'
+        if use_token:
+            desc += ' (脱敏)'
+        else:
+            desc += ' (原始值)'
         msg_id = await self._ask(
-            f'🔑 凭据请求: {entry_name}\n点 ✅ 批准 或 ❎ 拒绝',
+            f'🔑 凭据请求: {desc}\n点 ✅ 批准 或 ❎ 拒绝',
         )
         if msg_id is None:
             async with self._lock:
@@ -226,7 +237,7 @@ class CredentialMixin:
                     )
                 return web.json_response(
                     {
-                        'value': await self._register_secret(val),
+                        'value': await self._maybe_register(val, use_token),
                     }
                 )
 
@@ -235,17 +246,17 @@ class CredentialMixin:
                 for k in entry.custom_properties or {}:
                     v = entry.get_custom_property(k)
                     if v:
-                        props[k] = await self._register_secret(v)
+                        props[k] = await self._maybe_register(v, use_token)
             result = {
-                'title': await self._register_secret(entry.title),
-                'username': await self._register_secret(
-                    entry.username or '',
+                'title': await self._maybe_register(entry.title, use_token),
+                'username': await self._maybe_register(
+                    entry.username or '', use_token,
                 ),
-                'password': await self._register_secret(
-                    entry.password or '',
+                'password': await self._maybe_register(
+                    entry.password or '', use_token,
                 ),
-                'url': await self._register_secret(
-                    entry.url or '',
+                'url': await self._maybe_register(
+                    entry.url or '', use_token,
                 ),
             }
             if props:

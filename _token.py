@@ -50,6 +50,14 @@ class TokenMixin:
             self.token_to_pwd[token] = value
             return token
 
+    async def _maybe_register(self, value: str, use_token: bool = True) -> str:
+        """注册密码值（use_token=True）或透传原始值（use_token=False）。
+
+        use_token=True（默认）：注册到 token 映射，返回 __VG_CRED_NNNNNN__。
+        use_token=False：直接返回原始值，不注册。
+        """
+        return await self._register_secret(value) if use_token else value
+
     # ── Redact / Restore ──
 
     def _redact(self, text: str, pwd_to_token: dict | None = None) -> str:
