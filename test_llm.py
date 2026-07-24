@@ -40,7 +40,7 @@ mx.SSE_CLIENT_GONE = (
 )
 sys.modules['_matrix'] = mx
 
-from _llm import LlmMixin
+from _llm import LlmMixin, _mk_sse_event
 from _token import TokenMixin
 
 # ═══════════════════════════════════════════════════════════
@@ -496,7 +496,6 @@ class TestFinishReasonAndDone:
 # _mk_sse_event 直接单元测试
 # ═══════════════════════════════════════════════════════════
 
-from _llm import _mk_sse_event
 
 
 class TestMkSseEvent:

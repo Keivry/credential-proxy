@@ -96,6 +96,11 @@ class CredentialProxyOnly(TokenMixin, CredentialMixin, LlmMixin):
                 if req.get('approved') is None:
                     req['approved'] = True
                     req['event'].set()
+            # 如果 credential-proxy-only 无 TPM 后端，直接设 unlock_event
+            # 避免 handle_credential 的 unlock_evt.wait() 死等 300s
+            if self.unlock_event and not self.unlock_event.is_set():
+                self._unlock_in_progress = False
+                self.unlock_event.set()
         logger.info('Credential API 自动批准: %s', text.split('\n')[0])
         return 'auto-approved'
 
