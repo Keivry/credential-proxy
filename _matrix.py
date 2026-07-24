@@ -6,16 +6,19 @@ import os
 
 from nio import AsyncClient, ReactionEvent, RoomMessageText
 
+from _sse import (
+    ALL_REACTIONS,
+    REACTION_APPROVE,
+    REACTION_AUTO_UNLOCK,
+    REACTION_REJECT,
+    REACTIONS,
+)
+
 logger = logging.getLogger('credential-proxy')
 
 # ── Constants ──
 SYNC_TIMEOUT = 30000  # Matrix sync timeout (ms)
 MAX_RETRY_DELAY = 60  # 重试退避上限 (s)
-REACTION_APPROVE = '✅'
-REACTION_REJECT = '❎'
-REACTION_AUTO_UNLOCK = '🔓'
-REACTIONS = (REACTION_APPROVE, REACTION_REJECT)
-ALL_REACTIONS = (REACTION_APPROVE, REACTION_REJECT, REACTION_AUTO_UNLOCK)
 CMD_LOCK = 'lock proxy'
 CMD_STATUS = 'status'
 CMD_FORGET = 'forget secrets'

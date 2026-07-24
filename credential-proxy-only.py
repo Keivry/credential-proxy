@@ -2,13 +2,13 @@
 """凭据代理（轻量版）— LLM 脱敏代理 + Credential API，免 Matrix/TPM。
 
 用法:
-  LLM_8878=http://127.0.0.1:8878/v1 \\
-  LLM_8879=https://api.deepseek.com/v1 \\
+  LLM_8878=http://127.0.0.1:8878 \\
+  LLM_8879=https://api.deepseek.com \\
   CREDENTIAL_API_PORT=9876 \\
   python3 credential-proxy-only.py
 
 环境变量:
-  LLM_<PORT>=<UPSTREAM_URL>   — 端口→上游映射（必须）
+  LLM_<PORT>=<UPSTREAM_URL>   — 端口→上游映射（必须，URL 不带 /v1）
   CREDENTIAL_API_PORT         — Credential API 端口（默认 9876）
   CREDENTIAL_MASTER_PASSWORD  — 可选，设置后跳过 TPM 解封
   CREDENTIAL_PROXY_DEBUG_DIR  — 可选，调试数据保存目录

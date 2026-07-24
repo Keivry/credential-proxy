@@ -421,7 +421,6 @@ class LlmMixin:
                                             # 尝试从 byte_buf 读取续行重建 JSON
                                             # （处理 \n 在 JSON content 内截断的情况）
                                             accumulated = payload
-                                            saved_pos = pos
                                             reconstructed = False
                                             for _ in range(20):
                                                 nl = byte_buf.find(b'\n', pos)
@@ -521,7 +520,7 @@ class LlmMixin:
                                                         ).encode('utf-8'),
                                                     )
                                             else:
-                                                pos = saved_pos  # 回退
+                                                # pos 已越过续行，不回退（续行已在 byte_buf 中被消费）
                                                 logger.warning(
                                                     'SSE JSON 解析失败，'
                                                     '续行重建失败，转发原始行: %s...',

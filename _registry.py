@@ -8,7 +8,7 @@ import os
 import secrets
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 
 logger = logging.getLogger('credential-proxy')
 
@@ -65,27 +65,13 @@ class RegisteredCaller:
 
 
 class RegistryMixin:
-    """Mixin: Token / Caller 注册表管理 + 认证降级链。"""
+    """Mixin: Token / Caller 注册表管理 + 认证降级链。
 
-    def __init__(self):
-        # ── Token 注册表 ──
-        self._token_registry: dict[str, RegisteredToken] = {}
-        self._token_registry_path = ""
-        self._registrations_by_name: dict[str, str] = {}
-
-        # ── Caller 注册表 ──
-        self._caller_registry: dict[str, RegisteredCaller] = {}
-        self._caller_registry_by_path: dict[str, str] = {}
-
-        # ── 注册审批待处理 ──
-        self._registration_pending: dict[str, dict] = {}
-        self._registration_msgs: dict[str, str] = {}
-        # 哈希变更审批
-        self._hash_change_pending: dict[str, dict] = {}
-        self._hash_change_msgs: dict[str, str] = {}
-
-        # ── 自动放行频率限制 ──
-        self._auto_rate_limits: dict[str, float] = {}
+    注意：此类属性由 CredentialProxy.__init__ (proxy.py) 初始化，
+    不在此处设置 __init__，因为 CredentialProxy.__init__ 不调用
+    super().__init__()，且已手动初始化所有需要的属性。
+    如需新增属性，请同时在 proxy.py CredentialProxy.__init__ 中添加。
+    """
 
     # ── 通用名称检查 ──
 
@@ -122,7 +108,7 @@ class RegistryMixin:
         can_auto_unlock: bool = False,
     ) -> str:
         token_id = self._generate_token()
-        now = datetime.utcnow().isoformat() + "Z"
+        now = datetime.now(UTC).isoformat()
         reg = RegisteredToken(
             token_id=token_id, name=name, description=description,
             entries=entries or {}, allow_mode=allow_mode,
@@ -170,7 +156,7 @@ class RegistryMixin:
         """注册新 Caller（待批准状态 -> enabled=False）。
         返回 reg_id 用于后续激活。"""
         reg_id = self._generate_reg_id()
-        now = datetime.utcnow().isoformat() + "Z"
+        now = datetime.now(UTC).isoformat()
         reg = RegisteredCaller(
             reg_id=reg_id, name=name, description=description,
             script_path=script_path, script_hash=script_hash,
@@ -308,17 +294,17 @@ class RegistryMixin:
 
     # ── 自动放行频率限制 ──
 
-    def _check_auto_rate_limit(self, reg_name: str) -> bool:
+    async def _check_auto_rate_limit(self, reg_name: str) -> bool:
         """检查自动放行频率限制。
 
-        仅在 on_reaction 持有 self._lock 时调用。
-        单条 dict 写入在 CPython GIL 下安全。"""
-        now = time.monotonic()
-        last = self._auto_rate_limits.get(reg_name, 0.0)
-        if now - last < AUTO_RATE_INTERVAL:
-            return False
-        self._auto_rate_limits[reg_name] = now
-        return True
+        通过 async with self._lock 保证原子性（在 _handle_auto_approve 中调用时不持有外层锁）。"""
+        async with self._lock:
+            now = time.monotonic()
+            last = self._auto_rate_limits.get(reg_name, 0.0)
+            if now - last < AUTO_RATE_INTERVAL:
+                return False
+            self._auto_rate_limits[reg_name] = now
+            return True
 
     # ═══════════════════════════════════════════════════════════
     # 哈希变更
@@ -487,7 +473,7 @@ class RegistryMixin:
             })
         data = {
             "version": 2,
-            "updated_at": datetime.utcnow().isoformat() + "Z",
+            "updated_at": datetime.now(UTC).isoformat(),
             "tokens": tokens,
             "callers": callers,
         }

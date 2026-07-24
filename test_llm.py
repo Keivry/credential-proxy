@@ -49,7 +49,9 @@ from _token import TokenMixin
 
 
 class TestSSEHolder(TokenMixin, LlmMixin):
-    """最小 mock：仅测试 token 还原 + hold buffer 逻辑，不涉及 HTTP 层。"""
+    """辅助类，提供 TokenMixin + LlmMixin 需要的 self 属性。"""
+
+    __test__ = False
 
     def __init__(self):
         self._lock = asyncio.Lock()

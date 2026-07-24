@@ -75,6 +75,7 @@ class MockProxy(TokenMixin, CredentialMixin):
 
         # 频率限制
         self._last_credential_request = 0.0
+        self._register_rate_limits: dict[str, list[float]] = {}
 
         # Token
         self.pwd_to_token = type(

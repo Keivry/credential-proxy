@@ -23,6 +23,8 @@ from _token import (
 class TestToken(TokenMixin):
     """最小实现：提供 TokenMixin 需要的 self 属性。"""
 
+    __test__ = False  # 辅助类，非 pytest 测试类
+
     def __init__(self):
         self._lock = asyncio.Lock()
         self.token_to_pwd = {}

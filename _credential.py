@@ -9,7 +9,7 @@ import uuid
 
 from aiohttp import web
 
-from _matrix import REACTION_APPROVE, REACTION_AUTO_UNLOCK, REACTION_REJECT
+from _sse import REACTION_APPROVE, REACTION_AUTO_UNLOCK, REACTION_REJECT
 
 try:
     from pykeepass import PyKeePass
@@ -44,7 +44,7 @@ class CredentialMixin:
         """默认实现：日志记录。MatrixMixin 覆盖此方法发送 Matrix 消息。"""
         logger.info('[say] %s', text)
 
-    def _check_auto_rate_limit(self, reg_name: str) -> bool:
+    async def _check_auto_rate_limit(self, reg_name: str) -> bool:
         """默认实现：不限速。RegistryMixin 覆盖此方法。"""
         return True
 
@@ -53,7 +53,7 @@ class CredentialMixin:
         use_token: bool, reg,
     ) -> web.Response:
         """自动放行路径：频率检查 → 解锁 → 查询返回。"""
-        if not self._check_auto_rate_limit(getattr(reg, 'name', '')):
+        if not await self._check_auto_rate_limit(getattr(reg, 'name', '')):
             return web.json_response(
                 {'error': '请求过于频繁'},
                 status=429,
@@ -528,7 +528,13 @@ class CredentialMixin:
                     {'error': f"注册 '{name}' 不存在"},
                     status=404,
                 )
-            await self._revoke_token(reg.token_id)
+            # 判断类型：Token 用 token_id，Caller 用 reg_id
+            token_id = getattr(reg, 'token_id', None)
+            reg_id = getattr(reg, 'reg_id', None)
+            if token_id:
+                await self._revoke_token(token_id)
+            elif reg_id:
+                await self._revoke_caller(reg_id)
 
         return web.json_response({'status': 'revoked', 'name': name})
 
@@ -546,8 +552,10 @@ class CredentialMixin:
                     os.environ.get('DATA_DIR', '.'),
                     'admin_token',
                 )
-                with open(admin_token_path) as f:
-                    admin_token = f.read().strip()
+                def _read_admin_token(p: str) -> str:
+                    with open(p) as f:
+                        return f.read().strip()
+                admin_token = await asyncio.to_thread(_read_admin_token, admin_token_path)
             except (FileNotFoundError, OSError):
                 pass
 
@@ -582,8 +590,13 @@ class CredentialMixin:
                     {'error': f"未找到注册 '{name}'"},
                     status=404,
                 )
-            token_id = reg.token_id
-            await self._revoke_token(token_id)
+            # 判断类型：Token 用 token_id，Caller 用 reg_id
+            token_id = getattr(reg, 'token_id', None)
+            reg_id = getattr(reg, 'reg_id', None)
+            if token_id:
+                await self._revoke_token(token_id)
+            elif reg_id:
+                await self._revoke_caller(reg_id)
 
         logger.info(
             'EMERGENCY_REVOKE: name=%s peer=%s', name, peer,
@@ -596,7 +609,6 @@ class CredentialMixin:
 
     # ── Register rate limiting ──
 
-    _register_rate_limits: dict[str, list[float]] = {}
     REGISTER_MAX_PER_MINUTE = 5
 
     def _check_register_rate_limit(self, ip: str) -> bool:
@@ -759,20 +771,24 @@ class CredentialMixin:
         """自动 TPM 解封（用于自动放行场景，不经过 Matrix 审批）。
         使用 _unlock_generation 计数器防止 stale task 干扰。"""
         unlock_done = asyncio.Event()
-        evt = None
 
         async with self._lock:
             if self._unlock_in_progress:
-                evt = self._auto_unlock_event
-            else:
-                self._unlock_in_progress = True
-                self._unlock_generation += 1
-                gen = self._unlock_generation
-                self._auto_unlock_event = unlock_done
-
-        if evt is not None:
-            await evt.wait()
-            return
+                if self._auto_unlock_event is not None:
+                    # 另一个 _auto_unlock 正在执行
+                    evt = self._auto_unlock_event
+                elif self.unlock_event is not None:
+                    # _do_unlock (Matrix) 正在执行
+                    evt = self.unlock_event
+                else:
+                    # 防御性处理
+                    evt = asyncio.Event()
+                await evt.wait()
+                return
+            self._unlock_in_progress = True
+            self._unlock_generation += 1
+            gen = self._unlock_generation
+            self._auto_unlock_event = unlock_done
 
         try:
             loop = asyncio.get_running_loop()

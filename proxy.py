@@ -122,6 +122,7 @@ class CredentialProxy(
 
         # ── 凭据频率限制 ──
         self._last_credential_request = 0.0
+        self._register_rate_limits: dict[str, list[float]] = {}
 
         # ── Token 映射 (TokenMixin 使用) ──
         self.pwd_to_token = OrderedDict()
@@ -133,15 +134,32 @@ class CredentialProxy(
         self.keyfile_path = None
         if os.path.isdir(DB_DIR):
             kdbx_files: list[str] = []
+            key_files: dict[str, str] = {}
             for f in sorted(os.listdir(DB_DIR)):
                 if f.endswith('.kdbx'):
                     kdbx_files.append(f)
-                    self.kdbx_path = os.path.join(DB_DIR, f)
                 elif f.endswith('.key'):
-                    self.keyfile_path = os.path.join(DB_DIR, f)
+                    base = f[:-4]  # strip .key
+                    key_files[base] = os.path.join(DB_DIR, f)
+            if kdbx_files:
+                # 取字母序最后一个 .kdbx
+                chosen_kdbx = kdbx_files[-1]
+                self.kdbx_path = os.path.join(DB_DIR, chosen_kdbx)
+                # 尝试用同名 .key，fallback 到字母序最后一个 .key
+                base_name = chosen_kdbx[:-5]  # strip .kdbx
+                self.keyfile_path = key_files.get(
+                    base_name,
+                    # 无匹配时取最后一个 .key（向后兼容）
+                    os.path.join(DB_DIR, next(
+                        (f for f in sorted(os.listdir(DB_DIR)) if f.endswith('.key')),
+                        '',
+                    )) if any(
+                        f.endswith('.key') for f in os.listdir(DB_DIR)
+                    ) else None,
+                ) if key_files else None
             if len(kdbx_files) > 1:
                 logger.warning(
-                    'DB_DIR 中发现 %d 个 .kdbx 文件，使用字母序最后一个: %s',
+                    'DB_DIR 中发现 %d 个 .kdbx 文件，使用: %s（同名 .key 优先）',
                     len(kdbx_files),
                     kdbx_files[-1],
                 )

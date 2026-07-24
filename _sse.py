@@ -29,6 +29,13 @@ HOP_HEADERS = frozenset(
     }
 )
 
+# Matrix reaction 常量（与 _matrix.py 保持一致，供 _credential.py 在不引入 nio 时使用）
+REACTION_APPROVE = '\u2705'
+REACTION_REJECT = '\u274e'
+REACTION_AUTO_UNLOCK = '\U0001f513'
+REACTIONS = (REACTION_APPROVE, REACTION_REJECT)
+ALL_REACTIONS = (REACTION_APPROVE, REACTION_REJECT, REACTION_AUTO_UNLOCK)
+
 
 def filter_hop_headers(headers: dict) -> dict:
     """过滤逐跳头，返回可安全透传的 headers。"""

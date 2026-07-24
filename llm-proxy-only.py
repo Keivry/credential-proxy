@@ -2,20 +2,19 @@
 """轻量版 LLM Proxy — 无 Matrix/TPM/KeePass，仅 LLM 脱敏代理。
 
 用法:
-  LLM_8878=http://127.0.0.1:8878/v1 \\
-  LLM_8879=https://api.deepseek.com/v1 \\
+  LLM_8878=http://127.0.0.1:8878 \\
+  LLM_8879=https://api.deepseek.com \\
   OPENCODE_GO_API_KEY=sk-xxx \\
   DEEPSEEK_API_KEY=sk-xxx \\
   python3 llm-proxy-only.py
 
 环境变量:
-  LLM_<PORT>=<UPSTREAM_URL>  — 端口→上游映射（必须）
+  LLM_<PORT>=<UPSTREAM_URL>  — 端口→上游映射（必须，URL 不带 /v1）
   CREDENTIAL_PROXY_DEBUG_DIR — 可选，调试数据保存目录
 """
 
 import asyncio
 import logging
-import os
 import sys
 from collections import OrderedDict
 

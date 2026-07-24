@@ -3,6 +3,9 @@ name: Build & Release
 on:
   push:
     tags: ["v*"]
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
 
 env:
   REGISTRY: ghcr.io
@@ -59,6 +62,7 @@ jobs:
 
   release-binary:
     name: Build get binary
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
