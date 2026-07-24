@@ -39,6 +39,14 @@ func Credential(args []string) {
 	if caller != nil && caller.ScriptHash != "" {
 		auth["caller_hash"] = caller.ScriptHash
 		auth["caller_path"] = caller.ScriptPath
+	} else {
+		// 回退：哈希 get 二进制自身（无 /proc / 交互式 shell 等场景）
+		if selfPath, err := os.Executable(); err == nil {
+			if selfHash := internal.Sha256File(selfPath); selfHash != "" {
+				auth["caller_hash"] = selfHash
+				auth["caller_path"] = selfPath
+			}
+		}
 	}
 
 	// Phase 1: Token 兜底

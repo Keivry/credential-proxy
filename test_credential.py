@@ -156,8 +156,9 @@ async def test_health_unlocked():
 async def test_rate_limit():
     p = MockProxy()
     p.master_password = 'pw'  # 已解锁，跳过解锁阶段
+    auth = {'caller_hash': 'sha256:test'}
     # 第一次请求
-    req1 = make_request({'entry': 'test_entry'})
+    req1 = make_request({'entry': 'test_entry', 'auth': auth})
 
     # 模拟审批通过
     async def approve_after_msg(*args):
@@ -170,7 +171,7 @@ async def test_rate_limit():
     p._ask_mock.side_effect = approve_after_msg
 
     # 第二次请求（太快）
-    req2 = make_request({'entry': 'test_entry2'})
+    req2 = make_request({'entry': 'test_entry2', 'auth': auth})
     # 第一次通过
     await p.handle_credential(req1)
     # 第二次应被限速
@@ -208,7 +209,8 @@ async def test_unlock_flow():
 
     p._ask_mock.side_effect = ask_side_effect
 
-    req = make_request({'entry': 'test_entry'})
+    auth = {'caller_hash': 'sha256:test'}
+    req = make_request({'entry': 'test_entry', 'auth': auth})
     await p.handle_credential(req)
     assert unlock_done
     assert p.master_password == 'test_master_pw'
@@ -230,7 +232,8 @@ async def test_unlock_rejected():
 
     p._ask_mock.side_effect = ask_side_effect
 
-    req = make_request({'entry': 'test_entry'})
+    auth = {'caller_hash': 'sha256:test'}
+    req = make_request({'entry': 'test_entry', 'auth': auth})
     await p.handle_credential(req)
     call_args = aw.json_response.call_args[0][0]
     assert call_args['error'] == '解锁失败'
@@ -250,7 +253,8 @@ async def test_unlock_timeout():
     original_timeout = _credential.UNLOCK_TIMEOUT
     _credential.UNLOCK_TIMEOUT = 0.1  # 100ms
 
-    req = make_request({'entry': 'test_entry'})
+    auth = {'caller_hash': 'sha256:test'}
+    req = make_request({'entry': 'test_entry', 'auth': auth})
     await p.handle_credential(req)
     call_args = aw.json_response.call_args[0][0]
     assert call_args['error'] == '解锁超时'
@@ -279,8 +283,9 @@ async def test_concurrent_unlock_only_one_ask():
     p._ask_mock.side_effect = ask_side_effect
 
     # 两个并发请求
-    req1 = make_request({'entry': 'e1'})
-    req2 = make_request({'entry': 'e2'})
+    auth = {'caller_hash': 'sha256:test'}
+    req1 = make_request({'entry': 'e1', 'auth': auth})
+    req2 = make_request({'entry': 'e2', 'auth': auth})
     await asyncio.gather(
         p.handle_credential(req1),
         p.handle_credential(req2),
@@ -312,7 +317,8 @@ async def test_approval_approved():
 
     p._ask_mock.side_effect = ask_side_effect
 
-    req = make_request({'entry': 'test_entry'})
+    auth = {'caller_hash': 'sha256:test'}
+    req = make_request({'entry': 'test_entry', 'auth': auth})
     await p.handle_credential(req)
     # 审批通过后应进入 KeePass 查询（mock 自动创建属性，返回成功）
     call_args = aw.json_response.call_args[0][0]
@@ -335,7 +341,8 @@ async def test_approval_rejected():
 
     p._ask_mock.side_effect = ask_side_effect
 
-    req = make_request({'entry': 'test_entry'})
+    auth = {'caller_hash': 'sha256:test'}
+    req = make_request({'entry': 'test_entry', 'auth': auth})
     await p.handle_credential(req)
     call_args = aw.json_response.call_args[0][0]
     assert call_args['error'] == '审批被拒绝'
@@ -361,7 +368,8 @@ async def test_approval_approved_with_raw_token():
         return 'msg_id'
 
     p._ask_mock.side_effect = ask_side
-    req = make_request({'entry': 'MyEntry', 'field': 'password', 'token': False})
+    auth = {'caller_hash': 'sha256:test'}
+    req = make_request({'entry': 'MyEntry', 'field': 'password', 'token': False, 'auth': auth})
     await p.handle_credential(req)
     assert approval_text is not None
     assert 'MyEntry - password (原始值)' in approval_text
@@ -384,7 +392,8 @@ async def test_approval_approved_default_tokenized():
         return 'msg_id'
 
     p._ask_mock.side_effect = ask_side2
-    req = make_request({'entry': 'MyEntry', 'field': 'username'})
+    auth = {'caller_hash': 'sha256:test'}
+    req = make_request({'entry': 'MyEntry', 'field': 'username', 'auth': auth})
     await p.handle_credential(req)
     assert approval_text is not None
     assert 'MyEntry - username (脱敏)' in approval_text
@@ -404,7 +413,8 @@ async def test_approval_timeout():
     original = _credential.APPROVAL_TIMEOUT
     _credential.APPROVAL_TIMEOUT = 0.1
 
-    req = make_request({'entry': 'test_entry'})
+    auth = {'caller_hash': 'sha256:test'}
+    req = make_request({'entry': 'test_entry', 'auth': auth})
     await p.handle_credential(req)
     call_args = aw.json_response.call_args[0][0]
     assert call_args['error'] == '审批超时'
@@ -452,10 +462,30 @@ async def test_no_kdbx():
 
     p._ask_mock.side_effect = ask_side_effect
 
-    req = make_request({'entry': 'test_entry'})
+    auth = {'caller_hash': 'sha256:test'}
+    req = make_request({'entry': 'test_entry', 'auth': auth})
     await p.handle_credential(req)
     call_args = aw.json_response.call_args[0][0]
     assert '密码库未配置' in call_args['error']
+
+
+@pytest.mark.asyncio
+async def test_no_caller_hash_rejected():
+    """无 caller_hash → 返回 403。"""
+    p = MockProxy()
+    p.master_password = 'pw'
+
+    # 没有 auth 的请求 → 应被 caller_hash 拦截
+    req = make_request({'entry': 'test_entry'})
+    await p.handle_credential(req)
+    call_args = aw.json_response.call_args[0][0]
+    assert '缺少 caller_hash' in call_args['error']
+
+    # 有 auth 但没有 caller_hash → 也应拦截
+    req2 = make_request({'entry': 'test_entry', 'auth': {'token': 'abc'}})
+    await p.handle_credential(req2)
+    call_args2 = aw.json_response.call_args[0][0]
+    assert '缺少 caller_hash' in call_args2['error']
 
 
 @pytest.mark.asyncio
@@ -465,7 +495,8 @@ async def test_ask_message_failed():
     p.master_password = 'pw'
     p._ask_mock.return_value = None
 
-    req = make_request({'entry': 'test_entry'})
+    auth = {'caller_hash': 'sha256:test'}
+    req = make_request({'entry': 'test_entry', 'auth': auth})
     await p.handle_credential(req)
     call_args = aw.json_response.call_args[0][0]
     assert call_args['error'] == '无法发送审批消息'

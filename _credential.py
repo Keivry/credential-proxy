@@ -125,6 +125,15 @@ class CredentialMixin:
         if not entry_name:
             return web.json_response({'error': '缺少 entry 参数'}, status=400)
 
+        # ── 方案A：强制 caller_hash — 只接受 get 二进制的请求 ──
+        if not auth.get('caller_hash'):
+            return web.json_response({
+                'error': (
+                    '仅允许通过 get 获取凭据（缺少 caller_hash）。'
+                    '使用: get credential <条目> [字段]'
+                ),
+            }, status=403)
+
         # ── 自动放行检查 ──
         approve, reg, reason = self._check_auto_approve(
             entry_name, field, auth,
