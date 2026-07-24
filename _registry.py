@@ -1,4 +1,4 @@
-"""RegistryMixin — Token 注册表管理。"""
+"""RegistryMixin — Token/Caller 注册表管理 + 认证降级链。"""
 
 import asyncio
 import json
@@ -11,7 +11,13 @@ from datetime import datetime
 
 logger = logging.getLogger('credential-proxy')
 
-AUTO_RATE_INTERVAL = 1.0  # 自动放行最小间隔（秒）
+AUTO_RATE_INTERVAL = 1.0      # 自动放行最小间隔（秒）
+GRACE_PERIOD_SECONDS = 3600   # 哈希变更宽限期（1 小时）
+
+
+# ════════════════════════════════════════════════════════════════
+# Data classes
+# ════════════════════════════════════════════════════════════════
 
 
 @dataclass
@@ -20,41 +26,70 @@ class RegisteredToken:
     token_id: str
     name: str
     description: str = ""
-    # entries 格式：{"条目名": ["字段1", "字段2"]}，空列表 = 全部字段
     entries: dict[str, list[str]] = field(default_factory=dict)
-    allow_mode: str = "manual"     # "auto" = 自动放行, "manual" = 每次审批
-    can_auto_unlock: bool = False   # 自动放行时是否允许自动 TPM 解锁
+    allow_mode: str = "manual"
+    can_auto_unlock: bool = False
     created_at: str = ""
-    enabled: bool = True            # 是否生效
+    enabled: bool = True
+
+
+@dataclass
+class RegisteredCaller:
+    """注册的调用者（脚本文件），通过文件哈希绑定。"""
+    reg_id: str
+    name: str
+    script_path: str
+    script_hash: str           # "sha256:abc123..."
+    description: str = ""
+    script_hash_old: str = ""  # 上一版哈希（宽限期使用）
+    hash_change_at: float = 0.0  # 最近哈希变更的 UTC 时间戳
+    hash_change_notified: bool = False
+    entries: dict[str, list[str]] = field(default_factory=dict)
+    allow_mode: str = "manual"
+    can_auto_unlock: bool = False
+    created_at: str = ""
+    enabled: bool = True
+
+    @property
+    def in_grace_period(self) -> bool:
+        """宽限期内旧哈希仍有效（新哈希需审批后才能使用）。"""
+        if not self.hash_change_at:
+            return False
+        return (time.time() - self.hash_change_at) < GRACE_PERIOD_SECONDS
+
+
+# ════════════════════════════════════════════════════════════════
+# RegistryMixin
+# ════════════════════════════════════════════════════════════════
 
 
 class RegistryMixin:
-    """Mixin: Token 注册表管理。"""
+    """Mixin: Token / Caller 注册表管理 + 认证降级链。"""
 
     def __init__(self):
+        # ── Token 注册表 ──
         self._token_registry: dict[str, RegisteredToken] = {}
         self._token_registry_path = ""
-        # name → token_id 索引（用于唯一性检查）
         self._registrations_by_name: dict[str, str] = {}
+
+        # ── Caller 注册表 ──
+        self._caller_registry: dict[str, RegisteredCaller] = {}
+        self._caller_registry_by_path: dict[str, str] = {}
 
         # ── 注册审批待处理 ──
         self._registration_pending: dict[str, dict] = {}
-        # event_id → reg_id（用于 on_reaction 查找）
         self._registration_msgs: dict[str, str] = {}
+        # 哈希变更审批
+        self._hash_change_pending: dict[str, dict] = {}
+        self._hash_change_msgs: dict[str, str] = {}
 
         # ── 自动放行频率限制 ──
         self._auto_rate_limits: dict[str, float] = {}
 
-    # ── Token 生成 ──
-
-    def _generate_token(self) -> str:
-        """生成 32 字节随机 Token（64 字符 hex）。"""
-        return secrets.token_hex(32)
-
-    # ── 注册（仅注册到 pending，等待 Matrix 审批后激活）──
+    # ── 通用名称检查 ──
 
     def _name_exists(self, name: str) -> bool:
-        """检查名称是否已注册（含 pending）。"""
+        """检查名称是否已注册（含 Token 和 Caller，含 pending）。"""
         if name in self._registrations_by_name:
             return True
         for p in self._registration_pending.values():
@@ -62,28 +97,36 @@ class RegistryMixin:
                 return True
         return False
 
+    def _lookup_by_name(self, name: str):
+        """按名称查询任意注册（Token 或 Caller）。"""
+        rid = self._registrations_by_name.get(name)
+        if rid:
+            if rid in self._token_registry:
+                return self._token_registry[rid]
+            if rid in self._caller_registry:
+                return self._caller_registry[rid]
+        return None
+
+    # ═══════════════════════════════════════════════════════════
+    # Token 注册
+    # ═══════════════════════════════════════════════════════════
+
+    def _generate_token(self) -> str:
+        return secrets.token_hex(32)
+
     async def _register_token(
-        self,
-        name: str,
-        description: str = "",
+        self, name: str, description: str = "",
         entries: dict[str, list[str]] | None = None,
         allow_mode: str = "manual",
         can_auto_unlock: bool = False,
     ) -> str:
-        """注册新 Token（待批准状态 -> enabled=False）。
-        返回 token_id 用于后续激活。
-        """
         token_id = self._generate_token()
         now = datetime.utcnow().isoformat() + "Z"
         reg = RegisteredToken(
-            token_id=token_id,
-            name=name,
-            description=description,
-            entries=entries or {},
-            allow_mode=allow_mode,
-            can_auto_unlock=can_auto_unlock,
-            created_at=now,
-            enabled=False,  # 未激活
+            token_id=token_id, name=name, description=description,
+            entries=entries or {}, allow_mode=allow_mode,
+            can_auto_unlock=can_auto_unlock, created_at=now,
+            enabled=False,
         )
         async with self._lock:
             self._token_registry[token_id] = reg
@@ -91,17 +134,13 @@ class RegistryMixin:
         return token_id
 
     async def _activate_token(self, token_id: str):
-        """激活 Token（审批通过后调用）。"""
         async with self._lock:
             reg = self._token_registry.get(token_id)
             if reg:
                 reg.enabled = True
                 await self._save_token_registry()
 
-    # ── 吊销 ──
-
     async def _revoke_token(self, token_id: str) -> bool:
-        """吊销 Token。返回是否找到并移除。"""
         async with self._lock:
             reg = self._token_registry.pop(token_id, None)
             if reg:
@@ -110,69 +149,164 @@ class RegistryMixin:
                 return True
             return False
 
-    # ── 查询 ──
-
     def _lookup_token(self, token_id: str) -> RegisteredToken | None:
-        """按 token_id 查询。"""
         return self._token_registry.get(token_id)
 
-    def _lookup_by_name(self, name: str) -> RegisteredToken | None:
-        """按名称查询。"""
-        tid = self._registrations_by_name.get(name)
-        if tid:
-            return self._token_registry.get(tid)
+    # ═══════════════════════════════════════════════════════════
+    # Caller 注册
+    # ═══════════════════════════════════════════════════════════
+
+    def _generate_reg_id(self) -> str:
+        return "reg_" + secrets.token_hex(8)
+
+    async def _register_caller(
+        self, name: str, script_path: str, script_hash: str,
+        description: str = "",
+        entries: dict[str, list[str]] | None = None,
+        allow_mode: str = "manual",
+        can_auto_unlock: bool = False,
+    ) -> str:
+        """注册新 Caller（待批准状态 -> enabled=False）。
+        返回 reg_id 用于后续激活。"""
+        reg_id = self._generate_reg_id()
+        now = datetime.utcnow().isoformat() + "Z"
+        reg = RegisteredCaller(
+            reg_id=reg_id, name=name, description=description,
+            script_path=script_path, script_hash=script_hash,
+            entries=entries or {}, allow_mode=allow_mode,
+            can_auto_unlock=can_auto_unlock, created_at=now,
+            enabled=False,
+        )
+        async with self._lock:
+            self._caller_registry[reg_id] = reg
+            self._caller_registry_by_path[script_path] = reg_id
+            self._registrations_by_name[name] = reg_id
+        return reg_id
+
+    async def _activate_caller(self, reg_id: str):
+        async with self._lock:
+            reg = self._caller_registry.get(reg_id)
+            if reg:
+                reg.enabled = True
+                await self._save_token_registry()
+
+    async def _revoke_caller(self, reg_id: str) -> bool:
+        async with self._lock:
+            reg = self._caller_registry.pop(reg_id, None)
+            if reg:
+                self._registrations_by_name.pop(reg.name, None)
+                self._caller_registry_by_path.pop(reg.script_path, None)
+                await self._save_token_registry()
+                return True
+            return False
+
+    def _find_caller_by_hash(
+        self, script_hash: str, script_path: str,
+    ) -> RegisteredCaller | None:
+        """匹配 (script_hash, script_path)。两者都匹配才算。"""
+        for reg in self._caller_registry.values():
+            if not reg.enabled:
+                continue
+            if reg.script_hash == script_hash and reg.script_path == script_path:
+                return reg
+            # 宽限期内：旧哈希也匹配
+            if (
+                reg.in_grace_period
+                and reg.script_hash_old == script_hash
+                and reg.script_path == script_path
+            ):
+                return reg
         return None
 
-    def _check_entry_allowed(
-        self, reg: RegisteredToken, entry_name: str,
+    def _find_caller_by_path(self, script_path: str) -> RegisteredCaller | None:
+        """按脚本路径查找 Caller 注册（用于哈希变更检测）。"""
+        rid = self._caller_registry_by_path.get(script_path)
+        if rid:
+            return self._caller_registry.get(rid)
+        return None
+
+    def _check_entry_allowed_caller(
+        self, reg: RegisteredCaller, entry_name: str,
         field: str | None,
     ) -> bool:
-        """检查注册是否有权访问指定条目和字段。"""
+        """检查 Caller 注册是否有权访问指定条目和字段。"""
         if not reg.enabled:
             return False
         if entry_name not in reg.entries:
             return False
         allowed_fields = reg.entries[entry_name]
         if not allowed_fields:
-            return True  # 空列表 = 全部字段
+            return True
         if field is None or field in allowed_fields:
             return True
         return False
 
-    # ── 认证降级链 ──
+    # ═══════════════════════════════════════════════════════════
+    # 统一认证降级链
+    # ═══════════════════════════════════════════════════════════
 
     def _check_auto_approve(
         self, entry_name: str, field: str | None, auth: dict,
-    ) -> tuple[bool | None, RegisteredToken | None, str]:
+    ):
         """检查是否可自动放行。
+
+        优先级: Caller 哈希 > Token
 
         Returns:
             (approve, reg, reason):
-                approve=True  → 自动放行
+                approve=True  → 自动放行（reg 是匹配的注册记录）
                 approve=False → 明确拒绝（条目不在白名单）
                 approve=None  → 无匹配，继续 Matrix 审批
         """
+        # ── 优先级 1: Caller 哈希校验 ──
+        caller_hash = auth.get("caller_hash", "")
+        caller_path = auth.get("caller_path", "")
+        if caller_hash:
+            reg = self._find_caller_by_hash(caller_hash, caller_path)
+            if reg:
+                if not self._check_entry_allowed_caller(reg, entry_name, field):
+                    return False, reg, (
+                        f"Caller '{reg.name}' 无权访问 {entry_name}"
+                    )
+                return True, reg, ""
+            # 哈希不匹配但路径匹配？→ 哈希变更
+            path_reg = self._find_caller_by_path(caller_path)
+            if path_reg and path_reg.enabled:
+                # 返回特殊状态让调用者处理哈希变更
+                return None, path_reg, "hash_mismatch"
+
+        # ── 优先级 2: Token 校验 ──
         token = auth.get("token", "")
-        if not token:
-            return None, None, ""  # 无认证 -> 走 Matrix 审批
+        if token:
+            reg = self._lookup_token(token)
+            if not reg or not reg.enabled:
+                return None, None, ""
+            if not self._check_entry_allowed(reg, entry_name, field):
+                return False, reg, f"Token '{reg.name}' 无权访问 {entry_name}"
+            return True, reg, ""
 
-        reg = self._lookup_token(token)
-        if not reg:
-            return None, None, ""  # 无效 Token -> 走 Matrix 审批
+        return None, None, ""
 
+    # ── 通用条目检查（Token）──
+
+    def _check_entry_allowed(
+        self, reg: RegisteredToken, entry_name: str,
+        field: str | None,
+    ) -> bool:
         if not reg.enabled:
-            return None, None, ""
-
-        if not self._check_entry_allowed(reg, entry_name, field):
-            return False, reg, f"Token '{reg.name}' 无权访问 {entry_name}"
-
-        return True, reg, ""
+            return False
+        if entry_name not in reg.entries:
+            return False
+        allowed_fields = reg.entries[entry_name]
+        if not allowed_fields:
+            return True
+        if field is None or field in allowed_fields:
+            return True
+        return False
 
     # ── 自动放行频率限制 ──
 
     def _check_auto_rate_limit(self, reg_name: str) -> bool:
-        """检查自动放行的频率限制。
-        返回 True = 允许，False = 被限速。"""
         now = time.monotonic()
         last = self._auto_rate_limits.get(reg_name, 0.0)
         if now - last < AUTO_RATE_INTERVAL:
@@ -180,16 +314,83 @@ class RegistryMixin:
         self._auto_rate_limits[reg_name] = now
         return True
 
-    # ── 持久化 ──
+    # ═══════════════════════════════════════════════════════════
+    # 哈希变更
+    # ═══════════════════════════════════════════════════════════
+
+    async def _notify_hash_change(
+        self, reg: RegisteredCaller, new_hash: str,
+    ) -> str | None:
+        """发送哈希变更通知到 Matrix，返回 msg_id。
+
+        不阻塞——hash change 通知是异步的，正在运行的请求通过 fallback 完成。
+        """
+        msg_text = (
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚠️ {reg.name} 哈希已变更\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"\n"
+            f"  文件: {reg.script_path}\n"
+            f"  宽限期至: 变更后 1 小时\n"
+            f"\n"
+            f"  🔓 保持自动放行  |  ✅ 降级为普通授权  |  ❎ 拒绝\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        )
+        msg_id = await self._ask(msg_text, reactions=(
+            "🔓", "✅", "❎",
+        ))
+        if msg_id is None:
+            return None
+
+        # 注册 pending 哈希变更
+        async with self._lock:
+            self._hash_change_pending[reg.reg_id] = {
+                "reg_id": reg.reg_id,
+                "new_hash": new_hash,
+                "event": asyncio.Event(),
+                "result": None,
+            }
+            self._hash_change_msgs[msg_id] = reg.reg_id
+        return msg_id
+
+    async def _resolve_hash_change(
+        self, reg_id: str, new_hash: str, reaction: str,
+    ):
+        """处理哈希变更的用户选择。"""
+        async with self._lock:
+            reg = self._caller_registry.get(reg_id)
+            if not reg:
+                return
+            if reaction == "🔓":
+                # 保持自动放行，更新哈希
+                reg.script_hash_old = reg.script_hash
+                reg.script_hash = new_hash
+                reg.hash_change_at = 0.0
+                reg.hash_change_notified = False
+            elif reaction == "✅":
+                # 降级为普通授权（更新哈希但改为 manual）
+                reg.script_hash_old = reg.script_hash
+                reg.script_hash = new_hash
+                reg.hash_change_at = 0.0
+                reg.hash_change_notified = False
+                reg.allow_mode = "manual"
+            else:
+                # ❎ 拒绝 → 禁用注册
+                reg.enabled = False
+            await self._save_token_registry()
+
+    # ═══════════════════════════════════════════════════════════
+    # 持久化
+    # ═══════════════════════════════════════════════════════════
 
     def _load_token_registry(self, path: str):
-        """从文件加载 Token 注册表。"""
+        """从文件加载注册表（Token + Caller）。"""
         self._token_registry_path = path
         try:
             with open(path) as f:
                 data = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
-            logger.info("Token 注册表不存在或损坏（%s），使用空注册表", path)
+            logger.info("注册表不存在或损坏（%s），使用空注册表", path)
             return
 
         for t in data.get("tokens", []):
@@ -207,10 +408,28 @@ class RegistryMixin:
                 self._token_registry[reg.token_id] = reg
                 self._registrations_by_name[reg.name] = reg.token_id
 
+        for c in data.get("callers", []):
+            reg = RegisteredCaller(
+                reg_id=c.get("reg_id", ""),
+                name=c.get("name", ""),
+                script_path=c.get("script_path", ""),
+                script_hash=c.get("script_hash", ""),
+                script_hash_old=c.get("script_hash_old", ""),
+                hash_change_at=c.get("hash_change_at", 0.0),
+                entries=c.get("allowed_entries", {}),
+                allow_mode=c.get("allow_mode", "manual"),
+                can_auto_unlock=c.get("can_auto_unlock", False),
+                created_at=c.get("created_at", ""),
+                enabled=c.get("enabled", True),
+            )
+            if reg.reg_id:
+                self._caller_registry[reg.reg_id] = reg
+                self._caller_registry_by_path[reg.script_path] = reg.reg_id
+                self._registrations_by_name[reg.name] = reg.reg_id
+
         logger.info(
-            "已加载 %d 个 Token 注册（%s）",
-            len(self._token_registry),
-            path,
+            "已加载 %d 个 Token + %d 个 Caller 注册（%s）",
+            len(self._token_registry), len(self._caller_registry), path,
         )
 
     async def _save_token_registry(self):
@@ -228,10 +447,26 @@ class RegistryMixin:
                 "created_at": t.created_at,
                 "enabled": t.enabled,
             })
+        callers = []
+        for c in self._caller_registry.values():
+            callers.append({
+                "reg_id": c.reg_id,
+                "name": c.name,
+                "script_path": c.script_path,
+                "script_hash": c.script_hash,
+                "script_hash_old": c.script_hash_old,
+                "hash_change_at": c.hash_change_at,
+                "allowed_entries": c.entries,
+                "allow_mode": c.allow_mode,
+                "can_auto_unlock": c.can_auto_unlock,
+                "created_at": c.created_at,
+                "enabled": c.enabled,
+            })
         data = {
-            "version": 1,
+            "version": 2,
             "updated_at": datetime.utcnow().isoformat() + "Z",
             "tokens": tokens,
+            "callers": callers,
         }
         tmp_path = self._token_registry_path + ".tmp"
         with open(tmp_path, "w") as f:
@@ -241,12 +476,13 @@ class RegistryMixin:
         os.chmod(tmp_path, 0o600)
         os.rename(tmp_path, self._token_registry_path)
 
-    # ── 注册消息构建 ──
+    # ═══════════════════════════════════════════════════════════
+    # 注册消息构建
+    # ═══════════════════════════════════════════════════════════
 
     @staticmethod
     def _build_registration_msg(reg_data: dict) -> str:
-        """构建注册审批消息文本。
-        reg_data 包含 name, description, entries, allow_mode。"""
+        """构建注册审批消息文本。"""
         lines = []
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         if reg_data.get("allow_mode") == "auto":
@@ -257,6 +493,8 @@ class RegistryMixin:
         lines.append("")
         lines.append(f"  程序: {reg_data.get('name', '?')}")
         lines.append(f"  用途: {reg_data.get('description', '无描述')}")
+        if reg_data.get("script_path"):
+            lines.append(f"  脚本: {reg_data['script_path']}")
         lines.append("  访问:")
         for entry, fields in reg_data.get("entries", {}).items():
             fields_str = ", ".join(fields) if fields else "全部属性"

@@ -203,7 +203,27 @@ class MatrixMixin:
                     }.get(key, key)
                     say_text = f'{key} 注册审批: {name} → {action}'
 
-            # ── 3. 凭据审批分支 ──
+            # ── 3. 哈希变更审批分支 ──
+            elif hc_id := self._hash_change_msgs.get(orig):
+                pending = self._hash_change_pending.get(hc_id)
+                if pending and pending.get("result") is None:
+                    pending["result"] = key
+                    pending["event"].set()
+                    # 后台 resolve（不阻塞 on_reaction）
+                    asyncio.create_task(
+                        self._resolve_hash_change(
+                            pending["reg_id"], pending["new_hash"], key,
+                        ),
+                    )
+                    name = self._caller_registry.get(hc_id, {}).name if hasattr(self, '_caller_registry') else ''
+                    action = {
+                        "🔓": "保持自动放行",
+                        "✅": "降级为普通授权",
+                        "❎": "拒绝",
+                    }.get(key, key)
+                    say_text = f'{key} 哈希变更: {name or hc_id} → {action}'
+
+            # ── 4. 凭据审批分支 ──
             elif (
                 not (req_id := self.approval_msgs.get(orig))
                 or not (req := self.pending_requests.get(req_id))

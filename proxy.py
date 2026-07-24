@@ -102,6 +102,12 @@ class CredentialProxy(
         self._registrations_by_name: dict = {}
         self._registration_pending: dict = {}
         self._registration_msgs: dict = {}
+        # Caller 注册表
+        self._caller_registry: dict = {}
+        self._caller_registry_by_path: dict = {}
+        # 哈希变更审批
+        self._hash_change_pending: dict = {}
+        self._hash_change_msgs: dict = {}
         self._auto_rate_limits: dict = {}
         self._auto_unlock_event = None
 

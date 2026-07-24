@@ -44,6 +44,41 @@ class CredentialMixin:
         """默认实现：不限速。RegistryMixin 覆盖此方法。"""
         return True
 
+    async def _handle_auto_approve(
+        self, entry_name: str, field: str | None,
+        use_token: bool, reg,
+    ) -> web.Response:
+        """自动放行路径：频率检查 → 解锁 → 查询返回。"""
+        if not self._check_auto_rate_limit(getattr(reg, 'name', '')):
+            return web.json_response(
+                {'error': '请求过于频繁'},
+                status=429,
+            )
+        if self.master_password is None:
+            can_auto = getattr(reg, 'can_auto_unlock', False)
+            if can_auto:
+                try:
+                    await self._auto_unlock()
+                except Exception:
+                    logger.exception(
+                        'AUTO_APPROVE_UNLOCK_FAIL: reg=%s entry=%s',
+                        getattr(reg, 'name', '?'), entry_name,
+                    )
+                    await self._say(
+                        f"⚠️ 自动解封失败: {getattr(reg, 'name', '?')} → {entry_name}",
+                    )
+                    return web.json_response({'error': '自动解封失败'}, status=500)
+            else:
+                return web.json_response(
+                    {'error': 'Proxy 未解锁，请先手动解锁'},
+                    status=403,
+                )
+        logger.info(
+            'AUTO_APPROVE: reg=%s entry=%s field=%s',
+            getattr(reg, 'name', '?'), entry_name, field or '*',
+        )
+        return await self._query_and_return(entry_name, field, use_token, reg)
+
     # ── API startup ──
 
     async def start_credential_api(self, port: int = _CREDENTIAL_API_PORT):
@@ -51,8 +86,10 @@ class CredentialMixin:
         app.router.add_post('/credential', self.handle_credential)
         app.router.add_get('/health', self.handle_health)
         app.router.add_post('/register', self.handle_register)
+        app.router.add_post('/register-caller', self.handle_register_caller)
         app.router.add_post('/revoke', self.handle_revoke)
         app.router.add_post('/revoke/emergency', self.handle_revoke_emergency)
+        app.router.add_post('/approve-hash-change', self.handle_approve_hash_change)
         runner = web.AppRunner(app)
         await runner.setup()
         await web.TCPSite(runner, '0.0.0.0', port).start()
@@ -93,45 +130,33 @@ class CredentialMixin:
             entry_name, field, auth,
         )
         if approve is True:
-            # 自动放行频率限制（per-registration，独立于全局 2s 限制）
-            if not self._check_auto_rate_limit(reg.name):
-                return web.json_response(
-                    {'error': '请求过于频繁'},
-                    status=429,
-                )
-            # 确保已解锁
-            if self.master_password is None:
-                if reg.can_auto_unlock:
-                    try:
-                        await self._auto_unlock()
-                    except Exception:
-                        logger.exception(
-                            'AUTO_APPROVE_UNLOCK_FAIL: reg=%s entry=%s',
-                            reg.name, entry_name,
-                        )
-                        await self._say(
-                            f"⚠️ 自动解封失败: {reg.name} → {entry_name}（TPM 解封异常）",
-                        )
-                        return web.json_response(
-                            {'error': '自动解封失败'},
-                            status=500,
-                        )
-                else:
-                    return web.json_response(
-                        {'error': 'Proxy 未解锁，请先手动解锁'},
-                        status=403,
-                    )
-            # 查询并返回
-            logger.info(
-                'AUTO_APPROVE: token=%s entry=%s field=%s',
-                reg.name, entry_name, field or '*',
-            )
-            return await self._query_and_return(
+            return await self._handle_auto_approve(
                 entry_name, field, use_token, reg,
             )
         elif approve is False:
             # 明确拒绝（条目不在白名单）
             return web.json_response({'error': reason}, status=403)
+        elif reason == "hash_mismatch" and reg is not None:
+            # Caller 哈希已变更 → 异步通知用户，本次请求用 Token/Matrix 兜底
+            new_hash = auth.get("caller_hash", "")
+            if new_hash:
+                # 去重：避免同一变更发送多条通知
+                async with self._lock:
+                    caller_reg = self._caller_registry.get(getattr(reg, 'reg_id', ''))
+                    if caller_reg and not caller_reg.hash_change_notified:
+                        caller_reg.hash_change_notified = True
+                        await self._notify_hash_change(caller_reg, new_hash)
+            # Token 兜底
+            token = auth.get("token", "")
+            if token:
+                token_reg = self._lookup_token(token)
+                if token_reg and token_reg.enabled and self._check_entry_allowed(
+                    token_reg, entry_name, field,
+                ):
+                    return await self._handle_auto_approve(
+                        entry_name, field, use_token, token_reg,
+                    )
+            # 无 Token 兜底 → 走 Matrix 审批
 
         # ── 未匹配自动放行 → 现有解锁 + Matrix 审批流程 ──
 
@@ -532,6 +557,149 @@ class CredentialMixin:
         timestamps.append(now)
         self._register_rate_limits[ip] = timestamps
         return True
+
+    # ── Caller 注册 ──
+
+    async def handle_register_caller(self, request) -> web.Response:
+        """POST /register-caller — 注册新 Caller（需 Matrix 审批）。"""
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({'error': 'JSON 格式错误'}, status=400)
+
+        name = data.get('name', '').strip()
+        if not name:
+            return web.json_response({'error': '缺少 name 参数'}, status=400)
+
+        async with self._lock:
+            if self._name_exists(name):
+                return web.json_response(
+                    {'error': f"名称 '{name}' 已存在"},
+                    status=409,
+                )
+
+        script_path = data.get('script_path', '').strip()
+        script_hash = data.get('script_hash', '').strip()
+        if not script_path or not script_hash:
+            return web.json_response(
+                {'error': '缺少 script_path 或 script_hash'},
+                status=400,
+            )
+
+        description = data.get('description', '').strip()
+        entries = data.get('entries', {})
+        allow_mode = data.get('allow_mode', 'manual')
+        can_auto_unlock = data.get('can_auto_unlock', False)
+
+        reg_data = {
+            'name': name,
+            'description': description,
+            'script_path': script_path,
+            'entries': entries,
+            'allow_mode': allow_mode,
+        }
+        reg_id = await self._register_caller(
+            name=name, script_path=script_path, script_hash=script_hash,
+            description=description, entries=entries,
+            allow_mode=allow_mode, can_auto_unlock=can_auto_unlock,
+        )
+
+        msg_text = self._build_registration_msg(reg_data)
+        reactions = (
+            ("🔓", "✅", "❎") if allow_mode == 'auto' else None
+        )
+        msg_id = await self._ask(msg_text, reactions=reactions)
+        if msg_id is None:
+            await self._revoke_caller(reg_id)
+            return web.json_response({'error': '无法发送审批消息'}, status=503)
+
+        pending = {
+            'reg_id': reg_id,
+            'name': name,
+            'approved': None,
+            'event': asyncio.Event(),
+        }
+        async with self._lock:
+            self._registration_pending[reg_id] = pending
+            self._registration_msgs[msg_id] = reg_id
+
+        try:
+            await asyncio.wait_for(pending['event'].wait(), timeout=300)
+        except TimeoutError:
+            async with self._lock:
+                self._registration_pending.pop(reg_id, None)
+                self._registration_msgs.pop(msg_id, None)
+            await self._revoke_caller(reg_id)
+            return web.json_response({'error': '审批超时'}, status=408)
+
+        async with self._lock:
+            self._registration_pending.pop(reg_id, None)
+            self._registration_msgs.pop(msg_id, None)
+
+        reaction = pending.get('approved')
+        if reaction == "❎":
+            await self._revoke_caller(reg_id)
+            return web.json_response({'error': '注册被拒绝'}, status=403)
+
+        await self._activate_caller(reg_id)
+        if reaction == "🔓":
+            async with self._lock:
+                reg = self._caller_registry.get(reg_id)
+                if reg:
+                    reg.allow_mode = 'auto'
+                    reg.can_auto_unlock = True
+                    await self._save_token_registry()
+
+        return web.json_response({
+            'reg_id': reg_id,
+            'name': name,
+            'status': 'activated',
+        })
+
+    # ── 哈希变更审批 ──
+
+    async def handle_approve_hash_change(self, request) -> web.Response:
+        """POST /approve-hash-change — 处理用户对哈希变更的选择。
+
+        Body: {"reg_id": "...", "reaction": "🔓" | "✅" | "❎"}
+        这个端点通常由 Matrix reaction handler 代为触发，但也接受直接 API 调用。
+        """
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({'error': 'JSON 格式错误'}, status=400)
+
+        reg_id = data.get('reg_id', '').strip()
+        reaction = data.get('reaction', '').strip()
+        new_hash = data.get('new_hash', '').strip()
+
+        if not reg_id or not reaction or not new_hash:
+            return web.json_response(
+                {'error': '缺少 reg_id/reaction/new_hash'},
+                status=400,
+            )
+        if reaction not in ("🔓", "✅", "❎"):
+            return web.json_response(
+                {'error': 'reaction 必须为 🔓/✅/❎'},
+                status=400,
+            )
+
+        async with self._lock:
+            reg = self._caller_registry.get(reg_id)
+            if not reg:
+                return web.json_response(
+                    {'error': f"未找到 Caller 注册 '{reg_id}'"},
+                    status=404,
+                )
+
+        await self._resolve_hash_change(reg_id, new_hash, reaction)
+
+        action = {"🔓": "保持自动放行", "✅": "降级为普通授权", "❎": "拒绝"}[reaction]
+        return web.json_response({
+            'status': 'resolved',
+            'name': reg.name if reg else '',
+            'action': action,
+        })
 
     # ── Auto-unlock (for auto-approve path) ──
 
