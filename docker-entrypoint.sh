@@ -15,6 +15,10 @@ export CREDENTIAL_PORT="${CREDENTIAL_PORT:-8877}"
 # ── 确保数据目录存在 ──
 mkdir -p "$TPM_DIR" "$DB_DIR"
 
+# ── 确保 /data 目录归 credential-proxy 用户所有 ──
+# 容器以 root 启动创建目录，gosu 降权后非 root 用户需写 token_registry.json
+chown credential-proxy:credential-proxy "$DATA_DIR"
+
 # ── 修复 TPM 设备权限（容器内设专用组，不依赖宿主 GID）──
 # chown + chmod 660 = root + credential-proxy 组可读写
 if [ -e /dev/tpm0 ]; then
