@@ -195,7 +195,12 @@ class MatrixMixin:
                 ok = key == REACTION_APPROVE
                 req['approved'] = ok
                 req['event'].set()
-                say_text = f'{key} 已{"批准" if ok else "拒绝"}: {req["entry"]}'
+                extra = ''
+                if req.get('field'):
+                    extra += f' - {req["field"]}'
+                if not req.get('use_token', True):
+                    extra += ' (原始值)'
+                say_text = f'{key} 已{"批准" if ok else "拒绝"}: {req["entry"]}{extra}'
         if say_text:
             await self._say(say_text)
 

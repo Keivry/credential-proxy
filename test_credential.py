@@ -341,6 +341,57 @@ async def test_approval_rejected():
     assert call_args['error'] == '审批被拒绝'
 
 
+
+@pytest.mark.asyncio
+
+@pytest.mark.asyncio
+async def test_approval_approved_with_raw_token():
+    """token: false 时审批消息应显示 (原始值) 标记。"""
+    p = MockProxy()
+    p.master_password = 'pw'
+    approval_text = None
+
+    async def ask_side(text):
+        nonlocal approval_text
+        approval_text = text
+        async with p._lock:
+            for rid, rd in list(p.pending_requests.items()):
+                rd['approved'] = True
+                rd['event'].set()
+        return 'msg_id'
+
+    p._ask_mock.side_effect = ask_side
+    req = make_request({'entry': 'MyEntry', 'field': 'password', 'token': False})
+    await p.handle_credential(req)
+    assert approval_text is not None
+    assert 'MyEntry - password (原始值)' in approval_text
+
+
+@pytest.mark.asyncio
+async def test_approval_approved_default_tokenized():
+    """默认参数（无 token 字段）时审批消息应显示 (脱敏) 标记。"""
+    p = MockProxy()
+    p.master_password = 'pw'
+    approval_text = None
+
+    async def ask_side2(text):
+        nonlocal approval_text
+        approval_text = text
+        async with p._lock:
+            for rid, rd in list(p.pending_requests.items()):
+                rd['approved'] = True
+                rd['event'].set()
+        return 'msg_id'
+
+    p._ask_mock.side_effect = ask_side2
+    req = make_request({'entry': 'MyEntry', 'field': 'username'})
+    await p.handle_credential(req)
+    assert approval_text is not None
+    assert 'MyEntry - username (脱敏)' in approval_text
+
+
+
+
 @pytest.mark.asyncio
 async def test_approval_timeout():
     """审批超时 → 返回 408。"""
