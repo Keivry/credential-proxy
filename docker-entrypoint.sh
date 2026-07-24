@@ -15,12 +15,15 @@ export CREDENTIAL_PORT="${CREDENTIAL_PORT:-8877}"
 # ── 确保数据目录存在 ──
 mkdir -p "$TPM_DIR" "$DB_DIR"
 
-# ── 修复 TPM 设备权限（让非 root 用户可访问）──
+# ── 修复 TPM 设备权限（容器内设专用组，不依赖宿主 GID）──
+# chown + chmod 660 = root + credential-proxy 组可读写
 if [ -e /dev/tpm0 ]; then
-    chmod 666 /dev/tpm0
+    chown root:credential-proxy /dev/tpm0
+    chmod 660 /dev/tpm0
 fi
 if [ -e /dev/tpmrm0 ]; then
-    chmod 666 /dev/tpmrm0
+    chown root:credential-proxy /dev/tpmrm0
+    chmod 660 /dev/tpmrm0
 fi
 
 echo "=== Credential Proxy ==="
