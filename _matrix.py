@@ -166,7 +166,7 @@ class MatrixMixin:
             if (
                 self.unlock_event
                 and self.master_password is None
-                and (orig == self._unlock_msg_id or self._unlock_msg_id is None)
+                and orig == self._unlock_msg_id
             ):
                 if key == REACTION_APPROVE:
                     if not self._unlock_in_progress:

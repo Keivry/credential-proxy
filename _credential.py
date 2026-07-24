@@ -140,12 +140,16 @@ class CredentialMixin:
             # Caller 哈希已变更 → 异步通知用户，本次请求用 Token/Matrix 兜底
             new_hash = auth.get("caller_hash", "")
             if new_hash:
-                # 去重：避免同一变更发送多条通知
+                # 去重后发送通知（通知在锁外进行，避免嵌套锁死锁）
+                reg_id = getattr(reg, 'reg_id', '')
+                should_notify = False
                 async with self._lock:
-                    caller_reg = self._caller_registry.get(getattr(reg, 'reg_id', ''))
+                    caller_reg = self._caller_registry.get(reg_id)
                     if caller_reg and not caller_reg.hash_change_notified:
                         caller_reg.hash_change_notified = True
-                        await self._notify_hash_change(caller_reg, new_hash)
+                        should_notify = True
+                if should_notify:
+                    await self._notify_hash_change(caller_reg, new_hash)
             # Token 兜底
             token = auth.get("token", "")
             if token:
@@ -425,23 +429,7 @@ class CredentialMixin:
                 status=503,
             )
 
-        revoke_evt = asyncio.Event()
-        revoke_result = {'approved': None}
-
-        async def _on_revoke_reaction(msg_id, evt, result):
-            """等待 revoke 的 Matrix 审批结果。"""
-            while not evt.is_set():
-                async with self._lock:
-                    # 查找 reaction 消息
-                    for eid, rid in list(self.approval_msgs.items()):
-                        if rid == msg_id:
-                            req = self.pending_requests.get(rid)
-                            if req and req.get('approved') is not None:
-                                result['approved'] = req['approved']
-                                evt.set()
-                await asyncio.sleep(0.1)
-
-        # 简化：复用 pending_requests 机制
+        # 复用 pending_requests 机制
         async with self._lock:
             req_id = uuid.uuid4().hex[:8]
             revoke_evt_inner = asyncio.Event()
@@ -509,7 +497,7 @@ class CredentialMixin:
         peer = request.remote or ''
 
         # 紧急吊销要求：admin token 匹配 或 同网段 IP
-        is_internal = peer.startswith(('10.', '172.16.', '192.168.'))
+        is_internal = peer.startswith(('10.', '172.', '192.168.'))
         if not req_token or (req_token != admin_token and not is_internal):
             logger.warning(
                 'EMERGENCY_REVOKE_REJECTED: peer=%s', peer,
@@ -735,11 +723,16 @@ class CredentialMixin:
                 if self.unlock_event and not self.unlock_event.is_set():
                     self.unlock_event.set()
                 self._unlock_in_progress = False
+                self._auto_unlock_event = None
                 unlock_done.set()
         except Exception:
             async with self._lock:
                 self._unlock_in_progress = False
                 self._auto_unlock_event = None
+                if self.unlock_event and not self.unlock_event.is_set():
+                    self.unlock_event.set()
+                self.unlock_event = None
+                self._unlock_msg_id = None
                 unlock_done.set()
             logger.exception("自动 TPM 解封失败")
             raise

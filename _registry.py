@@ -378,6 +378,7 @@ class RegistryMixin:
                 # ❎ 拒绝 → 禁用注册
                 reg.enabled = False
             await self._save_token_registry()
+            self._hash_change_pending.pop(reg_id, None)
 
     # ═══════════════════════════════════════════════════════════
     # 持久化
