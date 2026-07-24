@@ -47,7 +47,21 @@ class TpmMixin:
             )
             if r2.returncode != 0:
                 raise RuntimeError(f'tpm2_unseal 失败: {r2.stderr.strip()}')
-            return r2.stdout.rstrip('\n\r')
+            # 格式校验：清理输出，拒绝空/过短/含控制字符的结果
+            pw = r2.stdout.rstrip('\n\r')
+            if not pw:
+                raise RuntimeError('TPM 解封返回空密码')
+            if len(pw) < 4:
+                raise RuntimeError(
+                    f'TPM 解封返回的密码过短 ({len(pw)} 字符)',
+                )
+            # 检查是否有多余的 stderr 输出（TPM 工具可能在 stdout 外输出调试信息）
+            if r2.stderr and r2.stderr.strip():
+                logger.warning(
+                    'tpm2_unseal stderr 非空（可能包含警告）: %s',
+                    r2.stderr.strip(),
+                )
+            return pw
         finally:
             try:
                 os.unlink(seal_ctx)

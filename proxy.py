@@ -14,6 +14,7 @@ MATRIX_ACCESS_TOKEN 环境变量提供 Matrix Bot 的 access token
 """
 
 import asyncio
+import ctypes
 import logging
 import os
 import sys
@@ -69,7 +70,32 @@ class CredentialProxy(
 ):
     """凭据代理：TPM 解锁 → Matrix 审批 → KeePass 查询 → LLM 脱敏代理。"""
 
+    @staticmethod
+    def _lock_memory():
+        """尝试 mlockall 锁定进程内存，防止 master_password 被 swap 到磁盘。
+        需要 CAP_IPC_LOCK（容器中需添加该 capability）。
+        失败时仅记 warning，不阻止启动。
+        """
+        try:
+            # Linux: libc.so.6 总是存在
+            libc = ctypes.CDLL('libc.so.6', use_errno=True)
+            MCL_CURRENT = 1
+            MCL_FUTURE = 2
+            if libc.mlockall(MCL_CURRENT | MCL_FUTURE) == 0:
+                logger.info('mlockall OK — 进程内存已锁定，防止 swap')
+            else:
+                err = ctypes.get_errno()
+                logger.warning(
+                    'mlockall 失败 (errno=%d)，密码可能被 swap。'
+                    '容器中需添加 CAP_IPC_LOCK 或 --cap-add=ipc_lock', err,
+                )
+        except Exception:
+            logger.warning('mlockall 不可用，密码可能被 swap 到磁盘')
+
     def __init__(self, homeserver: str, room_id: str, access_token: str):
+        # ── mlockall: 进程启动时锁定内存，防 master_password swap ──
+        self._lock_memory()
+
         # ── Matrix ──
         self.homeserver = homeserver
         self.room_id = room_id
