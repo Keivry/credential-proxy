@@ -20,3 +20,5 @@ docker-compose.yml
 dist/
 *.egg-info/
 .python-version
+get/
+.github/

@@ -1,4 +1,4 @@
-name: Docker Build & Push
+name: Build & Release
 
 on:
   push:
@@ -8,7 +8,8 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  build:
+  docker:
+    name: Build Docker Image
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -55,3 +56,32 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  release-binary:
+    name: Build get binary
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache-dependency-path: get/go.mod
+
+      - name: Build get binary
+        run: |
+          cd get
+          go build -v -ldflags="-s -w" -o get-credential-linux-amd64 .
+          sha256sum get-credential-linux-amd64 > get-credential-linux-amd64.sha256
+
+      - name: Upload binary to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            get/get-credential-linux-amd64
+            get/get-credential-linux-amd64.sha256
