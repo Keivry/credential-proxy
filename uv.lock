@@ -345,7 +345,7 @@ wheels = [
 
 [[package]]
 name = "credential-proxy"
-version = "0.1.4"
+version = "0.1.6"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -355,6 +355,12 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
+
+[package.dev-dependencies]
 dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -370,6 +376,12 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21" },
 ]
 provides-extras = ["dev"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "pytest-asyncio", specifier = ">=1.4.0" },
+]
 
 [[package]]
 name = "frozenlist"
