@@ -497,7 +497,6 @@ class TestFinishReasonAndDone:
 # ═══════════════════════════════════════════════════════════
 
 
-
 class TestMkSseEvent:
     """验证 _mk_sse_event 的 SSE 输出格式和边界。"""
 
