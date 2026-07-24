@@ -570,7 +570,7 @@ class CredentialMixin:
 
         # 紧急吊销要求：admin token 匹配 或 同网段 IP
         is_internal = peer.startswith(('10.', '172.', '192.168.'))
-        if not req_token or (req_token != admin_token and not is_internal):
+        if not (req_token == admin_token or is_internal):
             logger.warning(
                 'EMERGENCY_REVOKE_REJECTED: peer=%s', peer,
             )

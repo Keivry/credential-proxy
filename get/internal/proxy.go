@@ -17,7 +17,7 @@ var ProxyURL = getEnv("PROXY_URL", "http://127.0.0.1:8877")
 // httpClientTimeoutSeconds 默认 HTTP 超时，可通过 PROXY_HTTP_TIMEOUT 环境变量覆盖。
 // 支持 "30"（秒）或 "1m30s"（Go Duration 格式）两种输入。
 var httpClientTimeoutSeconds = func() time.Duration {
-	s := getEnv("PROXY_HTTP_TIMEOUT", "30")
+	s := getEnv("PROXY_HTTP_TIMEOUT", "300")
 	// 先试直接解析（支持 "1m30s", "5s" 等标准 Go Duration 格式）
 	if d, err := time.ParseDuration(s); err == nil {
 		return d

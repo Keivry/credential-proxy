@@ -47,9 +47,9 @@ class CredentialProxy(
     TokenMixin,
     TpmMixin,
     MatrixMixin,
+    RegistryMixin,
     CredentialMixin,
     LlmMixin,
-    RegistryMixin,
 ):
     """凭据代理：TPM 解锁 → Matrix 审批 → KeePass 查询 → LLM 脱敏代理。"""
 
