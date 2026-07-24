@@ -3,22 +3,23 @@
 每个密码映射为一个 __VG_CRED_NNNNNN__ token。
 使用 re.sub 单次替换，按长度降序防子串碰撞。
 """
+
 import logging
 import re as _re
 
-logger = logging.getLogger("credential-proxy")
+logger = logging.getLogger('credential-proxy')
 
-TOKEN_PREFIX = "__VG_CRED_"
-TOKEN_SUFFIX = "__"
+TOKEN_PREFIX = '__VG_CRED_'
+TOKEN_SUFFIX = '__'
 MAX_TOKEN_ENTRIES = 5000
 SECRET_MIN_LENGTH = 4
 # 用无界匹配防止 seq 溢出破坏 regex
-TOKEN_RE = _re.compile(rb"__VG_CRED_\d{4,}__")
-TOKEN_STR_RE = _re.compile(r"__VG_CRED_\d{4,}__")
+TOKEN_RE = _re.compile(rb'__VG_CRED_\d{4,}__')
+TOKEN_STR_RE = _re.compile(r'__VG_CRED_\d{4,}__')
 
 
 def _make_token(n: int) -> str:
-    return f"{TOKEN_PREFIX}{n:06d}{TOKEN_SUFFIX}"
+    return f'{TOKEN_PREFIX}{n:06d}{TOKEN_SUFFIX}'
 
 
 class TokenMixin:
@@ -35,8 +36,10 @@ class TokenMixin:
                 self.pwd_to_token.move_to_end(value)
                 return self.pwd_to_token[value]
             if TOKEN_STR_RE.fullmatch(value) or value.startswith(TOKEN_PREFIX):
-                logger.warning("密码值匹配内部 token 格式或前缀，拒绝注册（值已截断不记录）")
-                raise ValueError("密码值不能匹配内部 token 格式或以 token 前缀开头")
+                logger.warning(
+                    '密码值匹配内部 token 格式或前缀，拒绝注册（值已截断不记录）'
+                )
+                raise ValueError('密码值不能匹配内部 token 格式或以 token 前缀开头')
             self._token_seq += 1
             token = _make_token(self._token_seq)
             if len(self.pwd_to_token) >= MAX_TOKEN_ENTRIES:
@@ -63,19 +66,20 @@ class TokenMixin:
         # 显式 mapping：每次构建（快照场景，不缓存，防子集污染全集缓存）
         if pwd_to_token is not None:
             items = sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True)
-            pat = _re.compile("|".join(_re.escape(pwd) for pwd, _ in items))
+            pat = _re.compile('|'.join(_re.escape(pwd) for pwd, _ in items))
             repl = {pwd: token for pwd, token in mapping.items()}
             return pat.sub(lambda m: repl.get(m.group(0), m.group(0)), text)
         # 全集：使用版本缓存（pattern + repl dict 同时缓存）
-        if getattr(self, "_redact_cache_ver", -1) != self._token_seq:
+        if getattr(self, '_redact_cache_ver', -1) != self._token_seq:
             items = sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True)
             self._redact_cache_pat = _re.compile(
-                "|".join(_re.escape(pwd) for pwd, _ in items),
+                '|'.join(_re.escape(pwd) for pwd, _ in items),
             )
             self._redact_cache_repl = dict(mapping)
             self._redact_cache_ver = self._token_seq
         return self._redact_cache_pat.sub(
-            self._redact_cache_repl_func, text,
+            self._redact_cache_repl_func,
+            text,
         )
 
     def _redact_cache_repl_func(self, m):
@@ -93,18 +97,19 @@ class TokenMixin:
         # 显式 mapping：每次构建（active_t2p 通常 <10 项，开销可忽略）
         if token_to_pwd is not None:
             items = sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True)
-            pat = _re.compile("|".join(_re.escape(tok) for tok, _ in items))
+            pat = _re.compile('|'.join(_re.escape(tok) for tok, _ in items))
             return pat.sub(lambda m: mapping.get(m.group(0), m.group(0)), text)
         # 全集：使用版本缓存
-        if getattr(self, "_restore_cache_ver", -1) != self._token_seq:
+        if getattr(self, '_restore_cache_ver', -1) != self._token_seq:
             items = sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True)
             self._restore_cache_pat = _re.compile(
-                "|".join(_re.escape(tok) for tok, _ in items),
+                '|'.join(_re.escape(tok) for tok, _ in items),
             )
             self._restore_cache_repl = dict(mapping)
             self._restore_cache_ver = self._token_seq
         return self._restore_cache_pat.sub(
-            self._restore_cache_repl_func, text,
+            self._restore_cache_repl_func,
+            text,
         )
 
     def _restore_cache_repl_func(self, m):

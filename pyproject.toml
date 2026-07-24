@@ -29,3 +29,21 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 only-include = ["proxy.py"]
+
+[tool.ruff.lint]
+ignore = [
+    # 中文注释中的全角字符（：（）等）是正确的中文标点，不是混淆
+    "RUF001", "RUF002", "RUF003",
+    # docstring 格式（中文项目不适用英文标点规则）
+    "D400", "D415",
+    # 函数复杂度（历史遗留）
+    "C901", "PLR0915",
+    # 缺少返回类型注解（历史遗留，不阻塞运行）
+    "ANN202", "ANN201", "ANN001", "ANN002",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"test_*.py" = ["D", "ANN", "S"]
+
+[tool.ruff.format]
+quote-style = "single"
