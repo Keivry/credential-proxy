@@ -528,13 +528,14 @@ class CredentialMixin:
                     {'error': f"注册 '{name}' 不存在"},
                     status=404,
                 )
-            # 判断类型：Token 用 token_id，Caller 用 reg_id
+            # 判断类型：Token 用 token_id，Caller 用 reg_id（锁外调用，因为 _revoke_* 自带锁）
             token_id = getattr(reg, 'token_id', None)
             reg_id = getattr(reg, 'reg_id', None)
-            if token_id:
-                await self._revoke_token(token_id)
-            elif reg_id:
-                await self._revoke_caller(reg_id)
+        # ⚠️ 必须在锁外调用 _revoke_*，否则内部 async with self._lock 死锁
+        if token_id:
+            await self._revoke_token(token_id)
+        elif reg_id:
+            await self._revoke_caller(reg_id)
 
         return web.json_response({'status': 'revoked', 'name': name})
 
@@ -590,13 +591,14 @@ class CredentialMixin:
                     {'error': f"未找到注册 '{name}'"},
                     status=404,
                 )
-            # 判断类型：Token 用 token_id，Caller 用 reg_id
+            # 判断类型：Token 用 token_id，Caller 用 reg_id（锁外调用，因为 _revoke_* 自带锁）
             token_id = getattr(reg, 'token_id', None)
             reg_id = getattr(reg, 'reg_id', None)
-            if token_id:
-                await self._revoke_token(token_id)
-            elif reg_id:
-                await self._revoke_caller(reg_id)
+        # ⚠️ 必须在锁外调用 _revoke_*，否则内部 async with self._lock 死锁
+        if token_id:
+            await self._revoke_token(token_id)
+        elif reg_id:
+            await self._revoke_caller(reg_id)
 
         logger.info(
             'EMERGENCY_REVOKE: name=%s peer=%s', name, peer,
