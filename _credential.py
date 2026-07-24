@@ -221,43 +221,55 @@ class CredentialMixin:
                 )
 
             if field:
-                m = {
-                    'password': entry.password,
-                    'username': entry.username,
-                    'url': entry.url,
-                    'title': entry.title,
-                }
-                val = m.get(field)
-                if val is None and hasattr(entry, 'get_custom_property'):
+                # 标准字段: 只有 password 是受保护的秘密，需要 tokenize
+                if field in ('password', 'username', 'title', 'url'):
+                    val = getattr(entry, field, '') or ''
+                    if field == 'password':
+                        value = await self._maybe_register(val, use_token)
+                    else:
+                        value = val
+                elif hasattr(entry, 'is_custom_property_protected'):
+                    # 自定义属性: 仅 protected 的才 tokenize
                     val = entry.get_custom_property(field)
-                if val is None:
+                    if val is None:
+                        value = None
+                    elif entry.is_custom_property_protected(field):
+                        value = await self._maybe_register(val, use_token)
+                    else:
+                        value = val
+                else:
+                    val = entry.get_custom_property(field) if hasattr(entry, 'get_custom_property') else None
+                    value = await self._maybe_register(val, use_token) if val else None
+
+                if value is None:
                     return web.json_response(
                         {'error': f'无属性 {field}'},
                         status=404,
                     )
-                return web.json_response(
-                    {
-                        'value': await self._maybe_register(val, use_token),
-                    }
-                )
+                return web.json_response({'value': value})
 
             props = {}
-            if hasattr(entry, 'get_custom_property'):
+            if hasattr(entry, 'is_custom_property_protected'):
+                for k in entry.custom_properties or {}:
+                    v = entry.get_custom_property(k)
+                    if v:
+                        if entry.is_custom_property_protected(k):
+                            props[k] = await self._maybe_register(v, use_token)
+                        else:
+                            props[k] = v
+            elif hasattr(entry, 'get_custom_property'):
+                # 旧版 pykeepass 无 is_custom_property_protected: 全量 tokenize 兜底
                 for k in entry.custom_properties or {}:
                     v = entry.get_custom_property(k)
                     if v:
                         props[k] = await self._maybe_register(v, use_token)
             result = {
-                'title': await self._maybe_register(entry.title, use_token),
-                'username': await self._maybe_register(
-                    entry.username or '', use_token,
-                ),
+                'title': entry.title or '',
+                'username': entry.username or '',
                 'password': await self._maybe_register(
                     entry.password or '', use_token,
                 ),
-                'url': await self._maybe_register(
-                    entry.url or '', use_token,
-                ),
+                'url': entry.url or '',
             }
             if props:
                 result['custom_properties'] = props
