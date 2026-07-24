@@ -87,7 +87,7 @@ class CredentialProxyOnly(TokenMixin, CredentialMixin, LlmMixin):
     async def _ask(self, text: str) -> str | None:
         """免 Matrix 审批：自动批准 pending_requests 中的所有请求。"""
         async with self._lock:
-            for req_id, req in self.pending_requests.items():
+            for req in self.pending_requests.values():
                 if req.get('approved') is None:
                     req['approved'] = True
                     req['event'].set()

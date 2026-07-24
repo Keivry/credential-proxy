@@ -60,15 +60,23 @@ class MatrixMixin:
         self.client.add_event_callback(self.on_text, RoomMessageText)
         self.client.add_event_callback(self.on_reaction, ReactionEvent)
 
+        def _read_token(path: str) -> str | None:
+            try:
+                with open(path) as f:
+                    return f.read().strip()
+            except FileNotFoundError:
+                return None
+
+        def _write_token(path: str, content: str) -> None:
+            with open(path, 'w') as f:
+                f.write(content)
+
         sync_token_file = os.path.join(self._base_dir, 'sync_token')
         since = None
         try:
-            with open(sync_token_file) as f:
-                since = f.read().strip()
-                if since:
-                    logger.info('从 sync token 恢复')
-        except FileNotFoundError:
-            pass
+            since = await asyncio.to_thread(_read_token, sync_token_file)
+            if since:
+                logger.info('从 sync token 恢复')
         except Exception:
             logger.exception('读取 sync_token 失败')
 
@@ -85,8 +93,11 @@ class MatrixMixin:
                 if hasattr(resp, 'next_batch') and resp.next_batch:
                     since = resp.next_batch
                     try:
-                        with open(sync_token_file, 'w') as f:
-                            f.write(since)
+                        await asyncio.to_thread(
+                            _write_token,
+                            sync_token_file,
+                            since,
+                        )
                     except Exception:
                         logger.debug('保存 sync_token 失败', exc_info=True)
             except Exception:
@@ -174,11 +185,11 @@ class MatrixMixin:
                     self.unlock_event = None
                     self._unlock_msg_id = None
                     say_text = '❌ 解锁被拒绝'
-            elif not (req_id := self.approval_msgs.get(orig)):
-                pass
-            elif not (req := self.pending_requests.get(req_id)):
-                pass
-            elif req['approved'] is not None:
+            elif (
+                not (req_id := self.approval_msgs.get(orig))
+                or not (req := self.pending_requests.get(req_id))
+                or req['approved'] is not None
+            ):
                 pass
             else:
                 ok = key == REACTION_APPROVE
