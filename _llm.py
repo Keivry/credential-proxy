@@ -229,7 +229,7 @@ class LlmMixin:
                                             pos,
                                         )
                                     ) >= 0:
-                                        line_bytes = bytes(byte_buf[pos:idx])
+                                        line_bytes = byte_buf[pos:idx]
                                         pos = idx + 1
                                         line = line_bytes.decode(
                                             'utf-8',
@@ -455,6 +455,10 @@ class LlmMixin:
                                                         combined,
                                                         active_t2p,
                                                     )
+                                                    restored = _PARTIAL_TOKEN_RE.sub(
+                                                        '',
+                                                        restored,
+                                                    )
                                                     await resp.write(
                                                         _mk_sse_event(
                                                             restored,
@@ -473,6 +477,10 @@ class LlmMixin:
                                                     restored = self._restore(
                                                         combined,
                                                         active_t2p,
+                                                    )
+                                                    restored = _PARTIAL_TOKEN_RE.sub(
+                                                        '',
+                                                        restored,
                                                     )
                                                     await resp.write(
                                                         _mk_sse_event(
@@ -598,7 +606,7 @@ class LlmMixin:
                                             pos,
                                         )
                                     ) >= 0:
-                                        line_bytes = bytes(byte_buf[pos:idx])
+                                        line_bytes = byte_buf[pos:idx]
                                         pos = idx + 1
                                         line = line_bytes.decode(
                                             'utf-8',
