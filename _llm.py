@@ -22,25 +22,35 @@ SSE_MAX_BUF = 1_048_576  # SSE 缓冲区上限 (1MB)
 _PARTIAL_TOKEN_RE = _re.compile(r'__VG_CRED_\d*$')
 # Debug 开关：设置环境变量 CREDENTIAL_PROXY_DEBUG_DIR 开启
 _DEBUG_DIR = os.environ.get('CREDENTIAL_PROXY_DEBUG_DIR', '')
-_DEBUG_BUF = 50 * 1024 * 1024  # 每个请求最多保存 50MB
 
 
-def _debug_save(req_id: str, name: str, data: bytes) -> None:
-    """保存原始调试数据到 debug 目录（不中转记编码，不沿途修改）。
+def _extract_conv_id(data: dict) -> str | None:
+    """从 SSE data JSON 中提取 conversation ID。
 
-    按 request id 分目录存储，单文件超限后停止追加以防止磁盘写满。
+    兼容 OpenAI 格式 (data.id) 和 Anthropic 格式 (data.message.id)。
     """
-    if not _DEBUG_DIR:
+    if 'id' in data:
+        return data['id']
+    if isinstance(data.get('message'), dict):
+        return data['message'].get('id')
+    return None
+
+
+def _save_request_body(conv_id: str, body: bytes) -> None:
+    """保存原始请求 JSON body 到 debug 目录，以 conversation ID 命名。
+
+    仅在 LLM 对话 endpoint 且 CREDENTIAL_PROXY_DEBUG_DIR 设置时调用。
+    单次写入 request.json，不追加，不保存上游响应。
+    """
+    if not _DEBUG_DIR or not body:
         return
-    path = os.path.join(_DEBUG_DIR, req_id, name)
+    path = os.path.join(_DEBUG_DIR, conv_id, 'request.json')
     try:
-        if os.path.isfile(path) and os.path.getsize(path) > _DEBUG_BUF:
-            return
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, 'ab') as f:
-            f.write(data)
+        with open(path, 'wb') as f:
+            f.write(body)
     except OSError as exc:
-        logger.debug('Debug 保存失败: %s', exc)
+        logger.debug('保存调试请求失败: %s', exc)
 
 
 def _mk_sse_event(content: str, finish_reason: str | None = None) -> str:
@@ -117,8 +127,14 @@ class LlmMixin:
             if request.query_string:
                 target_url += '?' + request.query_string
             body = await request.read()
-            _debug_save(req_id, 'request.raw', body)
             body_text = body.decode('utf-8', errors='replace') if body else ''
+
+            # 仅对 LLM 对话 endpoint 保存调试原始请求 JSON（非对话如 /v1/models 不保存）
+            _debug_save_eligible = bool(_DEBUG_DIR) and (
+                tail.rstrip('/').endswith('chat/completions')
+                or tail.rstrip('/').endswith('v1/messages')
+            )
+            _debug_saved = False  # 标记是否已在 SSE 响应中保存过
 
             # 拍快照防 "forget secrets" 竞态（需持锁，防快照不一致）
             async with self._lock:
@@ -188,7 +204,6 @@ class LlmMixin:
                                     SSE_CHUNK_SIZE,
                                 ):
                                     byte_buf.extend(chunk)
-                                    _debug_save(req_id, 'upstream.raw', chunk)
                                     pos = 0
                                     while (
                                         idx := byte_buf.find(
@@ -214,20 +229,30 @@ class LlmMixin:
                                             continue
 
                                         payload = line[5:]
-                                        if payload.startswith(' '):
-                                            payload = payload[1:]
+                                        payload = payload.removeprefix(' ')
 
                                         # [DONE] 标记：先 flush 累积内容
                                         if payload.strip() == '[DONE]':
                                             await _flush(content_buf)
                                             await resp.write(
-                                                'data: [DONE]\n'.encode(),
+                                                b'data: [DONE]\n',
                                             )
                                             continue
 
                                         # 解析 JSON，提取 delta content
                                         try:
                                             parsed = json.loads(payload)
+
+                                            # 首次成功解析 SSE data 时提取 conversation ID 保存原始请求
+                                            if (
+                                                _debug_save_eligible
+                                                and not _debug_saved
+                                            ):
+                                                conv_id = _extract_conv_id(parsed)
+                                                if conv_id:
+                                                    _save_request_body(conv_id, body)
+                                                    _debug_saved = True
+
                                             choices = parsed.get('choices', [])
                                             choice = choices[0] if choices else {}
                                             delta = choice.get('delta', {})
@@ -348,9 +373,9 @@ class LlmMixin:
                                                 # 只有不以 data:/event:/id: 开头的行才是续行
                                                 if (
                                                     not next_line.strip()
-                                                    or next_line.startswith('data:')
-                                                    or next_line.startswith('event:')
-                                                    or next_line.startswith('id:')
+                                                    or next_line.startswith(
+                                                        ('data:', 'event:', 'id:')
+                                                    )
                                                 ):
                                                     break
                                                 accumulated += '\n' + next_line
@@ -521,7 +546,6 @@ class LlmMixin:
                                     SSE_CHUNK_SIZE,
                                 ):
                                     byte_buf.extend(chunk)
-                                    _debug_save(req_id, 'upstream.raw', chunk)
                                     # 先处理完整行，再检查缓冲区（防截断丢数据）
                                     pos = 0
                                     while (
@@ -538,8 +562,22 @@ class LlmMixin:
                                         ).rstrip('\r')
                                         if line.startswith('data:'):
                                             payload = line[5:]
-                                            if payload.startswith(' '):
-                                                payload = payload[1:]
+                                            payload = payload.removeprefix(' ')
+
+                                            # 首次 data 事件提取 conversation ID 保存原始请求
+                                            if (
+                                                _debug_save_eligible
+                                                and not _debug_saved
+                                            ):
+                                                try:
+                                                    _parsed = json.loads(payload)
+                                                    _cid = _extract_conv_id(_parsed)
+                                                    if _cid:
+                                                        _save_request_body(_cid, body)
+                                                        _debug_saved = True
+                                                except json.JSONDecodeError:
+                                                    pass
+
                                             restored = 'data: ' + self._restore(
                                                 payload,
                                                 active_t2p,
@@ -606,7 +644,17 @@ class LlmMixin:
                     else:
                         # ── 非流式 ──
                         resp_body = await upstream_resp.read()
-                        _debug_save(req_id, 'upstream.raw', resp_body)
+
+                        if _debug_save_eligible:
+                            try:
+                                resp_json = json.loads(resp_body)
+                                conv_id = resp_json.get('id')
+                                if conv_id:
+                                    _save_request_body(conv_id, body)
+                                    _debug_saved = True
+                            except json.JSONDecodeError:
+                                pass
+
                         resp_text = resp_body.decode(
                             'utf-8',
                             errors='replace',
@@ -620,6 +668,8 @@ class LlmMixin:
                             ),
                         )
             except Exception:
+                if _debug_save_eligible and not _debug_saved:
+                    _save_request_body(f'failed-{req_id}', body)
                 logger.exception(
                     'LLM 上游请求失败: %s %s',
                     request.method,
