@@ -235,7 +235,7 @@ class LlmMixin:
                                                 'finish_reason',
                                             )
 
-                                            if 'content' not in delta:
+                                            if delta.get('content') is None:
                                                 if 'reasoning_content' in delta:
                                                     # reasoning_content 同 content 一样需要 safe/hold 保护
                                                     content_buf += delta[
