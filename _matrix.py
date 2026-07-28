@@ -25,7 +25,6 @@ CMD_FORGET = 'forget secrets'
 
 
 class MatrixMixin:
-
     # ── Bot lifecycle ──
 
     async def start_bot(self):
@@ -171,35 +170,41 @@ class MatrixMixin:
             # ── 2. 注册审批分支 ──
             elif reg_id := self._registration_msgs.get(orig):
                 reg_pending = self._registration_pending.get(reg_id)
-                if reg_pending and reg_pending.get("approved") is None:
-                    reg_pending["approved"] = key  # 存储实际 reaction（🔓/✅/❎）
-                    reg_pending["event"].set()
-                    name = reg_pending.get("name", "?")
+                if reg_pending and reg_pending.get('approved') is None:
+                    reg_pending['approved'] = key  # 存储实际 reaction（🔓/✅/❎）
+                    reg_pending['event'].set()
+                    name = reg_pending.get('name', '?')
                     action = {
-                        REACTION_AUTO_UNLOCK: "自动放行",
-                        REACTION_APPROVE: "普通授权",
-                        REACTION_REJECT: "拒绝",
+                        REACTION_AUTO_UNLOCK: '自动放行',
+                        REACTION_APPROVE: '普通授权',
+                        REACTION_REJECT: '拒绝',
                     }.get(key, key)
                     say_text = f'{key} 注册审批: {name} → {action}'
 
             # ── 3. 哈希变更审批分支 ──
             elif hc_id := self._hash_change_msgs.get(orig):
                 pending = self._hash_change_pending.get(hc_id)
-                if pending and pending.get("result") is None:
-                    pending["result"] = key
-                    pending["event"].set()
+                if pending and pending.get('result') is None:
+                    pending['result'] = key
+                    pending['event'].set()
                     # 后台 resolve（不阻塞 on_reaction）
                     asyncio.create_task(
                         self._resolve_hash_change(
-                            pending["reg_id"], pending["new_hash"], key,
+                            pending['reg_id'],
+                            pending['new_hash'],
+                            key,
                         ),
                     )
-                    reg_obj = self._caller_registry.get(hc_id) if hasattr(self, '_caller_registry') else None
+                    reg_obj = (
+                        self._caller_registry.get(hc_id)
+                        if hasattr(self, '_caller_registry')
+                        else None
+                    )
                     name = reg_obj.name if reg_obj else ''
                     action = {
-                        "🔓": "保持自动放行",
-                        "✅": "降级为普通授权",
-                        "❎": "拒绝",
+                        '🔓': '保持自动放行',
+                        '✅': '降级为普通授权',
+                        '❎': '拒绝',
                     }.get(key, key)
                     say_text = f'{key} 哈希变更: {name or hc_id} → {action}'
 
@@ -239,7 +244,9 @@ class MatrixMixin:
             logger.debug('_say 发送失败', exc_info=True)
 
     async def _ask(
-        self, text: str, reactions: tuple[str, ...] | None = None,
+        self,
+        text: str,
+        reactions: tuple[str, ...] | None = None,
     ) -> str | None:
         """发送审批消息并预加 reaction，返回 event_id。
 

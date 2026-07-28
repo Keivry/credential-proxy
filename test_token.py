@@ -277,6 +277,7 @@ async def test_redact_cache_hit():
 # _maybe_register
 # ═══════════════════════════════════════════════════════════
 
+
 @pytest.mark.asyncio
 async def test_maybe_register_enabled():
     t = TestToken()

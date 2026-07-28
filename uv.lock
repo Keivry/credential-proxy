@@ -345,7 +345,7 @@ wheels = [
 
 [[package]]
 name = "credential-proxy"
-version = "0.7.1"
+version = "0.7.5"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -372,8 +372,8 @@ requires-dist = [
     { name = "brotli", specifier = ">=1.0" },
     { name = "matrix-nio", specifier = ">=0.7" },
     { name = "pykeepass", specifier = ">=4.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.1.1" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=1.4.0" },
 ]
 provides-extras = ["dev"]
 

@@ -70,7 +70,9 @@ class CredentialProxyOnly(TokenMixin, CredentialMixin, LlmMixin):
         try:
             cred_port = int(cred_port_raw)
         except (ValueError, TypeError):
-            logger.warning('CREDENTIAL_API_PORT 值无效: %r，使用默认 9876', cred_port_raw)
+            logger.warning(
+                'CREDENTIAL_API_PORT 值无效: %r，使用默认 9876', cred_port_raw
+            )
             cred_port = 9876
         logger.info('Credential API → 0.0.0.0:%d', cred_port)
         self._cred_port = cred_port

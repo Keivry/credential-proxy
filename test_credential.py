@@ -349,9 +349,7 @@ async def test_approval_rejected():
     assert call_args['error'] == '审批被拒绝'
 
 
-
 @pytest.mark.asyncio
-
 @pytest.mark.asyncio
 async def test_approval_approved_with_raw_token():
     """token: false 时审批消息应显示 (原始值) 标记。"""
@@ -370,7 +368,9 @@ async def test_approval_approved_with_raw_token():
 
     p._ask_mock.side_effect = ask_side
     auth = {'caller_hash': 'sha256:test'}
-    req = make_request({'entry': 'MyEntry', 'field': 'password', 'token': False, 'auth': auth})
+    req = make_request(
+        {'entry': 'MyEntry', 'field': 'password', 'token': False, 'auth': auth}
+    )
     await p.handle_credential(req)
     assert approval_text is not None
     assert 'MyEntry - password (原始值)' in approval_text
@@ -398,8 +398,6 @@ async def test_approval_approved_default_tokenized():
     await p.handle_credential(req)
     assert approval_text is not None
     assert 'MyEntry - username (脱敏)' in approval_text
-
-
 
 
 @pytest.mark.asyncio
