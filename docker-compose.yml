@@ -1,6 +1,7 @@
 services:
   credential-proxy:
     build: .
+    image: ghcr.io/keivry/credential-proxy:0.8.0
     container_name: credential-proxy
     restart: unless-stopped
     cap_add:
@@ -13,6 +14,14 @@ services:
       - HOMESERVER=https://matrix.example.com
       - ROOM_ID=!yourroomid:matrix.example.com
       - MATRIX_ACCESS_TOKEN=${MATRIX_ACCESS_TOKEN:?MATRIX_ACCESS_TOKEN is required}
+      # ── 三因子认证（v0.8.0+，强烈建议开启）──
+      # GET_BINARY_HASH: get 二进制的 SHA256（容器内计算）:
+      #   sha256sum get | cut -d' ' -f1
+      # GET_BINARY_SECRET: 随机部署密钥（Hermes 容器与 Proxy 容器共享）:
+      #   openssl rand -hex 32
+      # 未设置时跳过认证（兼容模式）。两个必须同时设置才生效。
+      # - GET_BINARY_HASH=sha256:abc123...
+      # - GET_BINARY_SECRET=abc123def456...
       # 可选：
       # - CREDENTIAL_PORT=8877
       # - DATA_DIR=/data
