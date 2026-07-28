@@ -336,112 +336,111 @@ class LlmMixin:
                                                 'finish_reason',
                                             )
 
-                                            if delta.get('content') is None:
-                                                if 'reasoning_content' in delta:
-                                                    reasoning_buf += delta[
-                                                        'reasoning_content'
-                                                    ]
-                                                    restored = self._restore(
+                                            # ── Reasoning content（独立处理，不受 content 影响）──
+                                            if 'reasoning_content' in delta:
+                                                reasoning_buf += delta[
+                                                    'reasoning_content'
+                                                ]
+                                                restored = self._restore(
+                                                    reasoning_buf,
+                                                    active_t2p,
+                                                )
+                                                last_us = restored.rfind('__')
+                                                safe = restored
+                                                pending = ''
+                                                if last_us >= 0:
+                                                    suffix = restored[last_us:]
+                                                    maybe_prefix = any(
+                                                        t.startswith(suffix)
+                                                        for t in active_t2p
+                                                    )
+                                                    if maybe_prefix:
+                                                        safe = restored[:last_us]
+                                                        pending = suffix
+                                                if safe:
+                                                    await resp.write(
+                                                        _mk_sse_event(
+                                                            reasoning_content=safe,
+                                                        ).encode(),
+                                                    )
+                                                reasoning_buf = pending
+                                                if finish_reason:
+                                                    reasoning_buf = self._restore(
                                                         reasoning_buf,
                                                         active_t2p,
                                                     )
-                                                    last_us = restored.rfind('__')
-                                                    safe = restored
-                                                    pending = ''
-                                                    if last_us >= 0:
-                                                        suffix = restored[last_us:]
-                                                        maybe_prefix = any(
-                                                            t.startswith(suffix)
-                                                            for t in active_t2p
-                                                        )
-                                                        if maybe_prefix:
-                                                            safe = restored[:last_us]
-                                                            pending = suffix
-                                                    if safe:
-                                                        await resp.write(
-                                                            _mk_sse_event(
-                                                                reasoning_content=safe,
-                                                            ).encode(),
-                                                        )
-                                                    reasoning_buf = pending
-                                                    if finish_reason:
-                                                        reasoning_buf = self._restore(
+                                                    reasoning_buf = (
+                                                        _PARTIAL_TOKEN_RE.sub(
+                                                            '',
                                                             reasoning_buf,
-                                                            active_t2p,
                                                         )
-                                                        reasoning_buf = (
-                                                            _PARTIAL_TOKEN_RE.sub(
-                                                                '',
-                                                                reasoning_buf,
-                                                            )
-                                                        )
-                                                        await resp.write(
-                                                            _mk_sse_event(
-                                                                reasoning_content=reasoning_buf,
-                                                                finish_reason=finish_reason,
-                                                            ).encode(),
-                                                        )
-                                                        reasoning_buf = ''
-                                                else:
-                                                    # 真正的非 content 事件
-                                                    await _flush(
-                                                        c=content_buf,
-                                                        rc=reasoning_buf,
                                                     )
                                                     await resp.write(
-                                                        (
-                                                            self._restore(
-                                                                line, active_t2p
-                                                            )
-                                                            + '\n'
-                                                        ).encode('utf-8'),
+                                                        _mk_sse_event(
+                                                            reasoning_content=reasoning_buf,
+                                                            finish_reason=finish_reason,
+                                                        ).encode(),
                                                     )
-                                                continue
+                                                    reasoning_buf = ''
 
-                                            # 追加 content 片段，还原 token
-                                            content_buf += delta['content']
-                                            restored = self._restore(
-                                                content_buf,
-                                                active_t2p,
-                                            )
-
-                                            # 找安全 flush 点
-                                            last_us = restored.rfind('__')
-                                            safe = restored
-                                            pending = ''
-                                            if last_us >= 0:
-                                                suffix = restored[last_us:]
-                                                maybe_prefix = any(
-                                                    t.startswith(suffix)
-                                                    for t in active_t2p
-                                                )
-                                                if maybe_prefix:
-                                                    safe = restored[:last_us]
-                                                    pending = suffix
-
-                                            # flush 安全部分
-                                            if safe:
-                                                await resp.write(
-                                                    _mk_sse_event(safe).encode(),
-                                                )
-                                            content_buf = pending
-
-                                            if finish_reason:
-                                                content_buf = self._restore(
+                                            # ── Content / 非 content 事件 ──
+                                            if delta.get('content') is not None:
+                                                # 追加 content 片段，还原 token
+                                                content_buf += delta['content']
+                                                restored = self._restore(
                                                     content_buf,
                                                     active_t2p,
                                                 )
-                                                content_buf = _PARTIAL_TOKEN_RE.sub(
-                                                    '',
-                                                    content_buf,
+
+                                                # 找安全 flush 点
+                                                last_us = restored.rfind('__')
+                                                safe = restored
+                                                pending = ''
+                                                if last_us >= 0:
+                                                    suffix = restored[last_us:]
+                                                    maybe_prefix = any(
+                                                        t.startswith(suffix)
+                                                        for t in active_t2p
+                                                    )
+                                                    if maybe_prefix:
+                                                        safe = restored[:last_us]
+                                                        pending = suffix
+
+                                                # flush 安全部分
+                                                if safe:
+                                                    await resp.write(
+                                                        _mk_sse_event(safe).encode(),
+                                                    )
+                                                content_buf = pending
+
+                                                if finish_reason:
+                                                    content_buf = self._restore(
+                                                        content_buf,
+                                                        active_t2p,
+                                                    )
+                                                    content_buf = _PARTIAL_TOKEN_RE.sub(
+                                                        '',
+                                                        content_buf,
+                                                    )
+                                                    await resp.write(
+                                                        _mk_sse_event(
+                                                            content_buf,
+                                                            finish_reason,
+                                                        ).encode(),
+                                                    )
+                                                    content_buf = ''
+                                            elif 'reasoning_content' not in delta:
+                                                # 真正的非 content 事件
+                                                await _flush(
+                                                    c=content_buf,
+                                                    rc=reasoning_buf,
                                                 )
                                                 await resp.write(
-                                                    _mk_sse_event(
-                                                        content_buf,
-                                                        finish_reason,
-                                                    ).encode(),
+                                                    (
+                                                        self._restore(line, active_t2p)
+                                                        + '\n'
+                                                    ).encode('utf-8'),
                                                 )
-                                                content_buf = ''
 
                                         except json.JSONDecodeError:
                                             # 尝试从 byte_buf 读取续行重建 JSON
@@ -535,6 +534,10 @@ class LlmMixin:
                                                     )
                                                 else:
                                                     # 非 content 事件
+                                                    await _flush(
+                                                        c=content_buf,
+                                                        rc=reasoning_buf,
+                                                    )
                                                     await resp.write(
                                                         (
                                                             'data: '
