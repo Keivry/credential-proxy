@@ -199,7 +199,7 @@ class RegistryMixin:
                 approve=None  → 无匹配，继续 Matrix 审批
         """
         async with self._lock:
-            # ── 优先级 1: Caller 哈希校验 ──
+            # ── Caller 哈希校验 ──
             caller_hash = auth.get('caller_hash', '')
             caller_path = auth.get('caller_path', '')
             if caller_hash:

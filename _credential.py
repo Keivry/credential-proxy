@@ -149,7 +149,7 @@ class CredentialMixin:
         app.router.add_get('/health', self.handle_health)
         app.router.add_get('/registrations', self.handle_registrations)
         # 仅当 RegistryMixin 可用时才注册 registry 相关路由
-        # （CredentialMixin 的 handler 内部调用 _register_token 等 RegistryMixin 方法）
+        # （CredentialMixin 的 handler 内部调用 _register_caller 等 RegistryMixin 方法）
         has_registry = hasattr(self, '_register_caller')
         if has_registry:
             app.router.add_post('/register-caller', self.handle_register_caller)
@@ -178,23 +178,12 @@ class CredentialMixin:
     # ── Registrations listing ──
 
     async def handle_registrations(self, _request) -> web.Response:
-        """列出所有 Token 和 Caller 注册（RegistryMixin 未加载时返回空列表）。"""
+        """列出所有 Caller 注册（RegistryMixin 未加载时返回空列表）。"""
         resp = self._require_auth(_request)
         if resp is not None:
             return resp
         items = []
         async with self._lock:
-            if hasattr(self, '_token_registry'):
-                for t in self._token_registry.values():
-                    items.append(
-                        {
-                            'name': t.name,
-                            'type': 'token',
-                            'entries': t.entries,
-                            'allow_mode': t.allow_mode,
-                            'enabled': t.enabled,
-                        }
-                    )
             if hasattr(self, '_caller_registry'):
                 for c in self._caller_registry.values():
                     items.append(
@@ -216,8 +205,8 @@ class CredentialMixin:
 
         流程：
         1. JSON 解析与参数提取（无锁）
-        2. caller_hash 强制校验（方案A）
-        3. 自动放行检查（Caller 哈希 > Token > Matrix 审批）
+        2. 三因子认证 + caller_hash 强制校验
+        3. 自动放行检查（Caller 哈希 → Matrix 审批）
         4. 解锁流程（等待 TPM 解封或 Matrix ✅）
         5. Matrix 审批流程
         6. KeePass 查询并返回（脱敏或原始值）
