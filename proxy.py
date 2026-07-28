@@ -83,7 +83,7 @@ class CredentialProxy(
                         'mlockall 失败 (errno=%d)，密码可能被 swap 到磁盘',
                         err,
                     )
-        except Exception:
+        except OSError:
             logger.warning('mlockall 不可用，密码可能被 swap 到磁盘')
 
     def __init__(self, homeserver: str, room_id: str, access_token: str):

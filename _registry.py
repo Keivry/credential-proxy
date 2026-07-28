@@ -392,14 +392,16 @@ class RegistryMixin:
         }
         data['integrity'] = self._compute_registry_integrity(data)
         tmp_path = self._token_registry_path + '.tmp'
-        with open(tmp_path, 'w') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-            f.flush()
-            # fsync 在线程池执行，不阻塞事件循环
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, os.fsync, f.fileno())
-        os.chmod(tmp_path, 0o600)
-        os.rename(tmp_path, self._token_registry_path)
+
+        def _write():
+            with open(tmp_path, 'w') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp_path, 0o600)
+            os.rename(tmp_path, self._token_registry_path)
+
+        await asyncio.to_thread(_write)
 
     @staticmethod
     def _compute_registry_integrity(data: dict) -> str:
