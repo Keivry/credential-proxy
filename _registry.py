@@ -22,19 +22,6 @@ GRACE_PERIOD_SECONDS = 3600   # 哈希变更宽限期（1 小时）
 
 
 @dataclass
-class RegisteredToken:
-    """注册的 Token，映射到一组允许的 KeePass 条目。"""
-    token_id: str
-    name: str
-    description: str = ""
-    entries: dict[str, list[str]] = field(default_factory=dict)
-    allow_mode: str = "manual"
-    can_auto_unlock: bool = False
-    created_at: str = ""
-    enabled: bool = True
-
-
-@dataclass
 class RegisteredCaller:
     """注册的调用者（脚本文件），通过文件哈希绑定。"""
     reg_id: str
@@ -85,59 +72,12 @@ class RegistryMixin:
         return False
 
     def _lookup_by_name(self, name: str):
-        """按名称查询任意注册（Token 或 Caller）。"""
+        """按名称查询 Caller 注册。"""
         rid = self._registrations_by_name.get(name)
         if rid:
-            if rid in self._token_registry:
-                return self._token_registry[rid]
             if rid in self._caller_registry:
                 return self._caller_registry[rid]
         return None
-
-    # ═══════════════════════════════════════════════════════════
-    # Token 注册
-    # ═══════════════════════════════════════════════════════════
-
-    def _generate_token(self) -> str:
-        return secrets.token_hex(32)
-
-    async def _register_token(
-        self, name: str, description: str = "",
-        entries: dict[str, list[str]] | None = None,
-        allow_mode: str = "manual",
-        can_auto_unlock: bool = False,
-    ) -> str:
-        token_id = self._generate_token()
-        now = datetime.now(UTC).isoformat()
-        reg = RegisteredToken(
-            token_id=token_id, name=name, description=description,
-            entries=entries or {}, allow_mode=allow_mode,
-            can_auto_unlock=can_auto_unlock, created_at=now,
-            enabled=False,
-        )
-        async with self._lock:
-            self._token_registry[token_id] = reg
-            self._registrations_by_name[name] = token_id
-        return token_id
-
-    async def _activate_token(self, token_id: str):
-        async with self._lock:
-            reg = self._token_registry.get(token_id)
-            if reg:
-                reg.enabled = True
-                await self._save_token_registry()
-
-    async def _revoke_token(self, token_id: str) -> bool:
-        async with self._lock:
-            reg = self._token_registry.pop(token_id, None)
-            if reg:
-                self._registrations_by_name.pop(reg.name, None)
-                await self._save_token_registry()
-                return True
-            return False
-
-    def _lookup_token(self, token_id: str) -> RegisteredToken | None:
-        return self._token_registry.get(token_id)
 
     # ═══════════════════════════════════════════════════════════
     # Caller 注册
@@ -263,34 +203,7 @@ class RegistryMixin:
                     # 返回特殊状态让调用者处理哈希变更
                     return None, path_reg, "hash_mismatch"
 
-            # ── 优先级 2: Token 校验 ──
-            token = auth.get("token", "")
-            if token:
-                reg = self._lookup_token(token)
-                if not reg or not reg.enabled:
-                    return None, None, ""
-                if not self._check_entry_allowed(reg, entry_name, field):
-                    return False, reg, f"Token '{reg.name}' 无权访问 {entry_name}"
-                return True, reg, ""
-
             return None, None, ""
-
-    # ── 通用条目检查（Token）──
-
-    def _check_entry_allowed(
-        self, reg: RegisteredToken, entry_name: str,
-        field: str | None,
-    ) -> bool:
-        if not reg.enabled:
-            return False
-        if entry_name not in reg.entries:
-            return False
-        allowed_fields = reg.entries[entry_name]
-        if not allowed_fields:
-            return True
-        if field is None or field in allowed_fields:
-            return True
-        return False
 
     # ── 自动放行频率限制 ──
 
@@ -400,21 +313,6 @@ class RegistryMixin:
                 )
                 return
 
-        for t in data.get("tokens", []):
-            reg = RegisteredToken(
-                token_id=t.get("token_id", ""),
-                name=t.get("name", ""),
-                description=t.get("description", ""),
-                entries=t.get("allowed_entries", {}),
-                allow_mode=t.get("allow_mode", "manual"),
-                can_auto_unlock=t.get("can_auto_unlock", False),
-                created_at=t.get("created_at", ""),
-                enabled=t.get("enabled", True),
-            )
-            if reg.token_id:
-                self._token_registry[reg.token_id] = reg
-                self._registrations_by_name[reg.name] = reg.token_id
-
         for c in data.get("callers", []):
             reg = RegisteredCaller(
                 reg_id=c.get("reg_id", ""),
@@ -436,25 +334,13 @@ class RegistryMixin:
                 self._registrations_by_name[reg.name] = reg.reg_id
 
         logger.info(
-            "已加载 %d 个 Token + %d 个 Caller 注册（%s）",
-            len(self._token_registry), len(self._caller_registry), path,
+            "已加载 %d 个 Caller 注册（%s）",
+            len(self._caller_registry), path,
         )
 
     async def _save_token_registry(self):
         """原子写 token_registry.json。
         调用者必须已持有 self._lock。"""
-        tokens = []
-        for t in self._token_registry.values():
-            tokens.append({
-                "token_id": t.token_id,
-                "name": t.name,
-                "description": t.description,
-                "allowed_entries": t.entries,
-                "allow_mode": t.allow_mode,
-                "can_auto_unlock": t.can_auto_unlock,
-                "created_at": t.created_at,
-                "enabled": t.enabled,
-            })
         callers = []
         for c in self._caller_registry.values():
             callers.append({
@@ -472,9 +358,8 @@ class RegistryMixin:
                 "enabled": c.enabled,
             })
         data = {
-            "version": 2,
+            "version": 3,
             "updated_at": datetime.now(UTC).isoformat(),
-            "tokens": tokens,
             "callers": callers,
         }
         data["integrity"] = self._compute_registry_integrity(data)

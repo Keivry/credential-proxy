@@ -32,32 +32,7 @@ func Credential(args []string) {
 	}
 
 	// 构建 auth 对象
-	auth := make(map[string]string)
-
-	// Phase 2: 自动检测调用者哈希
-	caller := internal.GetCallerInfo()
-	if caller != nil && caller.ScriptHash != "" {
-		auth["caller_hash"] = caller.ScriptHash
-		auth["caller_path"] = caller.ScriptPath
-	} else {
-		// 回退：哈希 get 二进制自身（无 /proc / 交互式 shell 等场景）
-		if selfPath, err := os.Executable(); err == nil {
-			if selfHash := internal.Sha256File(selfPath); selfHash != "" {
-				auth["caller_hash"] = selfHash
-				auth["caller_path"] = selfPath
-			}
-		}
-	}
-
-	// Phase 1: Token 兜底
-	token := os.Getenv("CREDENTIAL_TOKEN")
-	if token != "" {
-		auth["token"] = token
-	}
-
-	if len(auth) == 0 && os.Getenv("PROXY_URL") != "" {
-		// 无认证环境，尝试获取 token
-	}
+	auth := internal.BuildAuth()
 
 	result, err := internal.FetchCredential(entry, field, raw, auth)
 	if err != nil {

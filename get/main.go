@@ -36,15 +36,14 @@ func main() {
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `用法:
-  get credential <条目> [字段]    获取凭据
-  get register --entry <条目> --name <名称>  注册脚本
+  get credential <条目> [字段] [--raw]    获取凭据
+  get register --name <名称> --entry <条目> [--desc <描述>] [--auto] [--fields <字段,字段>] [--script-path <路径>]  注册脚本
   get revoke --name <名称>                  吊销注册
   get list                                  列出注册
   get status                                Proxy 状态
 
 环境变量:
-  CREDENTIAL_TOKEN   自动放行 Token
   PROXY_URL          Proxy 地址（默认 http://127.0.0.1:8877）
-  PROXY_HTTP_TIMEOUT HTTP 超时秒数（默认 30）
+  PROXY_HTTP_TIMEOUT HTTP 超时秒数（默认 300）
 `)
 }

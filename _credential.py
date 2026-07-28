@@ -9,8 +9,6 @@ import uuid
 
 from aiohttp import web
 
-from _sse import REACTION_APPROVE, REACTION_AUTO_UNLOCK, REACTION_REJECT
-
 try:
     from pykeepass import PyKeePass
 except ImportError:
@@ -28,6 +26,14 @@ UNLOCK_TIMEOUT = 300  # 解锁等待超时 (s)
 APPROVAL_TIMEOUT = 300  # 审批等待超时 (s)
 RATE_LIMIT_INTERVAL = 2.0  # 凭据请求最小间隔 (s)
 
+# ── 三因子认证常量 ──
+GET_BINARY_HASH = os.environ.get('GET_BINARY_HASH', '')
+GET_BINARY_SECRET = os.environ.get('GET_BINARY_SECRET', '')
+GET_BINARY_HASH_HEADER = 'X-Get-Binary-Hash'
+GET_BINARY_SECRET_HEADER = 'X-Get-Binary-Secret'
+CALLER_HASH_HEADER = 'X-Caller-Hash'
+CALLER_PATH_HEADER = 'X-Caller-Path'
+
 
 class CredentialMixin:
     """Mixin: 凭据 HTTP API 及 KeePass 查询。"""
@@ -35,10 +41,13 @@ class CredentialMixin:
     # ── 自动放行默认实现 (RegistryMixin 在生产代码中覆盖) ──
 
     async def _check_auto_approve(
-        self, entry_name: str, field: str | None, auth: dict,
+        self,
+        entry_name: str,
+        field: str | None,
+        auth: dict,
     ) -> tuple[bool | None, object | None, str]:
         """默认实现（async）：不执行自动放行。RegistryMixin 覆盖此方法。"""
-        return None, None, ""
+        return None, None, ''
 
     async def _say(self, text: str) -> None:
         """默认实现：日志记录。MatrixMixin 覆盖此方法发送 Matrix 消息。"""
@@ -49,8 +58,11 @@ class CredentialMixin:
         return True
 
     async def _handle_auto_approve(
-        self, entry_name: str, field: str | None,
-        use_token: bool, reg,
+        self,
+        entry_name: str,
+        field: str | None,
+        use_token: bool,
+        reg,
     ) -> web.Response:
         """自动放行路径：频率检查 → 解锁 → 查询返回。"""
         if not await self._check_auto_rate_limit(getattr(reg, 'name', '')):
@@ -66,10 +78,11 @@ class CredentialMixin:
                 except Exception:
                     logger.exception(
                         'AUTO_APPROVE_UNLOCK_FAIL: reg=%s entry=%s',
-                        getattr(reg, 'name', '?'), entry_name,
+                        getattr(reg, 'name', '?'),
+                        entry_name,
                     )
                     await self._say(
-                        f"⚠️ 自动解封失败: {getattr(reg, 'name', '?')} → {entry_name}",
+                        f'⚠️ 自动解封失败: {getattr(reg, "name", "?")} → {entry_name}',
                     )
                     return web.json_response({'error': '自动解封失败'}, status=500)
             else:
@@ -79,9 +92,54 @@ class CredentialMixin:
                 )
         logger.info(
             'AUTO_APPROVE: reg=%s entry=%s field=%s',
-            getattr(reg, 'name', '?'), entry_name, field or '*',
+            getattr(reg, 'name', '?'),
+            entry_name,
+            field or '*',
         )
         return await self._query_and_return(entry_name, field, use_token, reg)
+
+    # ── 三因子认证 ──
+
+    def _require_auth(self, request, auth=None):
+        """校验 get_binary_hash + get_binary_secret。
+        POST: 传入已解析的 auth dict。GET: auth=None（从 header 读）。
+        当 GET_BINARY_HASH / GET_BINARY_SECRET 未配置时跳过（兼容模式）。
+        返回 None=通过，web.Response=拒绝(403)。"""
+        # 未配置时跳过认证（兼容现有部署 / 开发环境）
+        if not GET_BINARY_HASH and not GET_BINARY_SECRET:
+            return None
+
+        if auth is not None:
+            hash_val = auth.get('get_binary_hash', '')
+            secret_val = auth.get('get_binary_secret', '')
+            caller_hash_val = auth.get('caller_hash', '')
+            caller_path = auth.get('caller_path', '')
+        else:
+            hash_val = request.headers.get(GET_BINARY_HASH_HEADER, '')
+            secret_val = request.headers.get(GET_BINARY_SECRET_HEADER, '')
+            caller_hash_val = request.headers.get(CALLER_HASH_HEADER, '')
+            caller_path = request.headers.get(CALLER_PATH_HEADER, '')
+
+        if not hash_val or hash_val != GET_BINARY_HASH:
+            return web.json_response(
+                {'error': '未授权请求（get_binary_hash 不匹配）'},
+                status=403,
+            )
+        if not secret_val or secret_val != GET_BINARY_SECRET:
+            return web.json_response(
+                {'error': '未授权请求（get_binary_secret 不匹配）'},
+                status=403,
+            )
+
+        # 审计日志
+        direct = caller_hash_val == hash_val
+        logger.info(
+            'API_CALL: endpoint=%s caller_path=%s direct=%s',
+            request.path,
+            caller_path or '(unknown)',
+            str(direct),
+        )
+        return None
 
     # ── API startup ──
 
@@ -92,9 +150,8 @@ class CredentialMixin:
         app.router.add_get('/registrations', self.handle_registrations)
         # 仅当 RegistryMixin 可用时才注册 registry 相关路由
         # （CredentialMixin 的 handler 内部调用 _register_token 等 RegistryMixin 方法）
-        has_registry = hasattr(self, '_register_token')
+        has_registry = hasattr(self, '_register_caller')
         if has_registry:
-            app.router.add_post('/register', self.handle_register)
             app.router.add_post('/register-caller', self.handle_register_caller)
             app.router.add_post('/revoke', self.handle_revoke)
             app.router.add_post('/revoke/emergency', self.handle_revoke_emergency)
@@ -122,27 +179,34 @@ class CredentialMixin:
 
     async def handle_registrations(self, _request) -> web.Response:
         """列出所有 Token 和 Caller 注册（RegistryMixin 未加载时返回空列表）。"""
+        resp = self._require_auth(_request)
+        if resp is not None:
+            return resp
         items = []
         async with self._lock:
             if hasattr(self, '_token_registry'):
                 for t in self._token_registry.values():
-                    items.append({
-                        'name': t.name,
-                        'type': 'token',
-                        'entries': t.entries,
-                        'allow_mode': t.allow_mode,
-                        'enabled': t.enabled,
-                    })
+                    items.append(
+                        {
+                            'name': t.name,
+                            'type': 'token',
+                            'entries': t.entries,
+                            'allow_mode': t.allow_mode,
+                            'enabled': t.enabled,
+                        }
+                    )
             if hasattr(self, '_caller_registry'):
                 for c in self._caller_registry.values():
-                    items.append({
-                        'name': c.name,
-                        'type': 'caller',
-                        'entries': c.entries,
-                        'allow_mode': c.allow_mode,
-                        'enabled': c.enabled,
-                        'script_path': c.script_path,
-                    })
+                    items.append(
+                        {
+                            'name': c.name,
+                            'type': 'caller',
+                            'entries': c.entries,
+                            'allow_mode': c.allow_mode,
+                            'enabled': c.enabled,
+                            'script_path': c.script_path,
+                        }
+                    )
         return web.json_response({'registrations': items})
 
     # ── Credential ──
@@ -177,29 +241,42 @@ class CredentialMixin:
         if not entry_name:
             return web.json_response({'error': '缺少 entry 参数'}, status=400)
 
+        # ── 三因子认证：get_binary_hash + get_binary_secret ──
+        auth_resp = self._require_auth(request, auth)
+        if auth_resp is not None:
+            return auth_resp
+
         # ── 方案A：强制 caller_hash — 只接受 get 二进制的请求 ──
         if not auth.get('caller_hash'):
-            return web.json_response({
-                'error': (
-                    '仅允许通过 get 获取凭据（缺少 caller_hash）。'
-                    '使用: get credential <条目> [字段]'
-                ),
-            }, status=403)
+            return web.json_response(
+                {
+                    'error': (
+                        '仅允许通过 get 获取凭据（缺少 caller_hash）。'
+                        '使用: get credential <条目> [字段]'
+                    ),
+                },
+                status=403,
+            )
 
         # ── 自动放行检查 ──
         approve, reg, reason = await self._check_auto_approve(
-            entry_name, field, auth,
+            entry_name,
+            field,
+            auth,
         )
         if approve is True:
             return await self._handle_auto_approve(
-                entry_name, field, use_token, reg,
+                entry_name,
+                field,
+                use_token,
+                reg,
             )
         elif approve is False:
             # 明确拒绝（条目不在白名单）
             return web.json_response({'error': reason}, status=403)
-        elif reason == "hash_mismatch" and reg is not None:
+        elif reason == 'hash_mismatch' and reg is not None:
             # Caller 哈希已变更 → 异步通知用户，本次请求用 Token/Matrix 兜底
-            new_hash = auth.get("caller_hash", "")
+            new_hash = auth.get('caller_hash', '')
             if new_hash:
                 # 去重后发送通知（通知在锁外进行，避免嵌套锁死锁）
                 reg_id = getattr(reg, 'reg_id', '')
@@ -211,17 +288,7 @@ class CredentialMixin:
                         should_notify = True
                 if should_notify:
                     await self._notify_hash_change(caller_reg, new_hash)
-            # Token 兜底
-            token = auth.get("token", "")
-            if token:
-                token_reg = self._lookup_token(token)
-                if token_reg and token_reg.enabled and self._check_entry_allowed(
-                    token_reg, entry_name, field,
-                ):
-                    return await self._handle_auto_approve(
-                        entry_name, field, use_token, token_reg,
-                    )
-            # 无 Token 兜底 → 走 Matrix 审批
+            # 无自动放行 → 走 Matrix 审批
 
         # ── 未匹配自动放行 → 现有解锁 + Matrix 审批流程 ──
 
@@ -340,128 +407,6 @@ class CredentialMixin:
         # ── 取凭据（通过共享查询方法）──
         return await self._query_and_return(entry_name, field, use_token)
 
-    # ── Token 注册 ──
-
-    async def handle_register(self, request) -> web.Response:
-        """POST /register — 注册新 Token（需 Matrix 审批）。"""
-        # 频率限制
-        peer = request.remote or 'unknown'
-        if not self._check_register_rate_limit(peer):
-            return web.json_response(
-                {'error': '注册请求过于频繁，请稍后再试'},
-                status=429,
-            )
-
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({'error': 'JSON 格式错误'}, status=400)
-
-        name = data.get('name', '').strip()
-        if not name:
-            return web.json_response({'error': '缺少 name 参数'}, status=400)
-
-        async with self._lock:
-            if self._name_exists(name):
-                return web.json_response(
-                    {'error': f"名称 '{name}' 已存在"},
-                    status=409,
-                )
-
-        description = data.get('description', '').strip()
-        entries = data.get('entries', {})
-        if not entries:
-            return web.json_response({'error': '缺少 entries 参数'}, status=400)
-
-        allow_mode = data.get('allow_mode', 'manual')
-        if allow_mode not in ('auto', 'manual'):
-            return web.json_response(
-                {'error': "allow_mode 必须为 'auto' 或 'manual'"},
-                status=400,
-            )
-        can_auto_unlock = data.get('can_auto_unlock', False)
-
-        # 注册 Token（待批准状态）
-        reg_data = {
-            'name': name,
-            'description': description,
-            'entries': entries,
-            'allow_mode': allow_mode,
-            'can_auto_unlock': can_auto_unlock,
-        }
-        token_id = await self._register_token(
-            name=name,
-            description=description,
-            entries=entries,
-            allow_mode=allow_mode,
-            can_auto_unlock=can_auto_unlock,
-        )
-
-        # 发 Matrix 审批消息
-        msg_text = self._build_registration_msg(reg_data)
-        reactions = (
-            (REACTION_AUTO_UNLOCK, REACTION_APPROVE, REACTION_REJECT)
-            if allow_mode == 'auto'
-            else None  # 默认 (✅, ❎)
-        )
-        msg_id = await self._ask(msg_text, reactions=reactions)
-        if msg_id is None:
-            await self._revoke_token(token_id)
-            return web.json_response(
-                {'error': '无法发送审批消息'},
-                status=503,
-            )
-
-        pending = {
-            'token_id': token_id,
-            'name': name,
-            'approved': None,
-            'event': asyncio.Event(),
-        }
-        async with self._lock:
-            self._registration_pending[token_id] = pending
-            self._registration_msgs[msg_id] = token_id
-
-        # 等待用户审批（300s 超时）
-        try:
-            await asyncio.wait_for(pending['event'].wait(), timeout=300)
-        except TimeoutError:
-            async with self._lock:
-                self._registration_pending.pop(token_id, None)
-                self._registration_msgs.pop(msg_id, None)
-            await self._revoke_token(token_id)
-            return web.json_response({'error': '审批超时'}, status=408)
-
-        # 清理 pending 状态
-        async with self._lock:
-            self._registration_pending.pop(token_id, None)
-            self._registration_msgs.pop(msg_id, None)
-
-        reaction = pending.get('approved')
-        if reaction == REACTION_REJECT:
-            await self._revoke_token(token_id)
-            return web.json_response({'error': '注册被拒绝'}, status=403)
-
-        # 激活 Token
-        await self._activate_token(token_id)
-        reg = self._lookup_token(token_id)
-
-        if reaction == REACTION_AUTO_UNLOCK:
-            # 用户选择了自动放行：更新 allow_mode + can_auto_unlock
-            async with self._lock:
-                if reg:
-                    reg.allow_mode = 'auto'
-                    reg.can_auto_unlock = True
-                    await self._save_token_registry()
-
-        return web.json_response({
-            'token': reg.token_id if reg else token_id,
-            'name': name,
-            'allow_mode': reg.allow_mode if reg else allow_mode,
-            'can_auto_unlock': reg.can_auto_unlock if reg else False,
-            'status': 'activated',
-        })
-
     # ── Token 吊销 ──
 
     async def handle_revoke(self, request) -> web.Response:
@@ -470,6 +415,12 @@ class CredentialMixin:
             data = await request.json()
         except json.JSONDecodeError:
             return web.json_response({'error': 'JSON 格式错误'}, status=400)
+
+        # ── 三因子认证 ──
+        auth_data = data.get('auth', {})
+        auth_resp = self._require_auth(request, auth_data)
+        if auth_resp is not None:
+            return auth_resp
 
         name = data.get('name', '').strip()
         if not name:
@@ -528,13 +479,9 @@ class CredentialMixin:
                     {'error': f"注册 '{name}' 不存在"},
                     status=404,
                 )
-            # 判断类型：Token 用 token_id，Caller 用 reg_id（锁外调用，因为 _revoke_* 自带锁）
-            token_id = getattr(reg, 'token_id', None)
+            # 锁外调用 _revoke_caller，避免嵌套锁死锁
             reg_id = getattr(reg, 'reg_id', None)
-        # ⚠️ 必须在锁外调用 _revoke_*，否则内部 async with self._lock 死锁
-        if token_id:
-            await self._revoke_token(token_id)
-        elif reg_id:
+        if reg_id:
             await self._revoke_caller(reg_id)
 
         return web.json_response({'status': 'revoked', 'name': name})
@@ -545,6 +492,17 @@ class CredentialMixin:
         从 CREDENTIAL_ADMIN_TOKEN 环境变量或 DATA_DIR/admin_token 文件读取
         admin token 进行认证。同一内网 IP 也可执行紧急吊销。
         """
+        # 三因子认证（紧急吊销也需要）
+        try:
+            data = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response({'error': 'JSON 格式错误'}, status=400)
+
+        auth_data = data.get('auth', {})
+        auth_resp = self._require_auth(request, auth_data)
+        if auth_resp is not None:
+            return auth_resp
+
         # Admin token 检查
         admin_token = os.environ.get('CREDENTIAL_ADMIN_TOKEN', '')
         if not admin_token:
@@ -553,19 +511,18 @@ class CredentialMixin:
                     os.environ.get('DATA_DIR', '.'),
                     'admin_token',
                 )
+
                 def _read_admin_token(p: str) -> str:
                     with open(p) as f:
                         return f.read().strip()
-                admin_token = await asyncio.to_thread(_read_admin_token, admin_token_path)
+
+                admin_token = await asyncio.to_thread(
+                    _read_admin_token, admin_token_path
+                )
             except (FileNotFoundError, OSError):
                 pass
 
         # 提取认证信息
-        try:
-            data = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response({'error': 'JSON 格式错误'}, status=400)
-
         req_token = data.get('admin_token', '')
         peer = request.remote or ''
 
@@ -573,7 +530,8 @@ class CredentialMixin:
         is_internal = peer.startswith(('10.', '172.', '192.168.'))
         if not (req_token == admin_token or is_internal):
             logger.warning(
-                'EMERGENCY_REVOKE_REJECTED: peer=%s', peer,
+                'EMERGENCY_REVOKE_REJECTED: peer=%s',
+                peer,
             )
             return web.json_response(
                 {'error': '未授权：需要 admin token 或内网 IP'},
@@ -591,38 +549,21 @@ class CredentialMixin:
                     {'error': f"未找到注册 '{name}'"},
                     status=404,
                 )
-            # 判断类型：Token 用 token_id，Caller 用 reg_id（锁外调用，因为 _revoke_* 自带锁）
-            token_id = getattr(reg, 'token_id', None)
+            # 锁外调用 _revoke_caller，避免嵌套锁死锁
             reg_id = getattr(reg, 'reg_id', None)
-        # ⚠️ 必须在锁外调用 _revoke_*，否则内部 async with self._lock 死锁
-        if token_id:
-            await self._revoke_token(token_id)
-        elif reg_id:
+        if reg_id:
             await self._revoke_caller(reg_id)
 
         logger.info(
-            'EMERGENCY_REVOKE: name=%s peer=%s', name, peer,
+            'EMERGENCY_REVOKE: name=%s peer=%s',
+            name,
+            peer,
         )
         await self._say(
-            f"⚠️ 紧急吊销: {name}\n发起 IP: {peer}",
+            f'⚠️ 紧急吊销: {name}\n发起 IP: {peer}',
         )
 
         return web.json_response({'status': 'revoked', 'name': name})
-
-    # ── Register rate limiting ──
-
-    REGISTER_MAX_PER_MINUTE = 5
-
-    def _check_register_rate_limit(self, ip: str) -> bool:
-        """/register 频率限制：每个来源 IP 最多 5 次/分钟。"""
-        now = time.monotonic()
-        timestamps = self._register_rate_limits.get(ip, [])
-        timestamps = [t for t in timestamps if now - t < 60]
-        if len(timestamps) >= self.REGISTER_MAX_PER_MINUTE:
-            return False
-        timestamps.append(now)
-        self._register_rate_limits[ip] = timestamps
-        return True
 
     # ── Caller 注册 ──
 
@@ -632,6 +573,12 @@ class CredentialMixin:
             data = await request.json()
         except json.JSONDecodeError:
             return web.json_response({'error': 'JSON 格式错误'}, status=400)
+
+        # ── 三因子认证 ──
+        auth_data = data.get('auth', {})
+        auth_resp = self._require_auth(request, auth_data)
+        if auth_resp is not None:
+            return auth_resp
 
         name = data.get('name', '').strip()
         if not name:
@@ -665,15 +612,17 @@ class CredentialMixin:
             'allow_mode': allow_mode,
         }
         reg_id = await self._register_caller(
-            name=name, script_path=script_path, script_hash=script_hash,
-            description=description, entries=entries,
-            allow_mode=allow_mode, can_auto_unlock=can_auto_unlock,
+            name=name,
+            script_path=script_path,
+            script_hash=script_hash,
+            description=description,
+            entries=entries,
+            allow_mode=allow_mode,
+            can_auto_unlock=can_auto_unlock,
         )
 
         msg_text = self._build_registration_msg(reg_data)
-        reactions = (
-            ("🔓", "✅", "❎") if allow_mode == 'auto' else None
-        )
+        reactions = ('🔓', '✅', '❎') if allow_mode == 'auto' else None
         msg_id = await self._ask(msg_text, reactions=reactions)
         if msg_id is None:
             await self._revoke_caller(reg_id)
@@ -703,12 +652,12 @@ class CredentialMixin:
             self._registration_msgs.pop(msg_id, None)
 
         reaction = pending.get('approved')
-        if reaction == "❎":
+        if reaction == '❎':
             await self._revoke_caller(reg_id)
             return web.json_response({'error': '注册被拒绝'}, status=403)
 
         await self._activate_caller(reg_id)
-        if reaction == "🔓":
+        if reaction == '🔓':
             async with self._lock:
                 reg = self._caller_registry.get(reg_id)
                 if reg:
@@ -716,11 +665,13 @@ class CredentialMixin:
                     reg.can_auto_unlock = True
                     await self._save_token_registry()
 
-        return web.json_response({
-            'reg_id': reg_id,
-            'name': name,
-            'status': 'activated',
-        })
+        return web.json_response(
+            {
+                'reg_id': reg_id,
+                'name': name,
+                'status': 'activated',
+            }
+        )
 
     # ── 哈希变更审批 ──
 
@@ -735,6 +686,12 @@ class CredentialMixin:
         except json.JSONDecodeError:
             return web.json_response({'error': 'JSON 格式错误'}, status=400)
 
+        # ── 三因子认证 ──
+        auth_data = data.get('auth', {})
+        auth_resp = self._require_auth(request, auth_data)
+        if auth_resp is not None:
+            return auth_resp
+
         reg_id = data.get('reg_id', '').strip()
         reaction = data.get('reaction', '').strip()
         new_hash = data.get('new_hash', '').strip()
@@ -744,7 +701,7 @@ class CredentialMixin:
                 {'error': '缺少 reg_id/reaction/new_hash'},
                 status=400,
             )
-        if reaction not in ("🔓", "✅", "❎"):
+        if reaction not in ('🔓', '✅', '❎'):
             return web.json_response(
                 {'error': 'reaction 必须为 🔓/✅/❎'},
                 status=400,
@@ -760,12 +717,14 @@ class CredentialMixin:
 
         await self._resolve_hash_change(reg_id, new_hash, reaction)
 
-        action = {"🔓": "保持自动放行", "✅": "降级为普通授权", "❎": "拒绝"}[reaction]
-        return web.json_response({
-            'status': 'resolved',
-            'name': reg.name if reg else '',
-            'action': action,
-        })
+        action = {'🔓': '保持自动放行', '✅': '降级为普通授权', '❎': '拒绝'}[reaction]
+        return web.json_response(
+            {
+                'status': 'resolved',
+                'name': reg.name if reg else '',
+                'action': action,
+            }
+        )
 
     # ── Auto-unlock (for auto-approve path) ──
 
@@ -796,7 +755,7 @@ class CredentialMixin:
             loop = asyncio.get_running_loop()
             pw = await loop.run_in_executor(None, self._tpm_unseal)
             if not pw:
-                raise RuntimeError("TPM 解封返回空密码")
+                raise RuntimeError('TPM 解封返回空密码')
             async with self._lock:
                 if self._unlock_generation != gen:
                     return  # 过时的 task，已被新实例替代
@@ -816,7 +775,7 @@ class CredentialMixin:
                 self.unlock_event = None
                 self._unlock_msg_id = None
                 unlock_done.set()
-            logger.exception("自动 TPM 解封失败")
+            logger.exception('自动 TPM 解封失败')
             raise
 
     # ── Shared KeePass query (used by both auto-approve and Matrix-approve paths) ──
@@ -891,7 +850,11 @@ class CredentialMixin:
                     else:
                         value = val
                 else:
-                    val = entry.get_custom_property(field) if hasattr(entry, 'get_custom_property') else None
+                    val = (
+                        entry.get_custom_property(field)
+                        if hasattr(entry, 'get_custom_property')
+                        else None
+                    )
                     value = await self._maybe_register(val, use_token) if val else None
 
                 if value is None:
@@ -919,7 +882,8 @@ class CredentialMixin:
                 'title': entry.title or '',
                 'username': entry.username or '',
                 'password': await self._maybe_register(
-                    entry.password or '', use_token,
+                    entry.password or '',
+                    use_token,
                 ),
                 'url': entry.url or '',
             }
@@ -931,11 +895,10 @@ class CredentialMixin:
             # 自动放行路径中查询失败，发 Matrix 通知
             if reg:
                 await self._say(
-                    f"⚠️ 自动放行查询失败: {getattr(reg, 'name', '?')} → "
-                    f"{entry_name}（请检查 KeePass）",
+                    f'⚠️ 自动放行查询失败: {getattr(reg, "name", "?")} → '
+                    f'{entry_name}（请检查 KeePass）',
                 )
             return web.json_response({'error': 'KeePass 内部错误'}, status=500)
-
 
     # ── Helpers ──
 

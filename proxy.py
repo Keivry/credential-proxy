@@ -115,9 +115,7 @@ class CredentialProxy(
         self.approval_msgs: dict = {}
         self._runners: list = []  # aiohttp AppRunner 列表
 
-        # ── Token 注册表 (RegistryMixin 使用) ──
-        self._token_registry: dict = {}
-        self._token_registry_path = ''
+        # ── 注册表 (RegistryMixin 使用) ──
         self._registrations_by_name: dict = {}
         self._registration_pending: dict = {}
         self._registration_msgs: dict = {}
@@ -132,7 +130,6 @@ class CredentialProxy(
 
         # ── 凭据频率限制 ──
         self._last_credential_request = 0.0
-        self._register_rate_limits: dict[str, list[float]] = {}
 
         # ── Token 映射 (TokenMixin 使用) ──
         self.pwd_to_token = OrderedDict()

@@ -112,6 +112,7 @@ type RegisterCallerRequest struct {
 	Entries       map[string][]string `json:"entries"`
 	AllowMode     string              `json:"allow_mode"`
 	CanAutoUnlock bool                `json:"can_auto_unlock,omitempty"`
+	Auth          map[string]string   `json:"auth,omitempty"`
 }
 
 // RegisterCallerResponse Proxy 注册响应
@@ -123,6 +124,7 @@ type RegisterCallerResponse struct {
 
 // RegisterCaller 注册调用者
 func RegisterCaller(req *RegisterCallerRequest) (string, error) {
+	req.Auth = BuildAuth()
 	data, err := json.Marshal(req)
 	if err != nil {
 		return "", fmt.Errorf("序列化失败: %w", err)
@@ -156,7 +158,8 @@ func RegisterCaller(req *RegisterCallerRequest) (string, error) {
 
 // RevokeRequest 吊销请求
 type RevokeRequest struct {
-	Name string `json:"name"`
+	Name string            `json:"name"`
+	Auth map[string]string `json:"auth,omitempty"`
 }
 
 // RevokeResponse 吊销响应
@@ -168,7 +171,8 @@ type RevokeResponse struct {
 
 // RevokeCaller 吊销注册
 func RevokeCaller(name string) error {
-	data, err := json.Marshal(RevokeRequest{Name: name})
+	auth := BuildAuth()
+	data, err := json.Marshal(RevokeRequest{Name: name, Auth: auth})
 	if err != nil {
 		return fmt.Errorf("序列化失败: %w", err)
 	}
@@ -211,7 +215,14 @@ type ListResponse struct {
 
 func ListRegistrations() ([]RegistrationItem, error) {
 	url := ProxyURL + "/registrations"
-	resp, err := httpClient.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("创建请求失败: %w", err)
+	}
+	for k, v := range AuthHeaders() {
+		req.Header.Set(k, v)
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("请求失败: %w", err)
 	}
@@ -243,7 +254,14 @@ type ProxyStatus struct {
 
 func FetchStatus() (*ProxyStatus, error) {
 	url := ProxyURL + "/health"
-	resp, err := httpClient.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("创建请求失败: %w", err)
+	}
+	for k, v := range AuthHeaders() {
+		req.Header.Set(k, v)
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("请求失败: %w", err)
 	}
