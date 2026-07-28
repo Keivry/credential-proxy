@@ -491,8 +491,35 @@ class LlmMixin:
                                                 finish_reason = choice.get(
                                                     'finish_reason',
                                                 )
+
+                                                # reasoning_content 独立处理
+                                                if 'reasoning_content' in delta:
+                                                    rc_combined = (
+                                                        reasoning_buf
+                                                        + delta['reasoning_content']
+                                                    )
+                                                    reasoning_buf = ''
+                                                    rc_restored = self._restore(
+                                                        rc_combined,
+                                                        active_t2p,
+                                                    )
+                                                    rc_restored = _PARTIAL_TOKEN_RE.sub(
+                                                        '',
+                                                        rc_restored,
+                                                    )
+                                                    await resp.write(
+                                                        _mk_sse_event(
+                                                            reasoning_content=rc_restored,
+                                                            finish_reason=(
+                                                                finish_reason
+                                                                if not content
+                                                                else None
+                                                            ),
+                                                        ).encode(),
+                                                    )
+
+                                                # content / 非 content
                                                 if content:
-                                                    # 合并 content_buf pending 部分
                                                     combined = content_buf + content
                                                     content_buf = ''
                                                     restored = self._restore(
@@ -505,34 +532,11 @@ class LlmMixin:
                                                     )
                                                     await resp.write(
                                                         _mk_sse_event(
-                                                            restored,
-                                                            finish_reason,
-                                                        ).encode(),
-                                                    )
-                                                elif 'reasoning_content' in delta:
-                                                    # 续行重建后的 reasoning_content
-                                                    reasoning_text = delta[
-                                                        'reasoning_content'
-                                                    ]
-                                                    combined = (
-                                                        reasoning_buf + reasoning_text
-                                                    )
-                                                    reasoning_buf = ''
-                                                    restored = self._restore(
-                                                        combined,
-                                                        active_t2p,
-                                                    )
-                                                    restored = _PARTIAL_TOKEN_RE.sub(
-                                                        '',
-                                                        restored,
-                                                    )
-                                                    await resp.write(
-                                                        _mk_sse_event(
-                                                            reasoning_content=restored,
+                                                            content=restored,
                                                             finish_reason=finish_reason,
                                                         ).encode(),
                                                     )
-                                                else:
+                                                elif 'reasoning_content' not in delta:
                                                     # 非 content 事件
                                                     await _flush(
                                                         c=content_buf,
