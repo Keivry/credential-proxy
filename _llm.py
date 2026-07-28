@@ -86,13 +86,22 @@ def _append_jsonl_line(path: str, line: str) -> None:
         f.write(line + '\n')
 
 
-def _mk_sse_event(content: str, finish_reason: str | None = None) -> str:
+def _mk_sse_event(
+    content: str = '',
+    finish_reason: str | None = None,
+    reasoning_content: str = '',
+) -> str:
     """Build OpenAI-compatible SSE data event JSON.
 
+    Supports both content and reasoning_content delta fields.
     Content is always included when non-empty — OpenAI allows
     content + finish_reason in the same delta event.
     """
-    delta = {'content': content} if content else {}
+    delta = {}
+    if content:
+        delta['content'] = content
+    if reasoning_content:
+        delta['reasoning_content'] = reasoning_content
     event = json.dumps(
         {
             'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish_reason}],
@@ -219,19 +228,31 @@ class LlmMixin:
                             content_buf = (
                                 ''  # 累积 delta.content 片段，O(1) 单字符串追加
                             )
+                            reasoning_buf = ''  # 累积 delta.reasoning_content 片段
                             byte_buf = bytearray()
                             resp_log_path = None
 
-                            async def _flush(c: str, fr: str | None = None):
-                                """flush 内容作为 SSE 事件并清空 content_buf。"""
-                                nonlocal content_buf
-                                if c or fr:
+                            async def _flush(
+                                c: str = '',
+                                rc: str = '',
+                                fr: str | None = None,
+                            ):
+                                """flush 内容作为 SSE 事件并清空缓冲区。"""
+                                nonlocal content_buf, reasoning_buf
+                                if c or rc or fr:
                                     if c:
                                         c = self._restore(c, active_t2p)
+                                    if rc:
+                                        rc = self._restore(rc, active_t2p)
                                     await resp.write(
-                                        _mk_sse_event(c, fr).encode(),
+                                        _mk_sse_event(
+                                            content=c,
+                                            finish_reason=fr,
+                                            reasoning_content=rc,
+                                        ).encode(),
                                     )
                                 content_buf = ''
+                                reasoning_buf = ''
 
                             try:
                                 async for chunk in upstream_resp.content.iter_chunked(
@@ -267,7 +288,10 @@ class LlmMixin:
 
                                         # [DONE] 标记：先 flush 累积内容
                                         if payload.strip() == '[DONE]':
-                                            await _flush(content_buf)
+                                            await _flush(
+                                                c=content_buf,
+                                                rc=reasoning_buf,
+                                            )
                                             await resp.write(
                                                 b'data: [DONE]\n',
                                             )
@@ -314,12 +338,11 @@ class LlmMixin:
 
                                             if delta.get('content') is None:
                                                 if 'reasoning_content' in delta:
-                                                    # reasoning_content 同 content 一样需要 safe/hold 保护
-                                                    content_buf += delta[
+                                                    reasoning_buf += delta[
                                                         'reasoning_content'
                                                     ]
                                                     restored = self._restore(
-                                                        content_buf,
+                                                        reasoning_buf,
                                                         active_t2p,
                                                     )
                                                     last_us = restored.rfind('__')
@@ -337,31 +360,34 @@ class LlmMixin:
                                                     if safe:
                                                         await resp.write(
                                                             _mk_sse_event(
-                                                                safe,
+                                                                reasoning_content=safe,
                                                             ).encode(),
                                                         )
-                                                    content_buf = pending
+                                                    reasoning_buf = pending
                                                     if finish_reason:
-                                                        content_buf = self._restore(
-                                                            content_buf,
+                                                        reasoning_buf = self._restore(
+                                                            reasoning_buf,
                                                             active_t2p,
                                                         )
-                                                        content_buf = (
+                                                        reasoning_buf = (
                                                             _PARTIAL_TOKEN_RE.sub(
                                                                 '',
-                                                                content_buf,
+                                                                reasoning_buf,
                                                             )
                                                         )
                                                         await resp.write(
                                                             _mk_sse_event(
-                                                                content_buf,
-                                                                finish_reason,
+                                                                reasoning_content=reasoning_buf,
+                                                                finish_reason=finish_reason,
                                                             ).encode(),
                                                         )
-                                                        content_buf = ''
+                                                        reasoning_buf = ''
                                                 else:
                                                     # 真正的非 content 事件
-                                                    await _flush(content_buf)
+                                                    await _flush(
+                                                        c=content_buf,
+                                                        rc=reasoning_buf,
+                                                    )
                                                     await resp.write(
                                                         (
                                                             self._restore(
@@ -490,9 +516,9 @@ class LlmMixin:
                                                         'reasoning_content'
                                                     ]
                                                     combined = (
-                                                        content_buf + reasoning_text
+                                                        reasoning_buf + reasoning_text
                                                     )
-                                                    content_buf = ''
+                                                    reasoning_buf = ''
                                                     restored = self._restore(
                                                         combined,
                                                         active_t2p,
@@ -503,8 +529,8 @@ class LlmMixin:
                                                     )
                                                     await resp.write(
                                                         _mk_sse_event(
-                                                            restored,
-                                                            finish_reason,
+                                                            reasoning_content=restored,
+                                                            finish_reason=finish_reason,
                                                         ).encode(),
                                                     )
                                                 else:
@@ -565,13 +591,32 @@ class LlmMixin:
                                 logger.debug('SSE 客户端断连: %s', e)
 
                             # 流结束：flush 残留（含 partial token 前缀清理）
-                            if content_buf:
-                                content_buf = self._restore(content_buf, active_t2p)
-                                content_buf = _PARTIAL_TOKEN_RE.sub('', content_buf)
+                            if content_buf or reasoning_buf:
                                 if content_buf:
+                                    content_buf = self._restore(
+                                        content_buf,
+                                        active_t2p,
+                                    )
+                                    content_buf = _PARTIAL_TOKEN_RE.sub(
+                                        '',
+                                        content_buf,
+                                    )
+                                if reasoning_buf:
+                                    reasoning_buf = self._restore(
+                                        reasoning_buf,
+                                        active_t2p,
+                                    )
+                                    reasoning_buf = _PARTIAL_TOKEN_RE.sub(
+                                        '',
+                                        reasoning_buf,
+                                    )
+                                if content_buf or reasoning_buf:
                                     try:
                                         await resp.write(
-                                            _mk_sse_event(content_buf).encode(),
+                                            _mk_sse_event(
+                                                content=content_buf,
+                                                reasoning_content=reasoning_buf,
+                                            ).encode(),
                                         )
                                     except (
                                         ConnectionResetError,
