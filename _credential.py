@@ -652,7 +652,7 @@ class CredentialMixin:
                 if reg:
                     reg.allow_mode = 'auto'
                     reg.can_auto_unlock = True
-                    await self._save_token_registry()
+                    await self._save_caller_registry()
 
         return web.json_response(
             {

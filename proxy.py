@@ -193,9 +193,9 @@ class CredentialProxy(
         self.tpm_seal_priv = os.path.join(TPM_DIR, 'seal.priv')
         logger.info('TPM primary: %s', self.tpm_primary)
 
-        # ── Token 注册表 (RegistryMixin 使用) ──
-        self._token_registry_path = os.path.join(DATA_DIR, 'token_registry.json')
-        self._load_token_registry(self._token_registry_path)
+        # ── Caller 注册表 (RegistryMixin 使用) ──
+        self._caller_registry_path = os.path.join(DATA_DIR, 'caller_registry.json')
+        self._load_caller_registry(self._caller_registry_path)
 
         # ── LLM 代理配置 (LlmMixin 使用) ──
         self.proxies = parse_llm_proxy_env()

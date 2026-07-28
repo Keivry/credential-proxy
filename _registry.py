@@ -1,4 +1,4 @@
-"""RegistryMixin — Token/Caller 注册表管理 + 认证降级链。"""
+"""RegistryMixin — Caller 注册表管理 + 自动放行认证。"""
 
 import asyncio
 import hashlib
@@ -53,7 +53,7 @@ class RegisteredCaller:
 
 
 class RegistryMixin:
-    """Mixin: Token / Caller 注册表管理 + 认证降级链。
+    """Mixin: Caller 注册表管理 + 自动放行认证。
 
     注意：此类属性由 CredentialProxy.__init__ (proxy.py) 初始化，
     不在此处设置 __init__，因为 CredentialProxy.__init__ 不调用
@@ -64,7 +64,7 @@ class RegistryMixin:
     # ── 通用名称检查 ──
 
     def _name_exists(self, name: str) -> bool:
-        """检查名称是否已注册（含 Token 和 Caller，含 pending）。"""
+        """检查名称是否已注册（含 Caller 和 pending）。"""
         if name in self._registrations_by_name:
             return True
         for p in self._registration_pending.values():
@@ -123,7 +123,7 @@ class RegistryMixin:
             reg = self._caller_registry.get(reg_id)
             if reg:
                 reg.enabled = True
-                await self._save_token_registry()
+                await self._save_caller_registry()
 
     async def _revoke_caller(self, reg_id: str) -> bool:
         async with self._lock:
@@ -131,7 +131,7 @@ class RegistryMixin:
             if reg:
                 self._registrations_by_name.pop(reg.name, None)
                 self._caller_registry_by_path.pop(reg.script_path, None)
-                await self._save_token_registry()
+                await self._save_caller_registry()
                 return True
             return False
 
@@ -307,19 +307,19 @@ class RegistryMixin:
             else:
                 # ❎ 拒绝 → 禁用注册
                 reg.enabled = False
-            await self._save_token_registry()
+            await self._save_caller_registry()
             self._hash_change_pending.pop(reg_id, None)
 
     # ═══════════════════════════════════════════════════════════
     # 持久化
     # ═══════════════════════════════════════════════════════════
 
-    def _load_token_registry(self, path: str):
-        """从文件加载注册表（Token + Caller），含完整性校验。
+    def _load_caller_registry(self, path: str):
+        """从文件加载注册表（Caller 注册），含完整性校验。
 
         仅在 __init__ 中单线程调用（构造函数阶段未启动协程），
         因此不获取 self._lock。后续写入始终在锁内进行。"""
-        self._token_registry_path = path
+        self._caller_registry_path = path
         try:
             with open(path) as f:
                 data = json.load(f)
@@ -364,8 +364,8 @@ class RegistryMixin:
             path,
         )
 
-    async def _save_token_registry(self):
-        """原子写 token_registry.json。
+    async def _save_caller_registry(self):
+        """原子写 caller_registry.json。
         调用者必须已持有 self._lock。"""
         callers = []
         for c in self._caller_registry.values():
@@ -391,7 +391,7 @@ class RegistryMixin:
             'callers': callers,
         }
         data['integrity'] = self._compute_registry_integrity(data)
-        tmp_path = self._token_registry_path + '.tmp'
+        tmp_path = self._caller_registry_path + '.tmp'
 
         def _write():
             with open(tmp_path, 'w') as f:
@@ -399,7 +399,7 @@ class RegistryMixin:
                 f.flush()
                 os.fsync(f.fileno())
             os.chmod(tmp_path, 0o600)
-            os.rename(tmp_path, self._token_registry_path)
+            os.rename(tmp_path, self._caller_registry_path)
 
         await asyncio.to_thread(_write)
 
