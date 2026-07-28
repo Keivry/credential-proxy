@@ -242,8 +242,10 @@ class LlmMixin:
                                 if c or rc or fr:
                                     if c:
                                         c = self._restore(c, active_t2p)
+                                        c = _PARTIAL_TOKEN_RE.sub('', c)
                                     if rc:
                                         rc = self._restore(rc, active_t2p)
+                                        rc = _PARTIAL_TOKEN_RE.sub('', rc)
                                     await resp.write(
                                         _mk_sse_event(
                                             content=c,
@@ -364,7 +366,9 @@ class LlmMixin:
                                                         ).encode(),
                                                     )
                                                 reasoning_buf = pending
-                                                if finish_reason:
+                                                if finish_reason and not delta.get(
+                                                    'content'
+                                                ):
                                                     reasoning_buf = self._restore(
                                                         reasoning_buf,
                                                         active_t2p,
