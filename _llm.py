@@ -351,10 +351,9 @@ class LlmMixin:
                                             )
 
                                             # ── Reasoning content（独立处理，不受 content 影响）──
-                                            if 'reasoning_content' in delta:
-                                                reasoning_buf += delta[
-                                                    'reasoning_content'
-                                                ]
+                                            rc_val = delta.get('reasoning_content')
+                                            if rc_val is not None:
+                                                reasoning_buf += rc_val
                                                 restored = self._restore(
                                                     reasoning_buf,
                                                     active_t2p,
@@ -509,11 +508,9 @@ class LlmMixin:
                                                 )
 
                                                 # reasoning_content 独立处理
-                                                if 'reasoning_content' in delta:
-                                                    rc_combined = (
-                                                        reasoning_buf
-                                                        + delta['reasoning_content']
-                                                    )
+                                                rc_val = delta.get('reasoning_content')
+                                                if rc_val is not None:
+                                                    rc_combined = reasoning_buf + rc_val
                                                     reasoning_buf = ''
                                                     rc_restored = self._restore(
                                                         rc_combined,
