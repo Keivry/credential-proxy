@@ -213,6 +213,18 @@ class LlmMixin:
                 ) as upstream_resp:
                     content_type = upstream_resp.content_type or ''
 
+                    # Log non-2xx upstream responses, only for chat completion endpoints
+                    if upstream_resp.status >= 400 and (
+                        tail.rstrip('/').endswith('chat/completions')
+                        or tail.rstrip('/').endswith('v1/messages')
+                    ):
+                        logger.warning(
+                            'LLM 上游返回 %d: %s %s',
+                            upstream_resp.status,
+                            request.method,
+                            target_url,
+                        )
+
                     if content_type.startswith('text/event-stream'):
                         # ── SSE 流式 ──
                         resp = web.StreamResponse(
