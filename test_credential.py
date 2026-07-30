@@ -46,6 +46,7 @@ sys.modules['pykeepass'] = pk
 
 from _credential import CredentialMixin
 from _token import TokenMixin
+import _credential
 
 # ═══════════════════════════════════════════════════════════
 # 测试辅助: 带 mock 的最小 CredentialProxy
@@ -499,6 +500,95 @@ async def test_ask_message_failed():
     await p.handle_credential(req)
     call_args = aw.json_response.call_args[0][0]
     assert call_args['error'] == '无法发送审批消息'
+
+
+# ═══════════════════════════════════════════════════════════
+# --raw 安全加固
+# ═══════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_raw_rejected_terminal_direct_call():
+    """token: false + caller_hash == GET_BINARY_HASH → 403（终端直调）"""
+    old_bh = _credential.GET_BINARY_HASH
+    old_bs = _credential.GET_BINARY_SECRET
+    _credential.GET_BINARY_HASH = 'sha256:test_binary_hash'
+    _credential.GET_BINARY_SECRET = 'test_secret'
+    try:
+        p = MockProxy()
+        p.master_password = 'pw'
+        auth = {
+            'caller_hash': 'sha256:test_binary_hash',
+            'get_binary_hash': 'sha256:test_binary_hash',
+            'get_binary_secret': 'test_secret',
+        }
+        req = make_request({'entry': 'test_entry', 'token': False, 'auth': auth})
+        await p.handle_credential(req)
+        call_args = aw.json_response.call_args[0][0]
+        assert '拒绝' in call_args['error']
+        assert aw.json_response.call_args[1]['status'] == 403
+    finally:
+        _credential.GET_BINARY_HASH = old_bh
+        _credential.GET_BINARY_SECRET = old_bs
+
+
+@pytest.mark.asyncio
+async def test_raw_allowed_script_context():
+    """token: false + caller_hash != GET_BINARY_HASH → 通过检查（脚本上下文）"""
+    old_bh = _credential.GET_BINARY_HASH
+    old_bs = _credential.GET_BINARY_SECRET
+    _credential.GET_BINARY_HASH = 'sha256:test_binary_hash'
+    _credential.GET_BINARY_SECRET = 'test_secret'
+    try:
+        p = MockProxy()
+        p.master_password = 'pw'
+        # 用自动放行路径绕过 Matrix 审批（不走 approval 等待）
+        p._check_auto_approve = AsyncMock(return_value=(True, None, ''))
+        p._handle_auto_approve = AsyncMock(return_value=MagicMock())
+
+        auth = {
+            'caller_hash': 'sha256:different_script_hash',
+            'get_binary_hash': 'sha256:test_binary_hash',
+            'get_binary_secret': 'test_secret',
+        }
+        req = make_request({'entry': 'test_entry', 'token': False, 'auth': auth})
+        await p.handle_credential(req)
+
+        # 通过我们的检查 → _handle_auto_approve 被调用（而非返回 403）
+        p._handle_auto_approve.assert_awaited_once()
+    finally:
+        _credential.GET_BINARY_HASH = old_bh
+        _credential.GET_BINARY_SECRET = old_bs
+
+
+@pytest.mark.asyncio
+async def test_tokenized_not_affected_by_raw_check():
+    """use_token=True（默认）时不受 --raw 检查影响。"""
+    old_bh = _credential.GET_BINARY_HASH
+    old_bs = _credential.GET_BINARY_SECRET
+    _credential.GET_BINARY_HASH = 'sha256:test_binary_hash'
+    _credential.GET_BINARY_SECRET = 'test_secret'
+    try:
+        p = MockProxy()
+        p.master_password = 'pw'
+        # 用自动放行路径绕过 Matrix 审批
+        p._check_auto_approve = AsyncMock(return_value=(True, None, ''))
+        p._handle_auto_approve = AsyncMock(return_value=MagicMock())
+
+        auth = {
+            'caller_hash': 'sha256:test_binary_hash',
+            'get_binary_hash': 'sha256:test_binary_hash',
+            'get_binary_secret': 'test_secret',
+        }
+        # 无 token:False → 默认 use_token=True
+        req = make_request({'entry': 'test_entry', 'auth': auth})
+        await p.handle_credential(req)
+
+        # 通过我们的检查（use_token=True 不走 --raw 分支）→ _handle_auto_approve 被调用
+        p._handle_auto_approve.assert_awaited_once()
+    finally:
+        _credential.GET_BINARY_HASH = old_bh
+        _credential.GET_BINARY_SECRET = old_bs
 
 
 # ═══════════════════════════════════════════════════════════

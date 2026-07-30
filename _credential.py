@@ -247,6 +247,26 @@ class CredentialMixin:
                 status=403,
             )
 
+        # ── 防直接调用 --raw（caller_hash == get_binary_hash 表示终端直调）──
+        # 脚本调用时 caller_hash 是脚本文件的 SHA256，不等于 get_binary_hash。
+        # 终端直接调用时 caller_hash fallback 到 get 二进制自身 hash，两者相等。
+        # 用服务端已验证的 GET_BINARY_HASH（而非客户端提供的 auth.get），
+        # 防止未配置三因子认证时的绕过。
+        if not use_token:
+            ch = auth.get('caller_hash', '')
+            bh = GET_BINARY_HASH
+            if ch and bh and ch == bh:
+                return web.json_response(
+                    {
+                        'error': (
+                            '原始凭据请求被拒绝（token: false / --raw）：'
+                            '不允许终端直接调用。'
+                            '请通过脚本文件内 subprocess.run 调用 get 二进制获取。'
+                        ),
+                    },
+                    status=403,
+                )
+
         # ── 自动放行检查 ──
         approve, reg, reason = await self._check_auto_approve(
             entry_name,
