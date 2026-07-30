@@ -1,29 +1,280 @@
 # credential-proxy
 
-Matrix 审批 + TPM 解封 + KeePassXC 后端的凭据代理服务。
+三因子认证凭据代理服务 — LLM 安全场景下的凭据存取管控方案。
 
-**功能：**
-- **凭据 API** — HTTP 接口查询 KeePass 条目，需 Matrix 房间 ✅/❎ 审批
-- **TPM 解封** — KeePass 主密码由 TPM 2.0 硬件密封，磁盘被盗也无法解密
-- **LLM 脱敏代理** — 反向代理 LLM API 请求，自动替换凭据为占位符
-
-**构建：**
-
-```bash
-docker build -t credential-proxy .
+```
+Hermes Agent / 脚本  ── get 二进制 ──▶  Credential Proxy (Docker)
+                                          ├─ 三因子认证（binary + secret + caller）
+                                          ├─ KeePassXC 数据库
+                                          ├─ TPM 2.0 硬件解封
+                                          ├─ Matrix ✅/❎ 审批
+                                          └─ LLM 脱敏反向代理
 ```
 
-**运行：**
+## 核心能力
+
+- **凭据 API** — HTTP 接口查询 KeePass 条目，支持字段级粒度控制
+- **三因子认证**（v0.8.0+）— `get_binary_hash` + `GET_BINARY_SECRET` + `caller_hash`，仅 `get` 二进制可通信
+- **Caller 自动放行** — 脚本文件 SHA256 哈希绑定注册，哈希匹配自动放行，被篡改需重新审批
+- **Matrix 审批** — 每笔凭据需用户 ✅/❎ 反应确认；支持注册审批（🔓 自动放行 / ✅ 普通审批 / ❎ 拒绝）
+- **TPM 2.0 密封** — KeePass 主密码由硬件密封，磁盘被盗无法解密
+- **LLM 脱敏代理** — 反向代理 LLM API 请求，凭据自动替换为 `__VG_CRED_NNNNNN__` 占位符，流式 SSE 实时还原
+- **双向保护** — `get credential` 默认返回脱敏值（tokenized），脚本需显式 `--raw` 获取明文
+
+## 架构
+
+### Python 服务端（7 文件 Mixin 模式）
+
+```
+proxy.py            主入口 + CredentialProxy 主类
+_credential.py      凭据 HTTP API（/credential /health）+ 三因子认证
+_token.py           凭据脱敏/还原 — __VG_CRED_NNNNNN__ token
+_tpm.py             TPM 硬件解封 KeePass 主密码
+_matrix.py          Matrix Bot — 审批、解锁、注册审批
+_registry.py        Caller 注册表 + 自动放行认证
+_llm.py             LLM 反向代理 — SSE 流式 + JSON-aware token 还原
+_sse.py             SSE 共享常量
+```
+
+轻量入口（无 Matrix/TPM/KeePass，仅 aiohttp）：
+
+- `credential-proxy-only.py` — 凭据 API + LLM 代理（自动批准）
+- `llm-proxy-only.py` — 纯 LLM 脱敏代理
+
+### Go 客户端二进制
+
+```
+get/                独立 Go CLI 项目
+├── main.go         入口 — credential / register / revoke / list / status
+├── cmd/
+│   ├── credential.go   获取凭据（支持 --raw）
+│   ├── register.go     注册脚本 caller
+│   └── revoke.go       吊销注册
+└── internal/
+    ├── auth.go         三因子认证构建
+    ├── caller.go       /proc/PPID 调用者识别 + SHA256 哈希
+    └── proxy.go        HTTP 客户端
+```
+
+### 三因子认证流程
+
+```
+get 二进制                         Credential Proxy
+    │                                   │
+    ├─ get_binary_hash=sha256(get)      │  因子 1：二进制完整性
+    ├─ get_binary_secret=<env>          │  因子 2：部署密钥
+    ├─ caller_hash=sha256(脚本)         │  因子 3：调用者身份
+    │                                   │
+    │  ─── POST /credential ─────────▶  │
+    │                                   ├─ 三因子校验
+    │                                   ├─ Caller 注册匹配？
+    │                                   │   ├─ 匹配 → 自动放行 ✅
+    │                                   │   └─ 不匹配 → Matrix 审批
+    │                                   └─ 返回凭据（脱敏/原始）
+    ◀── 响应 ─────────────────────────  │
+```
+
+## 快速开始
+
+### 前置条件
+
+- Linux 主机（生产建议 TPM 2.0 芯片）
+- KeePassXC 数据库（.kdbx）+ 密钥文件（.key）
+- Matrix 账号 + Homeserver
+
+### Docker 部署（推荐）
 
 ```bash
-docker run -d \
-  --name credential-proxy \
+# 1. 生成部署密钥
+SECRET=$(openssl rand -hex 32)
+
+# 2. 构建镜像
+docker build -t credential-proxy .
+
+# 3. 启动（基础版）
+docker run -d --name credential-proxy \
   --device /dev/tpm0 --device /dev/tpmrm0 \
-  -v /path/to/tpm-sealed:/data/tpm:ro \
+  -v /path/to/tpm:/data/tpm:ro \
   -v /path/to/keepass-db:/data/db:ro \
   -p 8877:8877 \
   -e HOMESERVER=https://matrix.example.com \
   -e ROOM_ID='!roomid:example.com' \
-  -e MATRIX_ACCESS_TOKEN=*** \
+  -e MATRIX_ACCESS_TOKEN='syt_...' \
+  -e GET_BINARY_HASH='sha256:...' \
+  -e GET_BINARY_SECRET="$SECRET" \
   credential-proxy
 ```
+
+或使用 `docker-compose.yml`（编辑后启动）：
+
+```bash
+docker compose up -d
+```
+
+### 客户端安装
+
+```bash
+# 从 GitHub Release 下载
+curl -fsSL -o /usr/local/bin/get \
+  https://github.com/Keivry/credential-proxy/releases/latest/download/get-credential-linux-amd64
+chmod +x /usr/local/bin/get
+```
+
+### 基本用法
+
+```bash
+# 获取脱敏值（默认）
+get credential 网易 授权码
+# → __VG_CRED_000001__
+
+# 获取原始值（仅限脚本，禁止终端直接调用）
+get credential 网易 授权码 --raw
+# → 实际密码
+
+# 完整条目
+get credential 和风天气
+# → 标题: 和风天气
+# → 用户名: admin
+# → 密码: __VG_CRED_000042__
+# → URL: https://api.qweather.com
+
+# 注册脚本 caller（需 Matrix 审批）
+get register --name "check-mail" \
+  --entry "网易" --fields "授权码" \
+  --desc "检查 163 邮箱" --auto
+
+# 查看已注册 caller
+get list
+
+# 吊销注册
+get revoke --name "check-mail"
+```
+
+## 安全设计
+
+### 保护层次
+
+| 层级 | 防御对象 | 机制 |
+|:-----|:---------|:-----|
+| Layer 1 | 外部容器/主机 | `get_binary_hash` + `GET_BINARY_SECRET` + `caller_hash` |
+| Layer 2 | 同容器未授权脚本 | Caller 注册 → 仅已注册脚本可自动放行 |
+| Layer 3 | 所有未注册请求 | Matrix 审批 |
+| Layer 4 | LLM 提供商侧泄露 | Token 脱敏（`__VG_CRED_NNNNNN__`） |
+| Layer 5 | 磁盘泄露 | TPM 硬件密封 |
+
+### `--raw` 安全约束（v0.8.4+）
+
+- **终端直接调用 `get credential X --raw`** 被拒绝：`caller_hash` 检测 fallback 到 `get` 自身 hash，等于 `get_binary_hash`
+- **脚本内 `subprocess.run` 调用** 放行：`caller_hash` = 脚本文件 SHA256，不等于 `get_binary_hash`
+- **服务端同时校验**：`GET_BINARY_HASH` 服务端常量，防止兼容模式下客户端伪造
+
+## 配置
+
+### 环境变量
+
+| 变量 | 说明 | 默认值 |
+|:-----|:-----|:------|
+| `HOMESERVER` | Matrix homeserver URL | — |
+| `ROOM_ID` | Matrix 审批房间 ID | — |
+| `MATRIX_ACCESS_TOKEN` | Matrix Bot access token | — |
+| `GET_BINARY_HASH` | `get` 二进制的 SHA256 | 空（跳过三因子认证） |
+| `GET_BINARY_SECRET` | 部署共享密钥 | 空（跳过三因子认证） |
+| `CREDENTIAL_PORT` | HTTP API 端口 | `8877` |
+| `DATA_DIR` | 数据目录 | `/data` |
+| `TPM_DIR` | TPM 密封文件目录 | `$DATA_DIR/tpm` |
+| `DB_DIR` | KeePass 数据库目录 | `$DATA_DIR/db` |
+| `LLM_<PORT>` | LLM 脱敏代理端口 → 上游 URL | — |
+
+### Caller 注册
+
+注册后将脚本文件的 SHA256 哈希绑定到 Proxy，实现篡改检测 + 自动放行。
+
+```bash
+# 从脚本文件内调用（自动检测 caller hash）
+python3 /path/to/script.py
+# 脚本内执行: subprocess.run(["get", "register", "--name", "...", ...])
+
+# 或用 --script-path 在终端注册（v0.8.0+）
+get register --name "my-script" \
+  --entry "条目名" \
+  --script-path /path/to/script.py \
+  --desc "描述" --auto
+```
+
+## 开发
+
+### 本地运行
+
+```bash
+# Python 虚拟环境
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+
+# 运行测试
+PYTHONPATH="." pytest -q
+
+# 启动开发版（自动批准，无需 Matrix）
+CREDENTIAL_MASTER_PASSWORD="your-pw" python3 credential-proxy-only.py
+```
+
+### Go 客户端构建
+
+```bash
+cd get && go build -o get .
+```
+
+### 项目结构
+
+```
+├── proxy.py             主入口（完整版）
+├── _credential.py        凭据 API + 三因子认证
+├── _token.py             脱敏 / 还原
+├── _tpm.py               TPM 硬件解封
+├── _matrix.py            Matrix Bot
+├── _registry.py          Caller 注册表
+├── _llm.py               LLM 脱敏代理
+├── _sse.py               SSE 共享常量
+├── credential-proxy-only.py  轻量版（自动批准）
+├── llm-proxy-only.py         极简版（仅 LLM 代理）
+├── get/                  Go 客户端二进制
+│   ├── main.go
+│   ├── cmd/
+│   └── internal/
+├── test_*.py             测试
+├── Dockerfile
+├── docker-compose.yml
+└── .github/workflows/    CI/CD
+```
+
+### 构建与发布
+
+GitHub Actions 自动处理：
+
+| 事件 | 动作 |
+|:-----|:-----|
+| `v*` tag 推送 | 构建 Docker 镜像 + Go 二进制 Release |
+| `master` 推送 | 仅构建 Docker 镜像 |
+| `master` 的 PR | 验证性构建（不推送） |
+
+手动构建：
+
+```bash
+# Docker
+docker build -t ghcr.io/keivry/credential-proxy:0.8.4 .
+
+# Go binary
+cd get && make build  # → /tmp/get-credential-linux-amd64
+```
+
+## 版本历史
+
+- **v0.8.4** — `--raw` 安全加固：禁止终端直接调用，强制脚本内使用
+- **v0.8.0** — 三因子认证；移除 Token 降级系统；`get register --script-path`
+- **v0.7.0** — Caller 注册表 + 自动放行 + 哈希变更通知
+- **v0.6.0** — LLM 脱敏代理 + SSE 流式 token 还原
+- **v0.5.0** — Go CLI 二进制 `get`
+- **v0.4.0** — Mixin 架构拆分
+- **v0.3.0** — TPM 硬件密封
+- **v0.2.0** — Matrix 审批流程
+- **v0.1.0** — 基础 KeePass HTTP API
