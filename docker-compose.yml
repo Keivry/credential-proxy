@@ -1,7 +1,7 @@
 services:
   credential-proxy:
     build: .
-    image: ghcr.io/keivry/credential-proxy:0.8.0
+    image: ghcr.io/keivry/credential-proxy:0.8.4
     container_name: credential-proxy
     restart: unless-stopped
     cap_add:
@@ -11,33 +11,39 @@ services:
         soft: -1
         hard: -1   # 防止 mlockall(ENOMEM)
     environment:
+      # ── Matrix 审批（必填）──
       - HOMESERVER=https://matrix.example.com
       - ROOM_ID=!yourroomid:matrix.example.com
       - MATRIX_ACCESS_TOKEN=${MATRIX_ACCESS_TOKEN:?MATRIX_ACCESS_TOKEN is required}
+
       # ── 三因子认证（v0.8.0+，强烈建议开启）──
-      # GET_BINARY_HASH: get 二进制的 SHA256（容器内计算）:
+      # 开启后仅 get 可通过认证直接通信，curl/Python 直调被 403 拒绝。
+      # GET_BINARY_HASH: get 二进制的 SHA256 哈希值
       #   sha256sum get | cut -d' ' -f1
-      # GET_BINARY_SECRET: 随机部署密钥（Hermes 容器与 Proxy 容器共享）:
+      # GET_BINARY_SECRET: 部署密钥（Hermes 容器与 Proxy 容器共享）
       #   openssl rand -hex 32
-      # 未设置时跳过认证（兼容模式）。两个必须同时设置才生效。
+      # 两个都必须设置才生效；都为空时跳过认证（兼容/开发模式）。
       # - GET_BINARY_HASH=sha256:abc123...
       # - GET_BINARY_SECRET=abc123def456...
-      # 可选：
+
+      # ── LLM 脱敏反向代理（可选）──
+      # 端口 → 上游 URL 映射。配置后自动替换请求/响应中的凭据为 __VG_CRED_*__ token。
+      - LLM_8878=https://api.opencode.ai
+      - LLM_8879=https://api.deepseek.com
+
+      # ── 可选参数 ──
       # - CREDENTIAL_PORT=8877
       # - DATA_DIR=/data
-      # LLM 脱敏代理（可选）：
-      # - LLM_8878=https://api.opencode.ai
-      # - LLM_8879=https://api.deepseek.com
+      # - CREDENTIAL_PROXY_DEBUG_DIR=/data/debug  # LLM 对话请求/响应日志
     ports:
-      - "8877:8877"
-      # LLM 代理端口（可选）：
-      # - "8878:8878"
-      # - "8879:8879"
+      - "8877:8877"        # 凭据 API
+      - "8878:8878"        # LLM 代理 — OpenCode
+      - "8879:8879"        # LLM 代理 — DeepSeek
     volumes:
+      # TPM 密封文件（primary.ctx + seal.pub + seal.priv）
       - ${TPM_HOST_PATH:-./data/tpm}:/data/tpm:ro
+      # KeePass 数据库（.kdbx + .key）
       - ${DB_HOST_PATH:-./data/db}:/data/db:ro
     devices:
       - /dev/tpm0:/dev/tpm0
       - /dev/tpmrm0:/dev/tpmrm0
-    # Podman 兼容（无 device cgroup，需 --device 参数）：
-    # 直接用 podman/docker run 而非 compose 的 device 字段
