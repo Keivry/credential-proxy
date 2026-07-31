@@ -1153,13 +1153,18 @@ class TestAnthropicEventRecognizer:
         events = [
             {'type': 'message_start', 'message': {'id': 'msg_01'}},
             {'type': 'content_block_start', 'index': 0},
-            {'type': 'content_block_stop', 'index': 0},
             {'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}},
             {'type': 'message_stop'},
             {'type': 'ping'},
         ]
         for evt in events:
             assert _anthropic_event(evt) is None, evt
+
+    def test_block_stop_recognized(self):
+        """content_block_stop → block_stop（用于清理跨块残留）。"""
+        kind, dt = self._evt({'type': 'content_block_stop', 'index': 0})
+        assert kind == 'block_stop'
+        assert dt is None
 
     def test_other_protocols_return_none(self):
         assert _anthropic_event({'choices': [{'delta': {'content': 'x'}}]}) is None
@@ -1379,4 +1384,111 @@ class TestAnthropicEventHandler:
         assert len(events) == 1
         assert events[0]['type'] == 'content_block_delta'
         assert events[0]['delta']['text'] == '你好世界'
+        assert cb == ''
+
+    @pytest.mark.asyncio
+    async def test_block_stop_clears_arg_buf(self):
+        """content_block_stop 清空 arg_buf：防跨块伪还原。"""
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        mid = len(token) // 2
+        # tool1: partial_json 截断在 token 中间
+        evt1 = {
+            'type': 'content_block_delta',
+            'index': 0,
+            'delta': {
+                'type': 'input_json_delta',
+                'partial_json': '{"pwd": "' + token[:mid],
+            },
+        }
+        _, _, ab = await holder._handle_anthropic_event(w, evt1, '', t2p, '', '', '')
+        assert ab == token[:mid]
+        # content_block_stop: 清空 arg_buf
+        stop_line = 'data: {"type":"content_block_stop","index":0}'
+        _, _, ab = await holder._handle_anthropic_event(
+            w,
+            {'type': 'content_block_stop', 'index': 0},
+            stop_line,
+            t2p,
+            '',
+            '',
+            ab,
+        )
+        assert ab == ''
+        assert stop_line + '\n' in w.text  # 原样透传
+
+    @pytest.mark.asyncio
+    async def test_cross_block_no_false_restore(self):
+        """回归：tool2 的 partial_json 从 token 剩余开头时不得伪还原。"""
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        mid = len(token) // 2
+        # tool1 截断
+        evt1 = {
+            'type': 'content_block_delta',
+            'index': 0,
+            'delta': {
+                'type': 'input_json_delta',
+                'partial_json': '{"pwd": "' + token[:mid],
+            },
+        }
+        _, _, ab = await holder._handle_anthropic_event(w, evt1, '', t2p, '', '', '')
+        # block_stop 清空
+        _, _, ab = await holder._handle_anthropic_event(
+            w,
+            {'type': 'content_block_stop', 'index': 0},
+            'data: {"type":"content_block_stop","index":0}',
+            t2p,
+            '',
+            '',
+            ab,
+        )
+        assert ab == ''
+        # tool2 从 token 剩余部分开头
+        evt2 = {
+            'type': 'content_block_delta',
+            'index': 1,
+            'delta': {
+                'type': 'input_json_delta',
+                'partial_json': token[mid:] + '"}',
+            },
+        }
+        _, _, ab = await holder._handle_anthropic_event(w, evt2, '', t2p, '', '', ab)
+        # 不跨块拼接：明文不出现
+        assert 'p@ssword123' not in w.text
+        assert ab == ''
+
+    @pytest.mark.asyncio
+    async def test_mid_flush_emits_safe_when_restorable(self):
+        """中游 flush（other delta）在缓冲含非 token 前缀残留时输出 safe 事件。"""
+        holder = TestSSEHolder()
+        await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        # content_buf 含无法匹配 token 前缀的 __ 文本（不会 hold）
+        cb = 'plain __hello'
+        cb, _, _ = await holder._handle_anthropic_event(
+            w,
+            {
+                'type': 'content_block_delta',
+                'index': 0,
+                'delta': {'type': 'server_tool_use', 'name': 't'},
+            },
+            'data: {"type":"content_block_delta","index":0}',
+            t2p,
+            cb,
+            '',
+            '',
+        )
+        # safe='plain __hello' 作为 text_delta 事件输出 + 原始行原样透传
+        events = w.parsed_events()
+        assert len(events) == 2
+        assert events[0]['type'] == 'content_block_delta'
+        assert events[0]['delta']['type'] == 'text_delta'
+        assert events[0]['delta']['text'] == 'plain __hello'
+        assert events[1] == {'type': 'content_block_delta', 'index': 0}
         assert cb == ''

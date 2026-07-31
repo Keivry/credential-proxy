@@ -168,16 +168,21 @@ def _anthropic_event(parsed: dict) -> tuple[str, str | None] | None:
     """识别 Anthropic Messages API SSE 事件（/v1/messages）。
 
     返回 (kind, delta_text)：
-      kind ∈ {'text', 'thinking', 'function_args', 'other'}
+      kind ∈ {'text', 'thinking', 'function_args', 'block_stop', 'other'}
       - 'text': content_block_delta 的 text_delta → delta.text
       - 'thinking': content_block_delta 的 thinking_delta → delta.thinking
       - 'function_args': content_block_delta 的 input_json_delta → delta.partial_json
+      - 'block_stop': content_block_stop（块结束，需清理跨块残留）→ delta_text=None
       - 'other': 其他 content_block_delta 类型（server_tool_use 等）→ delta_text=None
     非 Anthropic 事件（chat/completions、responses SSE 等）返回 None。
     注：message_start / content_block_start / message_delta / message_stop 等
     不含文本 delta 的事件返回 None，走整行透传（原样保留，无需还原）。
     """
     evt_type = parsed.get('type') if isinstance(parsed, dict) else None
+    if evt_type == 'content_block_stop':
+        # 块结束：arg_buf 中未完成的 token 前缀不可能再有后续分片，
+        # 必须清理，否则下一个 input_json_delta 可能跨块拼接伪还原
+        return 'block_stop', None
     if evt_type != 'content_block_delta':
         return None
     delta = parsed.get('delta')
@@ -344,6 +349,13 @@ class LlmMixin:
             await write((self._restore(line, active_t2p) + '\n').encode('utf-8'))
             return content_buf, reasoning_buf, arg_buf
         kind, delta_text = event
+
+        if kind == 'block_stop':
+            # 工具调用块结束：arg_buf 中未完成的 token 前缀不可能再有
+            # 后续分片（token 不会跨两个 tool_use block），清空防伪还原
+            # （content/reasoning 保留 pending，由流末统一清理）
+            await write((self._restore(line, active_t2p) + '\n').encode('utf-8'))
+            return content_buf, reasoning_buf, ''
 
         if kind in ('text', 'thinking', 'function_args'):
             if delta_text is None:  # pragma: no cover — 识别器保证 delta 事件携带 str
@@ -954,6 +966,19 @@ class LlmMixin:
                                             if reconstructed:
                                                 if parsed is None:
                                                     continue  # pragma: no cover
+                                                # 非 dict payload（数组/标量）→ 原样透传
+                                                # （与主循环 isinstance 防御对称）
+                                                if not isinstance(parsed, dict):
+                                                    await resp.write(
+                                                        (
+                                                            self._restore(
+                                                                'data: ' + sanitized,
+                                                                active_t2p,
+                                                            )
+                                                            + '\n'
+                                                        ).encode('utf-8'),
+                                                    )
+                                                    continue
                                                 # ── Responses API 事件（续行重建路径）──
                                                 if _responses_event(parsed) is not None:
                                                     is_responses_stream = True
