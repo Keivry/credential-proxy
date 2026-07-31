@@ -611,7 +611,7 @@ class LlmMixin:
                         if active_t2p:
                             # ── JSON-aware 流式 token 还原（广义 Plan C） ──
                             content_buf = (
-                                ''  # 累积 delta.content 片段，O(1) 单字符串追加
+                                ''  # 累积 delta.content 片段（每事件经 safe/pending 分割重置为小字符串，摊还 O(1)）
                             )
                             reasoning_buf = ''  # 累积 delta.reasoning_content 片段
                             arg_buf = ''  # 累积 responses function_call_arguments / anthropic partial_json 片段
