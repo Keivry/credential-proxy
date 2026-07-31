@@ -10,7 +10,7 @@ import uuid as _uuid
 from aiohttp import ClientSession, ClientTimeout, web
 
 from _sse import SSE_CLIENT_GONE, filter_hop_headers
-from _token import TOKEN_RE
+from _token import TOKEN_RE, TOKEN_STR_RE
 
 logger = logging.getLogger('credential-proxy')
 
@@ -155,7 +155,8 @@ def _mk_responses_flush_event(event_type: str, delta_text: str) -> str:
 def _split_safe_hold(content: str, active_t2p: dict) -> tuple[str, str]:
     """将累积文本分割为 (safe, hold)。
 
-    - safe: 可安全输出（不含可能是 token 前缀的尾部）
+    - safe: 可安全输出（剥离行中完整 token 形态——未还原的必是幻觉/未知句柄；
+       active 内的真实 token 已被 _restore 还原为明文）
     - hold: 保留到下个分片（以 __ 开头且匹配 active token 前缀）
     """
     if not content:
@@ -166,15 +167,15 @@ def _split_safe_hold(content: str, active_t2p: dict) -> tuple[str, str]:
     if m:
         token_str = m.group(0)
         if token_str not in active_t2p:
-            return content[: m.start()], token_str
+            return TOKEN_STR_RE.sub('', content[: m.start()]), token_str
     last_us = content.rfind('__')
     if last_us < 0:
-        return content, ''
+        return TOKEN_STR_RE.sub('', content), ''
     suffix = content[last_us:]
     maybe_prefix = any(t.startswith(suffix) for t in active_t2p)
     if maybe_prefix:
-        return content[:last_us], suffix
-    return content, ''
+        return TOKEN_STR_RE.sub('', content[:last_us]), suffix
+    return TOKEN_STR_RE.sub('', content), ''
 
 
 def _sanitize_json(text: str) -> str:
@@ -522,6 +523,16 @@ class LlmMixin:
                                         # 解析 JSON，提取 delta content
                                         try:
                                             parsed = json.loads(payload)
+                                            # 非 dict payload（JSON 数组/标量）→
+                                            # 原样透传，避免下游 .get 抛 AttributeError
+                                            if not isinstance(parsed, dict):
+                                                await resp.write(
+                                                    (
+                                                        self._restore(line, active_t2p)
+                                                        + '\n'
+                                                    ).encode('utf-8'),
+                                                )
+                                                continue
 
                                             # 保存原始 SSE payload 到 response.jsonl
                                             if resp_log_path:

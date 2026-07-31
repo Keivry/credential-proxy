@@ -595,8 +595,30 @@ class TestHallucinatedTokenHold:
         """token 不在行尾 → 不触发 hold（rfind 逻辑照常）。"""
         t2p = {'__VG_CRED_000001__': 'pwd'}
         safe, hold = _split_safe_hold('__VG_CRED_999999__ hi', t2p)
-        assert safe == '__VG_CRED_999999__ hi'
+        assert safe == ' hi'  # 行中完整幻觉 token 被剥离
         assert hold == ''
+
+    def test_unknown_token_mid_sentence_stripped(self):
+        """B 回归：行中幻觉 token 从 safe 剥离，防句柄泄漏。"""
+        t2p = {'__VG_CRED_000001__': 'pwd'}
+        safe, hold = _split_safe_hold('hi __VG_CRED_999999__ more', t2p)
+        assert '__VG_CRED' not in safe
+        assert '999999' not in safe
+        # 普通文本保留
+        assert 'hi ' in safe
+        assert ' more' in safe or hold == ''
+
+    def test_double_unknown_tokens(self):
+        """多个幻觉 token 全部剥离（不只行尾）。"""
+        t2p = {'__VG_CRED_000001__': 'pwd'}
+        safe, _ = _split_safe_hold('__VG_CRED_000002__ and __VG_CRED_000003__', t2p)
+        assert '__VG_CRED' not in safe
+
+    def test_token_like_word_unharmed(self):
+        """形似 token 的正常单词（无数字+__结尾）不受影响。"""
+        t2p = {'__VG_CRED_000001__': 'pwd'}
+        safe, _ = _split_safe_hold('__VG_CREDENTIAL__ is fine', t2p)
+        assert '__VG_CREDENTIAL__' in safe
 
     @pytest.mark.asyncio
     async def test_handler_no_reassembly(self):
