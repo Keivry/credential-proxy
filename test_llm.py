@@ -779,9 +779,17 @@ class TestResponsesEventRecognizer:
         kind, _ = self._evt({'type': 'response.created'})
         assert kind == 'other'
 
-    def test_output_item_done_is_other(self):
+    def test_output_item_done_is_item_done(self):
+        """output_item.done → item_done（用于清理跨 item 残留）。"""
         kind, dt = self._evt({'type': 'response.output_item.done'})
-        assert kind == 'other'
+        assert kind == 'item_done'
+        assert dt is None
+
+    def test_output_text_done_is_item_done(self):
+        kind, dt = self._evt(
+            {'type': 'response.output_text.done', 'delta': 'full text'}
+        )
+        assert kind == 'item_done'
         assert dt is None
 
     def test_chat_completions_event_returns_none(self):
@@ -994,6 +1002,48 @@ class TestResponsesEventHandler:
         assert 'p@ssword123' in w.text
         assert ' end' in w.text
         assert cb == ''
+
+    @pytest.mark.asyncio
+    async def test_item_done_clears_arg_buf(self):
+        """item_done（output_item.done）清空 arg_buf：防跨 item 伪还原（对称 block_stop）。"""
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        mid = len(token) // 2
+        # tool1: function_call_arguments 截断在 token 中间
+        evt1 = {
+            'type': 'response.function_call_arguments.delta',
+            'delta': '{"pwd": "' + token[:mid],
+            'sequence_number': 1,
+        }
+        _, _, ab = await holder._handle_responses_event(w, evt1, '', t2p, '', '', '')
+        assert ab == token[:mid]
+        # output_item.done: 清空 arg_buf，content/reasoning pending 保留
+        done_line = 'data: {"type":"response.output_item.done","sequence_number":2}'
+        cb, rb, ab = await holder._handle_responses_event(
+            w,
+            {'type': 'response.output_item.done', 'sequence_number': 2},
+            done_line,
+            t2p,
+            'text ' + token[:8],  # content pending 注入
+            'think ' + token[:8],  # reasoning pending 注入
+            ab,
+        )
+        assert ab == ''
+        assert cb == 'text ' + token[:8]
+        assert rb == 'think ' + token[:8]
+        assert done_line + '\n' in w.text  # 原样透传
+        # tool2 从 token 剩余部分开头 → 不伪还原
+        evt2 = {
+            'type': 'response.function_call_arguments.delta',
+            'delta': token[mid:] + '"}',
+            'sequence_number': 3,
+        }
+        _, _, ab = await holder._handle_responses_event(w, evt2, '', t2p, '', '', ab)
+        assert 'p@ssword123' not in w.text
+        assert '__VG_CRED' not in w.text
+        assert ab == ''
 
     @pytest.mark.asyncio
     async def test_completed_pure_prefix_flushed_empty(self):
@@ -1407,16 +1457,19 @@ class TestAnthropicEventHandler:
         assert ab == token[:mid]
         # content_block_stop: 清空 arg_buf
         stop_line = 'data: {"type":"content_block_stop","index":0}'
-        _, _, ab = await holder._handle_anthropic_event(
+        cb, rb, ab = await holder._handle_anthropic_event(
             w,
             {'type': 'content_block_stop', 'index': 0},
             stop_line,
             t2p,
-            '',
-            '',
+            'text ' + token[:8],  # content pending 注入
+            'think ' + token[:8],  # reasoning pending 注入
             ab,
         )
         assert ab == ''
+        # content/reasoning pending 保留（流末统一清理）
+        assert cb == 'text ' + token[:8]
+        assert rb == 'think ' + token[:8]
         assert stop_line + '\n' in w.text  # 原样透传
 
     @pytest.mark.asyncio
@@ -1458,18 +1511,48 @@ class TestAnthropicEventHandler:
             },
         }
         _, _, ab = await holder._handle_anthropic_event(w, evt2, '', t2p, '', '', ab)
-        # 不跨块拼接：明文不出现
+        # 不跨块拼接：明文与完整 token 形态都不出现
         assert 'p@ssword123' not in w.text
+        assert '__VG_CRED' not in w.text
         assert ab == ''
 
     @pytest.mark.asyncio
-    async def test_mid_flush_emits_safe_when_restorable(self):
-        """中游 flush（other delta）在缓冲含非 token 前缀残留时输出 safe 事件。"""
+    async def test_mid_flush_keeps_pending_no_event(self):
+        """真实中游 flush（other delta + token 前缀 pending）：不写事件、pending 保留、原行透传。"""
         holder = TestSSEHolder()
         await holder._register_secret('p@ssword123')
         t2p = dict(holder.token_to_pwd)
         w = FakeWriter()
-        # content_buf 含无法匹配 token 前缀的 __ 文本（不会 hold）
+        # content_buf 持 token 前缀 pending（生产中 delta 分支后唯一残留形态）
+        cb = '__VG'
+        cb, _, _ = await holder._handle_anthropic_event(
+            w,
+            {
+                'type': 'content_block_delta',
+                'index': 0,
+                'delta': {'type': 'server_tool_use', 'name': 't'},
+            },
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"server_tool_use","name":"t"}}',
+            t2p,
+            cb,
+            '',
+            '',
+        )
+        # flush 不输出合成事件（safe 为空）→ 只有透传行
+        events = w.parsed_events()
+        assert len(events) == 1
+        assert events[0]['delta'] == {'type': 'server_tool_use', 'name': 't'}
+        # pending 保留
+        assert cb == '__VG'
+
+    @pytest.mark.asyncio
+    async def test_mid_flush_emits_safe_keeps_pending(self):
+        """防御性中游 flush：safe 输出为 text_delta 事件、pending 保留（边缘输入，生产中不可达）。"""
+        holder = TestSSEHolder()
+        await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        # 边缘输入：非 token 前缀的 __ 文本不会 hold → safe 直接输出
         cb = 'plain __hello'
         cb, _, _ = await holder._handle_anthropic_event(
             w,

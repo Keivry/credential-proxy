@@ -118,9 +118,11 @@ def _responses_event(parsed: dict) -> tuple[str, str | None] | None:
     """识别 OpenAI Responses API SSE 事件（/v1/responses）。
 
     返回 (kind, delta_text)：
-      kind ∈ {'output_text', 'reasoning_text', 'function_call_arguments', 'other'}
+      kind ∈ {'output_text', 'reasoning_text', 'function_call_arguments', 'item_done', 'other'}
       - delta 事件: delta_text 为文本片段
-      - 'other'（response.created / completed / output_item.done 等）: delta_text=None
+      - 'item_done'（response.output_item.done / output_text.done / ...）: delta_text=None，
+        表示 item 结束，需清理跨 item 残留
+      - 'other'（response.created / completed 等）: delta_text=None
     非 Responses 事件（chat/completions SSE 等）返回 None。
     """
     evt_type = parsed.get('type') if isinstance(parsed, dict) else None
@@ -132,8 +134,13 @@ def _responses_event(parsed: dict) -> tuple[str, str | None] | None:
         'response.function_call_arguments.delta': 'function_call_arguments',
     }
     kind = kind_map.get(evt_type, 'other')
-    delta_text = parsed.get('delta') if kind != 'other' else None
-    if kind != 'other' and not isinstance(delta_text, str):
+    if evt_type.endswith('.done'):
+        # 各类型 done 事件：item 结束，arg_buf 中未完成的 token 前缀
+        # 不可能再有后续分片，必须清理，否则下一个 item 的
+        # function_call_arguments.delta 可能跨 item 拼接伪还原
+        kind = 'item_done'
+    delta_text = parsed.get('delta') if kind not in ('other', 'item_done') else None
+    if kind not in ('other', 'item_done') and not isinstance(delta_text, str):
         # delta 字段缺失/非字符串 → 当作普通事件透传
         return 'other', None
     return kind, delta_text
@@ -470,6 +477,13 @@ class LlmMixin:
             await write((self._restore(line, active_t2p) + '\n').encode('utf-8'))
             return content_buf, reasoning_buf, arg_buf
 
+        if kind == 'item_done':
+            # item 结束：arg_buf 中未完成的 token 前缀不可能再有后续分片
+            # （function call 参数不会跨 item 续写），清空防跨 item 伪还原
+            # （content/reasoning 保留 pending，由流末统一清理）
+            await write((self._restore(line, active_t2p) + '\n').encode('utf-8'))
+            return content_buf, reasoning_buf, ''
+
         if kind in ('output_text', 'reasoning_text', 'function_call_arguments'):
             if delta_text is None:  # pragma: no cover — 识别器保证 delta 事件携带 str
                 return content_buf, reasoning_buf, arg_buf
@@ -610,9 +624,7 @@ class LlmMixin:
 
                         if active_t2p:
                             # ── JSON-aware 流式 token 还原（广义 Plan C） ──
-                            content_buf = (
-                                ''  # 累积 delta.content 片段（每事件经 safe/pending 分割重置为小字符串，摊还 O(1)）
-                            )
+                            content_buf = ''  # 累积 delta.content 片段（每事件经 safe/pending 分割重置为小字符串，摊还 O(1)）
                             reasoning_buf = ''  # 累积 delta.reasoning_content 片段
                             arg_buf = ''  # 累积 responses function_call_arguments / anthropic partial_json 片段
                             is_responses_stream = False  # 本流是否 Responses API SSE
