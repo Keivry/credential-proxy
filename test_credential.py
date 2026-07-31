@@ -44,9 +44,33 @@ pk = types.ModuleType('pykeepass')
 pk.PyKeePass = MagicMock()
 sys.modules['pykeepass'] = pk
 
+import _credential
 from _credential import CredentialMixin
 from _token import TokenMixin
-import _credential
+
+# ═══════════════════════════════════════════════════════════
+# 固定三因子认证环境（防部署环境变量干扰测试确定性）
+# ═══════════════════════════════════════════════════════════
+
+
+@pytest.fixture(autouse=True)
+def _fixed_three_factor_env():
+    """强制三因子认证为兼容模式（GET_BINARY_HASH/SECRET 均为空）。
+
+    测试环境可能被部署注入 GET_BINARY_HASH / GET_BINARY_SECRET
+    （如 Hermes 容器与 Proxy 容器共享部署密钥），导致认证分支意外启用，
+    未携带 auth 的请求走到 get_binary_hash 检查而非 caller_hash 检查，
+    使大量测试断言（'缺少 caller_hash'）失败。
+    需要测试认证分支的用例自行设置 _credential.GET_BINARY_*。
+    """
+    old_bh = _credential.GET_BINARY_HASH
+    old_bs = _credential.GET_BINARY_SECRET
+    _credential.GET_BINARY_HASH = ''
+    _credential.GET_BINARY_SECRET = ''
+    yield
+    _credential.GET_BINARY_HASH = old_bh
+    _credential.GET_BINARY_SECRET = old_bs
+
 
 # ═══════════════════════════════════════════════════════════
 # 测试辅助: 带 mock 的最小 CredentialProxy
