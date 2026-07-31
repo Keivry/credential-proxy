@@ -106,6 +106,8 @@ async def env():
     finally:
         for r in proxy._runners:
             await r.cleanup()
+        if proxy._shared_session:
+            await proxy._shared_session.close()
         await up_runner.cleanup()
 
 
