@@ -19,8 +19,11 @@ UPSTREAM_TOTAL_TIMEOUT = 600  # 上游总超时 (s)
 UPSTREAM_CONNECT_TIMEOUT = 30  # 上游连接超时 (s)
 SSE_CHUNK_SIZE = 4096  # SSE 流式块大小
 SSE_MAX_BUF = 1_048_576  # SSE 缓冲区上限 (1MB)
-# 流末清理：匹配不完整 token 前缀（已还原的完整 token 不会被此匹配）
-_PARTIAL_TOKEN_RE = _re.compile(r'__VG_CRED_\d*$')
+# 流末清理：匹配 token 前缀/残缺形态（含完整但未还原的幻觉 token）。
+# 真实 token 会被 _restore 先行还原为明文，不会落此正则。
+_PARTIAL_TOKEN_RE = _re.compile(r'__VG_C(?:R(?:E(?:D(?:_?\d*)?)?)?)?_*$')
+# 完整 token 形态（行尾）：__VG_CRED_NNNNNN__
+_FULL_TOKEN_RE = _re.compile(r'__VG_CRED_\d+__$')
 # Debug 开关：设置环境变量 CREDENTIAL_PROXY_DEBUG_DIR 开启
 _DEBUG_DIR = os.environ.get('CREDENTIAL_PROXY_DEBUG_DIR', '')
 
@@ -120,7 +123,7 @@ def _responses_event(parsed: dict) -> tuple[str, str | None] | None:
       - 'other'（response.created / completed / output_item.done 等）: delta_text=None
     非 Responses 事件（chat/completions SSE 等）返回 None。
     """
-    evt_type = parsed.get('type')
+    evt_type = parsed.get('type') if isinstance(parsed, dict) else None
     if not isinstance(evt_type, str) or not evt_type.startswith('response.'):
         return None
     kind_map = {
@@ -157,6 +160,13 @@ def _split_safe_hold(content: str, active_t2p: dict) -> tuple[str, str]:
     """
     if not content:
         return '', ''
+    # 完整 token 形态但不在 active_t2p（LLM 幻觉/未知句柄）→ 整体 hold，
+    # 防止 rfind('__') 把完整 token 拆成两段、后续分片重组泄漏 token 字符串
+    m = _FULL_TOKEN_RE.search(content)
+    if m:
+        token_str = m.group(0)
+        if token_str not in active_t2p:
+            return content[: m.start()], token_str
     last_us = content.rfind('__')
     if last_us < 0:
         return content, ''
@@ -198,6 +208,53 @@ class LlmMixin:
 
     # ── Responses API SSE 事件处理 ──
 
+    async def _flush_responses_buf(
+        self,
+        write,
+        event_type: str,
+        buf: str,
+        active_t2p: dict,
+        keep_pending: bool = True,
+    ) -> str:
+        """flush 单个 Responses 缓冲：还原 → safe/pending 分割 → 输出 safe。
+
+        - keep_pending=True（中游）：返回保留的 pending（不完整 token 前缀，
+          等待后续分片）；safe 中无法 hold 的残缺 token 形态被 _PARTIAL_TOKEN_RE 清理
+        - keep_pending=False（流末）：不保留 pending，所有 partial 形态清理后
+          输出残余（如有）
+        """
+        if not buf:
+            return ''
+        restored = self._restore(buf, active_t2p)
+        if not keep_pending:
+            restored = _PARTIAL_TOKEN_RE.sub('', restored)
+            if not restored:
+                return ''
+            try:
+                await write(
+                    _mk_responses_flush_event(event_type, restored).encode('utf-8')
+                )
+            except (
+                ConnectionResetError,
+                ConnectionAbortedError,
+                BrokenPipeError,
+            ):
+                logger.debug('SSE 残余写入失败')
+            return ''
+        safe, pending = _split_safe_hold(restored, active_t2p)
+        if safe:
+            safe = _PARTIAL_TOKEN_RE.sub('', safe)
+        if safe:
+            try:
+                await write(_mk_responses_flush_event(event_type, safe).encode('utf-8'))
+            except (
+                ConnectionResetError,
+                ConnectionAbortedError,
+                BrokenPipeError,
+            ):
+                logger.debug('SSE 残余写入失败')
+        return pending
+
     async def _handle_responses_event(
         self,
         write,
@@ -212,7 +269,8 @@ class LlmMixin:
 
         - output_text / reasoning_text / function_call_arguments 的 delta 事件：
           累积 → _restore → safe/pending 分割 → 保持原格式输出已还原片段
-        - 其他 response.* 事件：先 flush 残留（Responses delta 格式），再原样透传
+        - 其他 response.* 事件：先 flush 各缓冲的 safe 部分（pending 保留等待
+          后续分片，未完成的 token 前缀由流末清理），再原样透传事件行
         """
         kind, delta_text = _responses_event(parsed)
         if kind is None:  # pragma: no cover — 调用方已保证是 Responses 事件
@@ -220,7 +278,8 @@ class LlmMixin:
             return content_buf, reasoning_buf, arg_buf
 
         if kind in ('output_text', 'reasoning_text', 'function_call_arguments'):
-            assert delta_text is not None  # _responses_event 保证 delta 事件携带 str
+            if delta_text is None:  # pragma: no cover — 识别器保证 delta 事件携带 str
+                return content_buf, reasoning_buf, arg_buf
             if kind == 'output_text':
                 content_buf += delta_text
             elif kind == 'reasoning_text':
@@ -244,37 +303,19 @@ class LlmMixin:
                 arg_buf = pending
             return content_buf, reasoning_buf, arg_buf
 
-        # 其他 response.* 事件：flush 残留 → 原样透传
-        if content_buf:
-            restored = self._restore(content_buf, active_t2p)
-            safe, _pending = _split_safe_hold(restored, active_t2p)
-            if safe:
-                await write(
-                    _mk_responses_flush_event(
-                        'response.output_text.delta', safe
-                    ).encode('utf-8')
-                )
-            content_buf = ''
-        if reasoning_buf:
-            restored = self._restore(reasoning_buf, active_t2p)
-            safe, _pending = _split_safe_hold(restored, active_t2p)
-            if safe:
-                await write(
-                    _mk_responses_flush_event(
-                        'response.reasoning_text.delta', safe
-                    ).encode('utf-8')
-                )
-            reasoning_buf = ''
-        if arg_buf:
-            restored = self._restore(arg_buf, active_t2p)
-            safe, _pending = _split_safe_hold(restored, active_t2p)
-            if safe:
-                await write(
-                    _mk_responses_flush_event(
-                        'response.function_call_arguments.delta', safe
-                    ).encode('utf-8')
-                )
-            arg_buf = ''
+        # 其他 response.* 事件：flush 各缓冲 safe 部分（pending 保留）→ 原样透传
+        content_buf = await self._flush_responses_buf(
+            write, 'response.output_text.delta', content_buf, active_t2p
+        )
+        reasoning_buf = await self._flush_responses_buf(
+            write, 'response.reasoning_text.delta', reasoning_buf, active_t2p
+        )
+        arg_buf = await self._flush_responses_buf(
+            write,
+            'response.function_call_arguments.delta',
+            arg_buf,
+            active_t2p,
+        )
         await write((self._restore(line, active_t2p) + '\n').encode('utf-8'))
         return content_buf, reasoning_buf, arg_buf
 
@@ -313,7 +354,7 @@ class LlmMixin:
             _debug_save_eligible = bool(_DEBUG_DIR) and (
                 tail.rstrip('/').endswith('chat/completions')
                 or tail.rstrip('/').endswith('v1/messages')
-                or tail.rstrip('/').endswith('responses')
+                or tail.rstrip('/').endswith('/v1/responses')
             )
             _debug_saved = False  # 标记是否已在 SSE 响应中保存过
 
@@ -443,10 +484,36 @@ class LlmMixin:
 
                                         # [DONE] 标记：先 flush 累积内容
                                         if payload.strip() == '[DONE]':
-                                            await _flush(
-                                                c=content_buf,
-                                                rc=reasoning_buf,
-                                            )
+                                            if is_responses_stream:
+                                                # 兼容网关可能在 responses 流中发 [DONE]：
+                                                # 用 responses 格式 flush，避免 chat 格式污染
+                                                content_buf = (
+                                                    await self._flush_responses_buf(
+                                                        resp.write,
+                                                        'response.output_text.delta',
+                                                        content_buf,
+                                                        active_t2p,
+                                                    )
+                                                )
+                                                reasoning_buf = (
+                                                    await self._flush_responses_buf(
+                                                        resp.write,
+                                                        'response.reasoning_text.delta',
+                                                        reasoning_buf,
+                                                        active_t2p,
+                                                    )
+                                                )
+                                                arg_buf = await self._flush_responses_buf(
+                                                    resp.write,
+                                                    'response.function_call_arguments.delta',
+                                                    arg_buf,
+                                                    active_t2p,
+                                                )
+                                            else:
+                                                await _flush(
+                                                    c=content_buf,
+                                                    rc=reasoning_buf,
+                                                )
                                             await resp.write(
                                                 b'data: [DONE]\n',
                                             )
@@ -517,18 +584,9 @@ class LlmMixin:
                                                     reasoning_buf,
                                                     active_t2p,
                                                 )
-                                                last_us = restored.rfind('__')
-                                                safe = restored
-                                                pending = ''
-                                                if last_us >= 0:
-                                                    suffix = restored[last_us:]
-                                                    maybe_prefix = any(
-                                                        t.startswith(suffix)
-                                                        for t in active_t2p
-                                                    )
-                                                    if maybe_prefix:
-                                                        safe = restored[:last_us]
-                                                        pending = suffix
+                                                safe, pending = _split_safe_hold(
+                                                    restored, active_t2p
+                                                )
                                                 if safe:
                                                     await resp.write(
                                                         _mk_sse_event(
@@ -567,18 +625,9 @@ class LlmMixin:
                                                 )
 
                                                 # 找安全 flush 点
-                                                last_us = restored.rfind('__')
-                                                safe = restored
-                                                pending = ''
-                                                if last_us >= 0:
-                                                    suffix = restored[last_us:]
-                                                    maybe_prefix = any(
-                                                        t.startswith(suffix)
-                                                        for t in active_t2p
-                                                    )
-                                                    if maybe_prefix:
-                                                        safe = restored[:last_us]
-                                                        pending = suffix
+                                                safe, pending = _split_safe_hold(
+                                                    restored, active_t2p
+                                                )
 
                                                 # flush 安全部分
                                                 if safe:
@@ -657,9 +706,8 @@ class LlmMixin:
                                                 except json.JSONDecodeError:
                                                     continue
                                             if reconstructed:
-                                                assert (
-                                                    parsed is not None
-                                                )  # reconstructed 仅由 try 成功路径置位
+                                                if parsed is None:
+                                                    continue  # pragma: no cover
                                                 # ── Responses API 事件（续行重建路径）──
                                                 if _responses_event(parsed) is not None:
                                                     is_responses_stream = True
@@ -670,7 +718,7 @@ class LlmMixin:
                                                     ) = await self._handle_responses_event(
                                                         resp.write,
                                                         parsed,
-                                                        sanitized,
+                                                        'data: ' + sanitized,
                                                         active_t2p,
                                                         content_buf,
                                                         reasoning_buf,
@@ -794,57 +842,27 @@ class LlmMixin:
                             # 流结束：flush 残留（含 partial token 前缀清理）
                             if is_responses_stream:
                                 # ── Responses 流：残留按对应 delta 事件类型输出 ──
-                                if content_buf:
-                                    restored = self._restore(content_buf, active_t2p)
-                                    restored = _PARTIAL_TOKEN_RE.sub('', restored)
-                                    if restored:
-                                        try:
-                                            await resp.write(
-                                                _mk_responses_flush_event(
-                                                    'response.output_text.delta',
-                                                    restored,
-                                                ).encode(),
-                                            )
-                                        except (
-                                            ConnectionResetError,
-                                            ConnectionAbortedError,
-                                            BrokenPipeError,
-                                        ):
-                                            logger.debug('SSE 残余写入失败')
-                                if reasoning_buf:
-                                    restored = self._restore(reasoning_buf, active_t2p)
-                                    restored = _PARTIAL_TOKEN_RE.sub('', restored)
-                                    if restored:
-                                        try:
-                                            await resp.write(
-                                                _mk_responses_flush_event(
-                                                    'response.reasoning_text.delta',
-                                                    restored,
-                                                ).encode(),
-                                            )
-                                        except (
-                                            ConnectionResetError,
-                                            ConnectionAbortedError,
-                                            BrokenPipeError,
-                                        ):
-                                            logger.debug('SSE 残余写入失败')
-                                if arg_buf:
-                                    restored = self._restore(arg_buf, active_t2p)
-                                    restored = _PARTIAL_TOKEN_RE.sub('', restored)
-                                    if restored:
-                                        try:
-                                            await resp.write(
-                                                _mk_responses_flush_event(
-                                                    'response.function_call_arguments.delta',
-                                                    restored,
-                                                ).encode(),
-                                            )
-                                        except (
-                                            ConnectionResetError,
-                                            ConnectionAbortedError,
-                                            BrokenPipeError,
-                                        ):
-                                            logger.debug('SSE 残余写入失败')
+                                await self._flush_responses_buf(
+                                    resp.write,
+                                    'response.output_text.delta',
+                                    content_buf,
+                                    active_t2p,
+                                    keep_pending=False,
+                                )
+                                await self._flush_responses_buf(
+                                    resp.write,
+                                    'response.reasoning_text.delta',
+                                    reasoning_buf,
+                                    active_t2p,
+                                    keep_pending=False,
+                                )
+                                await self._flush_responses_buf(
+                                    resp.write,
+                                    'response.function_call_arguments.delta',
+                                    arg_buf,
+                                    active_t2p,
+                                    keep_pending=False,
+                                )
                             elif content_buf or reasoning_buf:
                                 if content_buf:
                                     content_buf = self._restore(

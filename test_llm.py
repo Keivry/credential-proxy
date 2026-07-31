@@ -41,11 +41,13 @@ mx.SSE_CLIENT_GONE = (
 sys.modules['_matrix'] = mx
 
 from _llm import (
+    _PARTIAL_TOKEN_RE,
     LlmMixin,
     _mk_responses_flush_event,
     _mk_responses_sse_event,
     _mk_sse_event,
     _responses_event,
+    _split_safe_hold,
 )
 from _token import TokenMixin
 
@@ -79,28 +81,8 @@ def holder():
 
 # ═══════════════════════════════════════════════════════════
 # 核心算法：content 累积 → _restore → safe/hold 分割
+# （_split_safe_hold 从 _llm 导入生产版，不维护测试副本）
 # ═══════════════════════════════════════════════════════════
-
-
-def _split_safe_hold(content: str, active_t2p: dict) -> tuple[str, str]:
-    """split content into (safe_to_flush, hold_for_next_chunk).
-
-    返回: (safe, hold)
-    - safe: 可以安全输出（不含可能 token 前缀）
-    - hold: 保留（以 __ 开头且匹配 active token 前缀）
-    """
-    if not content:
-        return '', ''
-
-    last_us = content.rfind('__')
-    if last_us < 0:
-        return content, ''
-
-    suffix = content[last_us:]
-    maybe_prefix = any(t.startswith(suffix) for t in active_t2p)
-    if maybe_prefix:
-        return content[:last_us], suffix
-    return content, ''
 
 
 # ═══════════════════════════════════════════════════════════
@@ -556,6 +538,156 @@ class TestMkSseEvent:
 
 
 # ═══════════════════════════════════════════════════════════
+# 幻觉 token / partial 形态清理（B3/M1 回归）
+# ═══════════════════════════════════════════════════════════
+
+
+class TestPartialTokenCleanup:
+    """_PARTIAL_TOKEN_RE：清理残缺 token 形态，不误伤正常文本。"""
+
+    def test_full_token_not_matched(self):
+        """完整 token 形态（真实 token 已被 _restore 还原；残留=幻觉）→ 流末清理。"""
+        assert _PARTIAL_TOKEN_RE.sub('', 'xx __VG_CRED_000001__') == 'xx '
+
+    def test_partial_forms_cleaned(self):
+        """B3 回归：各种残缺形态都被清理（含任意字符截断）。"""
+        cases = [
+            ('__VG_C', ''),
+            ('__VG_CR', ''),
+            ('__VG_CRE', ''),
+            ('__VG_CRED', ''),
+            ('__VG_CRED_', ''),
+            ('__VG_CRED_000001', ''),
+            ('__VG_CRED_000001_', ''),  # 缺结尾下划线
+        ]
+        for text, expected in cases:
+            assert _PARTIAL_TOKEN_RE.sub('', text) == expected, text
+
+    def test_partial_in_middle_of_text(self):
+        """行尾之外的 partial 不受影响（只在行尾清理）。"""
+        text = '密码是 __VG_CRED_000001_ 后面还有字'
+        assert _PARTIAL_TOKEN_RE.sub('', text) == text
+
+    def test_normal_text_unharmed(self):
+        assert _PARTIAL_TOKEN_RE.sub('', 'foo__bar') == 'foo__bar'
+        assert _PARTIAL_TOKEN_RE.sub('', '普通文本') == '普通文本'
+        assert _PARTIAL_TOKEN_RE.sub('', '__') == '__'
+
+
+class TestHallucinatedTokenHold:
+    """M1 回归：完整但不在 active_t2p 的 token（幻觉）整体 hold，防重组泄漏。"""
+
+    def test_unknown_full_token_held(self):
+        t2p = {'__VG_CRED_000001__': 'pwd'}
+        safe, hold = _split_safe_hold('hi __VG_CRED_999999__', t2p)
+        assert safe == 'hi '
+        assert hold == '__VG_CRED_999999__'
+
+    def test_known_token_restored_already(self):
+        """active 里的 token 已被 _restore 还原为明文，不触发 hold。"""
+        t2p = {'__VG_CRED_000001__': 'pwd'}
+        # 模拟 _restore 后的文本：明文，不含 token
+        safe, hold = _split_safe_hold('hi pwd', t2p)
+        assert safe == 'hi pwd'
+        assert hold == ''
+
+    def test_unknown_token_mid_text(self):
+        """token 不在行尾 → 不触发 hold（rfind 逻辑照常）。"""
+        t2p = {'__VG_CRED_000001__': 'pwd'}
+        safe, hold = _split_safe_hold('__VG_CRED_999999__ hi', t2p)
+        assert safe == '__VG_CRED_999999__ hi'
+        assert hold == ''
+
+    @pytest.mark.asyncio
+    async def test_handler_no_reassembly(self):
+        """handler 层面：幻觉 token 不被重组输出，流末被清理。"""
+        holder = TestSSEHolder()
+        await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        evt = {
+            'type': 'response.output_text.delta',
+            'delta': 'hi __VG_CRED_999999__',
+            'sequence_number': 1,
+        }
+        cb, _, _ = await holder._handle_responses_event(w, evt, '', t2p, '', '', '')
+        # 幻觉 token 整体 hold，不输出 token 字符串
+        assert 'hi ' in w.text
+        assert '__VG_CRED_999999__' not in w.text
+        assert cb == '__VG_CRED_999999__'
+        # 流末清理
+        cb = await holder._flush_responses_buf(
+            w, 'response.output_text.delta', cb, t2p, keep_pending=False
+        )
+        assert cb == ''
+        assert '__VG_CRED' not in w.text
+
+
+class TestResponsesStreamEndFlush:
+    """流末 flush（keep_pending=False）：清理 partial 并输出残余。"""
+
+    @pytest.mark.asyncio
+    async def test_pending_prefix_cleaned_at_end(self):
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        # 模拟流结束时的残留：'text ' + 未完成前缀
+        cb = 'text ' + token[:8]
+        cb = await holder._flush_responses_buf(
+            w, 'response.output_text.delta', cb, t2p, keep_pending=False
+        )
+        assert cb == ''
+        # safe 部分输出，partial 前缀被清理
+        assert 'text ' in w.text
+        assert token[:8] not in w.text
+
+    @pytest.mark.asyncio
+    async def test_pure_prefix_cleaned_empty(self):
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        cb = await holder._flush_responses_buf(
+            w, 'response.output_text.delta', token[:8], t2p, keep_pending=False
+        )
+        assert cb == ''
+        assert w.text == ''  # 纯前缀无残余可输出
+
+    @pytest.mark.asyncio
+    async def test_reasoning_and_arg_buf_at_end(self):
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        await holder._flush_responses_buf(
+            w,
+            'response.reasoning_text.delta',
+            'think ' + token[:8],
+            t2p,
+            keep_pending=False,
+        )
+        await holder._flush_responses_buf(
+            w,
+            'response.function_call_arguments.delta',
+            '{"k":' + token[:8],
+            t2p,
+            keep_pending=False,
+        )
+        events = w.parsed_events()
+        assert any(
+            e['type'] == 'response.reasoning_text.delta' and e['delta'] == 'think '
+            for e in events
+        )
+        assert any(
+            e['type'] == 'response.function_call_arguments.delta'
+            and e['delta'] == '{"k":'
+            for e in events
+        )
+        assert token[:8] not in w.text
+
+
+# ═══════════════════════════════════════════════════════════
 # Responses API SSE 事件（/v1/responses）— 识别器 + 处理器
 # ═══════════════════════════════════════════════════════════
 
@@ -788,8 +920,8 @@ class TestResponsesEventHandler:
             '',
             '',
         )
-        # 残留中的 safe 部分以 Responses delta 事件 flush；partial token 前缀被清理
-        assert cb == ''
+        # 残留中的 safe 部分以 Responses delta 事件 flush；pending 保留等后续分片
+        assert cb == token[:8]  # B1 修复：flush 不再丢弃 pending
         events = w.parsed_events()
         assert any(
             e['type'] == 'response.output_text.delta' and e['delta'] == 'text '
@@ -800,6 +932,44 @@ class TestResponsesEventHandler:
         # completed 事件本身原样透传
         assert 'response.completed' in w.text
         assert 'chat.completion' not in w.text  # 无 chat 格式污染
+
+    @pytest.mark.asyncio
+    async def test_pending_survives_non_delta_event(self):
+        """B1 回归：token 分片跨非 delta 事件（done/completed）时 pending 保留并完成还原。"""
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        mid = len(token) // 2
+        evt1 = {
+            'type': 'response.output_text.delta',
+            'delta': 'text ' + token[:mid],
+            'sequence_number': 1,
+        }
+        done_line = 'data: {"type":"response.output_item.done","sequence_number":2}'
+        cb, _, _ = await holder._handle_responses_event(w, evt1, '', t2p, '', '', '')
+        assert cb == token[:mid]
+        # 非 delta 事件：pending 保留
+        cb, _, _ = await holder._handle_responses_event(
+            w,
+            {'type': 'response.output_item.done', 'sequence_number': 2},
+            done_line,
+            t2p,
+            cb,
+            '',
+            '',
+        )
+        assert cb == token[:mid]
+        # 后续分片完成 token
+        evt2 = {
+            'type': 'response.output_text.delta',
+            'delta': token[mid:] + ' end',
+            'sequence_number': 3,
+        }
+        cb, _, _ = await holder._handle_responses_event(w, evt2, '', t2p, cb, '', '')
+        assert 'p@ssword123' in w.text
+        assert ' end' in w.text
+        assert cb == ''
 
     @pytest.mark.asyncio
     async def test_completed_pure_prefix_flushed_empty(self):
@@ -832,8 +1002,9 @@ class TestResponsesEventHandler:
             '',
             '',
         )
-        assert cb == ''
-        # 只透传 completed，无残留事件
+        # B1 修复后：pending 保留（token 前缀等待后续分片），流末才清理
+        assert cb == token[:8]
+        # 纯前缀残留无 safe 可输出：只透传 completed
         assert w.text == completed_line + '\n'
         assert token[:8] not in w.text
 
