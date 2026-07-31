@@ -188,10 +188,10 @@ class CredentialProxy(
             logger.warning('未找到 .kdbx 文件，凭据获取将不可用')
 
         # ── TPM (TpmMixin 使用) ──
-        self.tpm_primary = os.path.join(TPM_DIR, 'primary.ctx')
+        # primary key 现场派生（tpm2_createprimary），无需持久化 primary.ctx
         self.tpm_seal_pub = os.path.join(TPM_DIR, 'seal.pub')
         self.tpm_seal_priv = os.path.join(TPM_DIR, 'seal.priv')
-        logger.info('TPM primary: %s', self.tpm_primary)
+        logger.info('TPM seal: %s / %s', self.tpm_seal_pub, self.tpm_seal_priv)
 
         # ── Caller 注册表 (RegistryMixin 使用) ──
         self._caller_registry_path = os.path.join(DATA_DIR, 'caller_registry.json')

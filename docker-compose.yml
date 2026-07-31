@@ -1,7 +1,7 @@
 services:
   credential-proxy:
     build: .
-    image: ghcr.io/keivry/credential-proxy:0.8.7
+    image: ghcr.io/keivry/credential-proxy:0.8.8
     container_name: credential-proxy
     restart: unless-stopped
     cap_add:
@@ -40,7 +40,7 @@ services:
       - "8878:8878"        # LLM 代理 — OpenCode
       - "8879:8879"        # LLM 代理 — DeepSeek
     volumes:
-      # TPM 密封文件（primary.ctx + seal.pub + seal.priv）
+      # TPM 密封文件（seal.pub + seal.priv；primary key 每次解封现场派生，无需 primary.ctx）
       - ${TPM_HOST_PATH:-./data/tpm}:/data/tpm:ro
       # KeePass 数据库（.kdbx + .key）
       - ${DB_HOST_PATH:-./data/db}:/data/db:ro

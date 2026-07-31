@@ -269,6 +269,7 @@ cd get && make build  # → /tmp/get-credential-linux-amd64
 
 ## 版本历史
 
+- **v0.8.8** — TPM 解封不再依赖持久化 primary.ctx：primary key 由 storage seed 确定性派生，每次解封前现场 `tpm2_createprimary`（owner + rsa2048 + sha256）生成，`seal.pub/seal.priv` 跨重启永久有效。修复 主机 重启后 `tpm2_load` 报 `integrity check failed (0x1DF)` 导致 TPM 解锁失败的问题（旧 primary.ctx 是 transient context 快照，重启后失效）。部署只需保留 seal.pub/seal.priv
 - **v0.8.7** — 审查修复：① 续行重建路径 non-dict payload（JSON 数组/字符串）防御（与主循环对称，防 SSE 流截断）；② `content_block_stop` / responses `*.done` 事件清理 arg_buf（防跨块/跨 item 拼接伪还原，与 anthropic 的 block_stop 对称）；③ 新增 SSE 主循环集成测试（test_sse_stream_loop.py，真实 aiohttp：跨行数组/字符串透传、[DONE] 标记）
 - **v0.8.6** — LLM 代理适配 Anthropic Messages API（/v1/messages）流式：content_block_delta 的 text_delta / thinking_delta / input_json_delta 分片 token 累积还原，保持 Anthropic 事件格式（`event:` 行 + data 结构）输出；非 content_block_delta 事件（message_start / message_stop 等）原样透传。至此三种协议（chat/completions、responses、messages）流式分片还原齐平
 - **v0.8.5** — LLM 代理适配 OpenAI Responses API（/v1/responses）：SSE delta 事件（output_text / reasoning_text / function_call_arguments）分片 token 累积还原，保持原格式输出，无 chat/completions 格式污染；非流式 JSON 整包还原（原有）。首轮审查修复：flush 保留 pending（跨事件分片还原）、续行重建补 `data: ` 前缀、`_PARTIAL_TOKEN_RE` 覆盖全部残缺形态、幻觉 token 防重组泄漏
