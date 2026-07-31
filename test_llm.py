@@ -39,10 +39,12 @@ mx.SSE_CLIENT_GONE = (
     BrokenPipeError,
 )
 sys.modules['_matrix'] = mx
-
 from _llm import (
     _PARTIAL_TOKEN_RE,
     LlmMixin,
+    _anthropic_event,
+    _mk_anthropic_delta_event,
+    _mk_anthropic_flush_event,
     _mk_responses_flush_event,
     _mk_responses_sse_event,
     _mk_sse_event,
@@ -1080,3 +1082,301 @@ class TestResponsesEventHandler:
         _, _, _ = await holder._handle_responses_event(w, evt, '', {}, '', '', '')
         assert '你好，旅行者' in w.text
         assert '\\u' not in w.text
+
+
+# ═══════════════════════════════════════════════════════════
+# Anthropic Messages API SSE 事件（/v1/messages）— 识别器 + 处理器
+# ═══════════════════════════════════════════════════════════
+
+
+class TestAnthropicEventRecognizer:
+    """_anthropic_event 识别器。"""
+
+    @staticmethod
+    def _evt(payload: dict) -> tuple[str, str | None]:
+        result = _anthropic_event(payload)
+        assert result is not None
+        return result
+
+    def test_text_delta(self):
+        kind, dt = self._evt(
+            {
+                'type': 'content_block_delta',
+                'index': 0,
+                'delta': {'type': 'text_delta', 'text': 'hello'},
+            }
+        )
+        assert kind == 'text'
+        assert dt == 'hello'
+
+    def test_thinking_delta(self):
+        kind, dt = self._evt(
+            {
+                'type': 'content_block_delta',
+                'index': 0,
+                'delta': {'type': 'thinking_delta', 'thinking': 'think...'},
+            }
+        )
+        assert kind == 'thinking'
+        assert dt == 'think...'
+
+    def test_input_json_delta(self):
+        kind, dt = self._evt(
+            {
+                'type': 'content_block_delta',
+                'index': 0,
+                'delta': {'type': 'input_json_delta', 'partial_json': '{"a":'},
+            }
+        )
+        assert kind == 'function_args'
+        assert dt == '{"a":'
+
+    def test_other_delta_type(self):
+        """server_tool_use 等其他 delta 类型 → other。"""
+        kind, dt = self._evt(
+            {
+                'type': 'content_block_delta',
+                'index': 0,
+                'delta': {'type': 'server_tool_use', 'name': 'x'},
+            }
+        )
+        assert kind == 'other'
+        assert dt is None
+
+    def test_delta_not_dict(self):
+        kind, dt = self._evt({'type': 'content_block_delta', 'index': 0})
+        assert kind == 'other'
+        assert dt is None
+
+    def test_non_delta_events_return_none(self):
+        """message_start / content_block_start / message_delta / message_stop 等不含文本，不拦截。"""
+        events = [
+            {'type': 'message_start', 'message': {'id': 'msg_01'}},
+            {'type': 'content_block_start', 'index': 0},
+            {'type': 'content_block_stop', 'index': 0},
+            {'type': 'message_delta', 'delta': {'stop_reason': 'end_turn'}},
+            {'type': 'message_stop'},
+            {'type': 'ping'},
+        ]
+        for evt in events:
+            assert _anthropic_event(evt) is None, evt
+
+    def test_other_protocols_return_none(self):
+        assert _anthropic_event({'choices': [{'delta': {'content': 'x'}}]}) is None
+        assert _anthropic_event({'type': 'response.created'}) is None
+
+
+class TestAnthropicEventFormatting:
+    """Anthropic 事件输出格式保持。"""
+
+    def test_mk_anthropic_delta_event_preserves_structure(self):
+        parsed = {
+            'type': 'content_block_delta',
+            'index': 2,
+            'delta': {'type': 'text_delta', 'text': 'orig', 'signature': 'sig1'},
+        }
+        result = _mk_anthropic_delta_event(parsed, 'restored', 'text')
+        assert result.startswith('data: ')
+        out = json.loads(result[6:].rstrip('\n'))
+        assert out['type'] == 'content_block_delta'
+        assert out['index'] == 2
+        assert out['delta']['type'] == 'text_delta'
+        assert out['delta']['text'] == 'restored'
+        assert out['delta']['signature'] == 'sig1'  # 其他字段保留
+
+    def test_mk_anthropic_flush_event(self):
+        parsed = {'type': 'content_block_delta', 'index': 1}
+        result = _mk_anthropic_flush_event(parsed, 'x', 'thinking')
+        out = json.loads(result[6:].rstrip('\n'))
+        assert out['type'] == 'content_block_delta'
+        assert out['index'] == 1
+        assert out['delta'] == {'type': 'thinking_delta', 'thinking': 'x'}
+
+    def test_mk_anthropic_flush_event_input_json(self):
+        parsed = {'type': 'content_block_delta', 'index': 0}
+        result = _mk_anthropic_flush_event(parsed, '{"k":', 'partial_json')
+        out = json.loads(result[6:].rstrip('\n'))
+        assert out['delta'] == {'type': 'input_json_delta', 'partial_json': '{"k":'}
+
+
+class TestAnthropicEventHandler:
+    """_handle_anthropic_event 核心：分片 token 累积还原。"""
+
+    @pytest.mark.asyncio
+    async def test_text_fragmented_token(self):
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        mid = len(token) // 2
+        evt1 = {
+            'type': 'content_block_delta',
+            'index': 0,
+            'delta': {'type': 'text_delta', 'text': 'secret ' + token[:mid]},
+        }
+        evt2 = {
+            'type': 'content_block_delta',
+            'index': 0,
+            'delta': {'type': 'text_delta', 'text': token[mid:] + ' end'},
+        }
+        cb, _, _ = await holder._handle_anthropic_event(w, evt1, '', t2p, '', '', '')
+        assert 'secret ' in w.text
+        assert cb == token[:mid]
+        cb, _, _ = await holder._handle_anthropic_event(w, evt2, '', t2p, cb, '', '')
+        assert 'p@ssword123' in w.text
+        assert ' end' in w.text
+        assert cb == ''
+
+    @pytest.mark.asyncio
+    async def test_thinking_fragmented_token(self):
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        mid = len(token) // 2
+        evt1 = {
+            'type': 'content_block_delta',
+            'index': 0,
+            'delta': {'type': 'thinking_delta', 'thinking': 'let me ' + token[:mid]},
+        }
+        evt2 = {
+            'type': 'content_block_delta',
+            'index': 0,
+            'delta': {'type': 'thinking_delta', 'thinking': token[mid:] + ' think'},
+        }
+        _, rb, _ = await holder._handle_anthropic_event(w, evt1, '', t2p, '', '', '')
+        assert rb == token[:mid]
+        _, rb, _ = await holder._handle_anthropic_event(w, evt2, '', t2p, '', rb, '')
+        assert 'p@ssword123' in w.text
+        assert rb == ''
+
+    @pytest.mark.asyncio
+    async def test_input_json_fragmented_token(self):
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        mid = len(token) // 2
+        evt1 = {
+            'type': 'content_block_delta',
+            'index': 0,
+            'delta': {
+                'type': 'input_json_delta',
+                'partial_json': '{"pwd": "' + token[:mid],
+            },
+        }
+        evt2 = {
+            'type': 'content_block_delta',
+            'index': 0,
+            'delta': {
+                'type': 'input_json_delta',
+                'partial_json': token[mid:] + '"}',
+            },
+        }
+        _, _, ab = await holder._handle_anthropic_event(w, evt1, '', t2p, '', '', '')
+        assert ab == token[:mid]
+        _, _, ab = await holder._handle_anthropic_event(w, evt2, '', t2p, '', '', ab)
+        assert 'p@ssword123' in w.text
+        assert ab == ''
+
+    @pytest.mark.asyncio
+    async def test_single_event_full_token(self):
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        evt = {
+            'type': 'content_block_delta',
+            'index': 0,
+            'delta': {'type': 'text_delta', 'text': '密码是 ' + token},
+        }
+        cb, _, _ = await holder._handle_anthropic_event(w, evt, '', t2p, '', '', '')
+        assert '密码是 p@ssword123' in w.text
+        assert token not in w.text
+        assert cb == ''
+
+    @pytest.mark.asyncio
+    async def test_other_delta_flushes_and_passthrough(self):
+        """server_tool_use delta：flush 残留（pending 保留）→ 原样透传。"""
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        evt1 = {
+            'type': 'content_block_delta',
+            'index': 0,
+            'delta': {'type': 'text_delta', 'text': 'text ' + token[:8]},
+        }
+        cb, _, _ = await holder._handle_anthropic_event(w, evt1, '', t2p, '', '', '')
+        assert cb == token[:8]
+        tool_line = (
+            'data: {"type": "content_block_delta", "index": 0, '
+            '"delta": {"type": "server_tool_use", "name": "t"}}'
+        )
+        cb, _, _ = await holder._handle_anthropic_event(
+            w,
+            {
+                'type': 'content_block_delta',
+                'index': 0,
+                'delta': {'type': 'server_tool_use', 'name': 't'},
+            },
+            tool_line,
+            t2p,
+            cb,
+            '',
+            '',
+        )
+        # pending 保留，无合成事件（safe 为空）
+        assert cb == token[:8]
+        # 事件行原样透传
+        assert 'server_tool_use' in w.text
+        # 无 chat 格式污染
+        assert 'chat.completion' not in w.text
+        assert 'choices' not in w.text
+
+    @pytest.mark.asyncio
+    async def test_message_start_passthrough(self):
+        """非 content_block_delta 事件：识别器返回 None，handler 原样透传。"""
+        holder = TestSSEHolder()
+        await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        evt = {'type': 'message_start', 'message': {'id': 'msg_01', 'content': []}}
+        assert _anthropic_event(evt) is None
+        w = FakeWriter()
+        cb, rb, ab = await holder._handle_anthropic_event(
+            w, evt, 'data: {"type":"message_start"}', t2p, '', '', ''
+        )
+        assert w.text == 'data: {"type":"message_start"}\n'
+        assert (cb, rb, ab) == ('', '', '')
+
+    @pytest.mark.asyncio
+    async def test_stream_end_flush_cleans_partial(self):
+        """流末 flush（keep_pending=False）：清理 partial 并输出残余。"""
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        _dummy = {'type': 'content_block_delta', 'index': 0}
+        cb = await holder._flush_anthropic_buf(
+            w, _dummy, 'text', 'text ' + token[:8], t2p, keep_pending=False
+        )
+        assert cb == ''
+        assert 'text ' in w.text
+        assert token[:8] not in w.text
+
+    @pytest.mark.asyncio
+    async def test_no_pollution_when_no_token(self):
+        """无 token 时普通文本按 Anthropic 格式透传。"""
+        holder = TestSSEHolder()
+        w = FakeWriter()
+        evt = {
+            'type': 'content_block_delta',
+            'index': 0,
+            'delta': {'type': 'text_delta', 'text': '你好世界'},
+        }
+        cb, _, _ = await holder._handle_anthropic_event(w, evt, '', {}, '', '', '')
+        events = w.parsed_events()
+        assert len(events) == 1
+        assert events[0]['type'] == 'content_block_delta'
+        assert events[0]['delta']['text'] == '你好世界'
+        assert cb == ''

@@ -152,6 +152,69 @@ def _mk_responses_flush_event(event_type: str, delta_text: str) -> str:
     return 'data: ' + json.dumps(out, ensure_ascii=False) + '\n'
 
 
+# Anthropic delta 类型 → (字段, 输出时使用的 delta.type)
+_ANTHROPIC_DELTA_FIELDS = {
+    'text': ('text', 'text_delta'),
+    'thinking': ('thinking', 'thinking_delta'),
+    'function_args': ('partial_json', 'input_json_delta'),
+}
+# 字段名 → delta.type（_mk_anthropic_flush_event 用）
+_ANTHROPIC_FIELD_DELTA_TYPE = {
+    field: dtype for _kind, (field, dtype) in _ANTHROPIC_DELTA_FIELDS.items()
+}
+
+
+def _anthropic_event(parsed: dict) -> tuple[str, str | None] | None:
+    """识别 Anthropic Messages API SSE 事件（/v1/messages）。
+
+    返回 (kind, delta_text)：
+      kind ∈ {'text', 'thinking', 'function_args', 'other'}
+      - 'text': content_block_delta 的 text_delta → delta.text
+      - 'thinking': content_block_delta 的 thinking_delta → delta.thinking
+      - 'function_args': content_block_delta 的 input_json_delta → delta.partial_json
+      - 'other': 其他 content_block_delta 类型（server_tool_use 等）→ delta_text=None
+    非 Anthropic 事件（chat/completions、responses SSE 等）返回 None。
+    注：message_start / content_block_start / message_delta / message_stop 等
+    不含文本 delta 的事件返回 None，走整行透传（原样保留，无需还原）。
+    """
+    evt_type = parsed.get('type') if isinstance(parsed, dict) else None
+    if evt_type != 'content_block_delta':
+        return None
+    delta = parsed.get('delta')
+    if not isinstance(delta, dict):
+        return 'other', None
+    dtype = delta.get('type')
+    if dtype == 'text_delta' and isinstance(delta.get('text'), str):
+        return 'text', delta['text']
+    if dtype == 'thinking_delta' and isinstance(delta.get('thinking'), str):
+        return 'thinking', delta['thinking']
+    if dtype == 'input_json_delta' and isinstance(delta.get('partial_json'), str):
+        return 'function_args', delta['partial_json']
+    return 'other', None
+
+
+def _mk_anthropic_delta_event(parsed: dict, text: str, field: str) -> str:
+    """保持 Anthropic 事件结构，仅替换 delta 文本字段（已还原文本）。
+
+    field ∈ {'text', 'thinking', 'partial_json'} 对应三种 delta 类型。
+    """
+    out = dict(parsed)
+    out['delta'] = dict(parsed['delta'])
+    out['delta'][field] = text
+    return 'data: ' + json.dumps(out, ensure_ascii=False) + '\n'
+
+
+def _mk_anthropic_flush_event(parsed: dict, text: str, field: str) -> str:
+    """构造 Anthropic content_block_delta 事件（中游/流末 flush 残留用）。"""
+    delta_type = _ANTHROPIC_FIELD_DELTA_TYPE[field]
+    out = {
+        'type': 'content_block_delta',
+        'index': parsed.get('index', 0),
+        'delta': {'type': delta_type, field: text},
+    }
+    return 'data: ' + json.dumps(out, ensure_ascii=False) + '\n'
+
+
 def _split_safe_hold(content: str, active_t2p: dict) -> tuple[str, str]:
     """将累积文本分割为 (safe, hold)。
 
@@ -206,6 +269,123 @@ def _sanitize_json(text: str) -> str:
 
 class LlmMixin:
     """Mixin: LLM 反向代理，脱敏/还原。"""
+
+    # ── Anthropic Messages API SSE 事件处理 ──
+
+    async def _flush_anthropic_buf(
+        self,
+        write,
+        parsed: dict,
+        field: str,
+        buf: str,
+        active_t2p: dict,
+        keep_pending: bool = True,
+    ) -> str:
+        """flush 单个 Anthropic 缓冲：还原 → safe/pending 分割 → 输出 safe。
+
+        - keep_pending=True（中游）：返回保留的 pending（不完整 token 前缀，
+          等待后续分片）；safe 中无法 hold 的残缺 token 形态被 _PARTIAL_TOKEN_RE 清理
+        - keep_pending=False（流末）：不保留 pending，所有 partial 形态清理后
+          输出残余（如有）
+        """
+        if not buf:
+            return ''
+        restored = self._restore(buf, active_t2p)
+        if not keep_pending:
+            restored = _PARTIAL_TOKEN_RE.sub('', restored)
+            if not restored:
+                return ''
+            try:
+                await write(
+                    _mk_anthropic_flush_event(parsed, restored, field).encode('utf-8')
+                )
+            except (
+                ConnectionResetError,
+                ConnectionAbortedError,
+                BrokenPipeError,
+            ):
+                logger.debug('SSE 残余写入失败')
+            return ''
+        safe, pending = _split_safe_hold(restored, active_t2p)
+        if safe:
+            safe = _PARTIAL_TOKEN_RE.sub('', safe)
+        if safe:
+            try:
+                await write(
+                    _mk_anthropic_flush_event(parsed, safe, field).encode('utf-8')
+                )
+            except (
+                ConnectionResetError,
+                ConnectionAbortedError,
+                BrokenPipeError,
+            ):
+                logger.debug('SSE 残余写入失败')
+        return pending
+
+    async def _handle_anthropic_event(
+        self,
+        write,
+        parsed: dict,
+        line: str,
+        active_t2p: dict,
+        content_buf: str,
+        reasoning_buf: str,
+        arg_buf: str,
+    ) -> tuple[str, str, str]:
+        """处理单个 Anthropic Messages API 事件，返回更新后的 (content_buf, reasoning_buf, arg_buf)。
+
+        - content_block_delta 文本事件（text_delta / thinking_delta / input_json_delta）：
+          累积 → _restore → safe/pending 分割 → 保持 Anthropic 格式输出已还原片段
+        - 其他 content_block_delta（server_tool_use 等）：flush 各缓冲 safe 部分
+          （pending 保留等待后续分片，未完成的 token 前缀由流末清理），再原样透传
+        """
+        event = _anthropic_event(parsed)
+        if event is None:  # pragma: no cover — 调用方已保证是 Anthropic 事件
+            await write((self._restore(line, active_t2p) + '\n').encode('utf-8'))
+            return content_buf, reasoning_buf, arg_buf
+        kind, delta_text = event
+
+        if kind in ('text', 'thinking', 'function_args'):
+            if delta_text is None:  # pragma: no cover — 识别器保证 delta 事件携带 str
+                return content_buf, reasoning_buf, arg_buf
+            field = _ANTHROPIC_DELTA_FIELDS[kind][0]
+            if kind == 'text':
+                content_buf += delta_text
+            elif kind == 'thinking':
+                reasoning_buf += delta_text
+            else:
+                arg_buf += delta_text
+            buf = (
+                content_buf
+                if kind == 'text'
+                else (reasoning_buf if kind == 'thinking' else arg_buf)
+            )
+            restored = self._restore(buf, active_t2p)
+            safe, pending = _split_safe_hold(restored, active_t2p)
+            if safe:
+                await write(
+                    _mk_anthropic_delta_event(parsed, safe, field).encode('utf-8')
+                )
+            if kind == 'text':
+                content_buf = pending
+            elif kind == 'thinking':
+                reasoning_buf = pending
+            else:
+                arg_buf = pending
+            return content_buf, reasoning_buf, arg_buf
+
+        # 其他 content_block_delta：flush 各缓冲 safe 部分（pending 保留）→ 原样透传
+        content_buf = await self._flush_anthropic_buf(
+            write, parsed, 'text', content_buf, active_t2p
+        )
+        reasoning_buf = await self._flush_anthropic_buf(
+            write, parsed, 'thinking', reasoning_buf, active_t2p
+        )
+        arg_buf = await self._flush_anthropic_buf(
+            write, parsed, 'partial_json', arg_buf, active_t2p
+        )
+        await write((self._restore(line, active_t2p) + '\n').encode('utf-8'))
+        return content_buf, reasoning_buf, arg_buf
 
     # ── Responses API SSE 事件处理 ──
 
@@ -422,8 +602,11 @@ class LlmMixin:
                                 ''  # 累积 delta.content 片段，O(1) 单字符串追加
                             )
                             reasoning_buf = ''  # 累积 delta.reasoning_content 片段
-                            arg_buf = ''  # 累积 responses function_call_arguments 片段
+                            arg_buf = ''  # 累积 responses function_call_arguments / anthropic partial_json 片段
                             is_responses_stream = False  # 本流是否 Responses API SSE
+                            is_anthropic_stream = (
+                                False  # 本流是否 Anthropic Messages API SSE
+                            )
                             byte_buf = bytearray()
                             resp_log_path = None
 
@@ -510,6 +693,40 @@ class LlmMixin:
                                                     arg_buf,
                                                     active_t2p,
                                                 )
+                                            elif is_anthropic_stream:
+                                                # 兼容网关可能在 anthropic 流中发 [DONE]：
+                                                # 用 anthropic 格式 flush，避免 chat 格式污染
+                                                _dummy = {
+                                                    'type': 'content_block_delta',
+                                                    'index': 0,
+                                                }
+                                                content_buf = (
+                                                    await self._flush_anthropic_buf(
+                                                        resp.write,
+                                                        _dummy,
+                                                        'text',
+                                                        content_buf,
+                                                        active_t2p,
+                                                    )
+                                                )
+                                                reasoning_buf = (
+                                                    await self._flush_anthropic_buf(
+                                                        resp.write,
+                                                        _dummy,
+                                                        'thinking',
+                                                        reasoning_buf,
+                                                        active_t2p,
+                                                    )
+                                                )
+                                                arg_buf = (
+                                                    await self._flush_anthropic_buf(
+                                                        resp.write,
+                                                        _dummy,
+                                                        'partial_json',
+                                                        arg_buf,
+                                                        active_t2p,
+                                                    )
+                                                )
                                             else:
                                                 await _flush(
                                                     c=content_buf,
@@ -570,6 +787,24 @@ class LlmMixin:
                                                     reasoning_buf,
                                                     arg_buf,
                                                 ) = await self._handle_responses_event(
+                                                    resp.write,
+                                                    parsed,
+                                                    line,
+                                                    active_t2p,
+                                                    content_buf,
+                                                    reasoning_buf,
+                                                    arg_buf,
+                                                )
+                                                continue
+
+                                            # ── Anthropic Messages API 事件（/v1/messages SSE）──
+                                            if _anthropic_event(parsed) is not None:
+                                                is_anthropic_stream = True
+                                                (
+                                                    content_buf,
+                                                    reasoning_buf,
+                                                    arg_buf,
+                                                ) = await self._handle_anthropic_event(
                                                     resp.write,
                                                     parsed,
                                                     line,
@@ -736,6 +971,23 @@ class LlmMixin:
                                                         arg_buf,
                                                     )
                                                     continue
+                                                # ── Anthropic Messages API 事件（续行重建路径）──
+                                                if _anthropic_event(parsed) is not None:
+                                                    is_anthropic_stream = True
+                                                    (
+                                                        content_buf,
+                                                        reasoning_buf,
+                                                        arg_buf,
+                                                    ) = await self._handle_anthropic_event(
+                                                        resp.write,
+                                                        parsed,
+                                                        'data: ' + sanitized,
+                                                        active_t2p,
+                                                        content_buf,
+                                                        reasoning_buf,
+                                                        arg_buf,
+                                                    )
+                                                    continue
                                                 choices = parsed.get(
                                                     'choices',
                                                     [],
@@ -870,6 +1122,33 @@ class LlmMixin:
                                 await self._flush_responses_buf(
                                     resp.write,
                                     'response.function_call_arguments.delta',
+                                    arg_buf,
+                                    active_t2p,
+                                    keep_pending=False,
+                                )
+                            elif is_anthropic_stream:
+                                # ── Anthropic 流：残留按对应 delta 类型输出 ──
+                                _dummy = {'type': 'content_block_delta', 'index': 0}
+                                await self._flush_anthropic_buf(
+                                    resp.write,
+                                    _dummy,
+                                    'text',
+                                    content_buf,
+                                    active_t2p,
+                                    keep_pending=False,
+                                )
+                                await self._flush_anthropic_buf(
+                                    resp.write,
+                                    _dummy,
+                                    'thinking',
+                                    reasoning_buf,
+                                    active_t2p,
+                                    keep_pending=False,
+                                )
+                                await self._flush_anthropic_buf(
+                                    resp.write,
+                                    _dummy,
+                                    'partial_json',
                                     arg_buf,
                                     active_t2p,
                                     keep_pending=False,
