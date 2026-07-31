@@ -261,7 +261,7 @@ GitHub Actions 自动处理：
 
 ```bash
 # Docker
-docker build -t ghcr.io/keivry/credential-proxy:0.8.4 .
+docker build -t ghcr.io/keivry/credential-proxy:0.8.5 .
 
 # Go binary
 cd get && make build  # → /tmp/get-credential-linux-amd64
@@ -269,6 +269,7 @@ cd get && make build  # → /tmp/get-credential-linux-amd64
 
 ## 版本历史
 
+- **v0.8.5** — LLM 代理适配 OpenAI Responses API（/v1/responses）：SSE delta 事件（output_text / reasoning_text / function_call_arguments）分片 token 累积还原，保持原格式输出，无 chat/completions 格式污染；非流式 JSON 整包还原（原有）
 - **v0.8.4** — `--raw` 安全加固：禁止终端直接调用，强制脚本内使用
 - **v0.8.0** — 三因子认证；移除 Token 降级系统；`get register --script-path`
 - **v0.7.0** — Caller 注册表 + 自动放行 + 哈希变更通知

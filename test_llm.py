@@ -40,7 +40,13 @@ mx.SSE_CLIENT_GONE = (
 )
 sys.modules['_matrix'] = mx
 
-from _llm import LlmMixin, _mk_sse_event
+from _llm import (
+    LlmMixin,
+    _mk_responses_flush_event,
+    _mk_responses_sse_event,
+    _mk_sse_event,
+    _responses_event,
+)
 from _token import TokenMixin
 
 # ═══════════════════════════════════════════════════════════
@@ -547,3 +553,337 @@ class TestMkSseEvent:
         parsed = json.loads(data)
         assert 'choices' in parsed
         assert isinstance(parsed['choices'], list)
+
+
+# ═══════════════════════════════════════════════════════════
+# Responses API SSE 事件（/v1/responses）— 识别器 + 处理器
+# ═══════════════════════════════════════════════════════════
+
+
+class FakeWriter:
+    """收集写入字节的假 SSE writer（模拟 resp.write）。"""
+
+    def __init__(self):
+        self.chunks: list[bytes] = []
+
+    async def __call__(self, data: bytes):
+        self.chunks.append(data)
+
+    @property
+    def text(self) -> str:
+        return b''.join(self.chunks).decode('utf-8')
+
+    def parsed_events(self) -> list[dict]:
+        """解析输出中所有 data: 事件的 JSON payload。"""
+        events = []
+        for line in self.text.splitlines():
+            if line.startswith('data: '):
+                events.append(json.loads(line[6:]))
+        return events
+
+
+class TestResponsesEventRecognizer:
+    """_responses_event 识别器。"""
+
+    @staticmethod
+    def _evt(payload: dict) -> tuple[str, str | None]:
+        """解包识别结果（测试场景保证非 None）。"""
+        result = _responses_event(payload)
+        assert result is not None
+        return result
+
+    def test_output_text_delta(self):
+        kind, dt = self._evt({'type': 'response.output_text.delta', 'delta': 'hi'})
+        assert kind == 'output_text'
+        assert dt == 'hi'
+
+    def test_reasoning_text_delta(self):
+        kind, dt = self._evt(
+            {'type': 'response.reasoning_text.delta', 'delta': 'think'}
+        )
+        assert kind == 'reasoning_text'
+        assert dt == 'think'
+
+    def test_function_call_arguments_delta(self):
+        kind, dt = self._evt(
+            {
+                'type': 'response.function_call_arguments.delta',
+                'delta': '{"city":',
+            }
+        )
+        assert kind == 'function_call_arguments'
+        assert dt == '{"city":'
+
+    def test_completed_is_other(self):
+        kind, dt = self._evt({'type': 'response.completed'})
+        assert kind == 'other'
+        assert dt is None
+
+    def test_created_is_other(self):
+        kind, _ = self._evt({'type': 'response.created'})
+        assert kind == 'other'
+
+    def test_output_item_done_is_other(self):
+        kind, dt = self._evt({'type': 'response.output_item.done'})
+        assert kind == 'other'
+        assert dt is None
+
+    def test_chat_completions_event_returns_none(self):
+        """chat/completions SSE 事件（无 type 或非 response.*）→ None。"""
+        assert _responses_event({'choices': [{'delta': {'content': 'x'}}]}) is None
+        assert _responses_event({'object': 'chat.completion.chunk'}) is None
+
+    def test_delta_not_string_falls_back_to_other(self):
+        """delta 字段非字符串（异常/边界）→ 当作普通事件。"""
+        kind, dt = self._evt({'type': 'response.output_text.delta', 'delta': 123})
+        assert kind == 'other'
+        assert dt is None
+
+    def test_missing_delta_falls_back_to_other(self):
+        kind, dt = self._evt({'type': 'response.output_text.delta'})
+        assert kind == 'other'
+        assert dt is None
+
+
+class TestResponsesEventFormatting:
+    """Responses 事件输出格式。"""
+
+    def test_mk_responses_sse_event_preserves_fields(self):
+        evt = {
+            'type': 'response.output_text.delta',
+            'delta': 'x',
+            'sequence_number': 5,
+        }
+        result = _mk_responses_sse_event(evt, 'restored')
+        assert result.startswith('data: ')
+        assert result.endswith('\n')
+        parsed = json.loads(result[6:].rstrip('\n'))
+        assert parsed['type'] == 'response.output_text.delta'
+        assert parsed['delta'] == 'restored'
+        assert parsed['sequence_number'] == 5
+
+    def test_mk_responses_flush_event(self):
+        result = _mk_responses_flush_event('response.output_text.delta', 'x')
+        parsed = json.loads(result[6:].rstrip('\n'))
+        assert parsed == {'type': 'response.output_text.delta', 'delta': 'x'}
+
+
+class TestResponsesEventHandler:
+    """_handle_responses_event：分片 token 累积还原 + 保持原格式。"""
+
+    @pytest.mark.asyncio
+    async def test_single_event_full_token_restore(self):
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        evt = {
+            'type': 'response.output_text.delta',
+            'delta': f'secret is {token}',
+            'sequence_number': 1,
+        }
+        cb, _, _ = await holder._handle_responses_event(w, evt, '', t2p, '', '', '')
+        assert 'secret is p@ssword123' in w.text
+        assert token not in w.text  # 无残留 token
+        assert cb == ''  # 完整 token 后无 pending
+
+    @pytest.mark.asyncio
+    async def test_fragmented_token_accumulates(self):
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        mid = len(token) // 2
+        evt1 = {
+            'type': 'response.output_text.delta',
+            'delta': 'prefix ' + token[:mid],
+            'sequence_number': 1,
+        }
+        evt2 = {
+            'type': 'response.output_text.delta',
+            'delta': token[mid:] + ' suffix',
+            'sequence_number': 2,
+        }
+        cb, rb, ab = await holder._handle_responses_event(w, evt1, '', t2p, '', '', '')
+        # 第一片：safe='prefix '，pending=token 前缀（restore 后仍为不完整 token）
+        assert 'prefix ' in w.text
+        assert cb == token[:mid]
+        cb, rb, ab = await holder._handle_responses_event(w, evt2, '', t2p, cb, rb, ab)
+        assert 'p@ssword123' in w.text
+        assert ' suffix' in w.text
+        assert cb == ''
+        # 输出事件保持 Responses 格式（非 chat.completion.chunk）
+        events = w.parsed_events()
+        assert all(e['type'] == 'response.output_text.delta' for e in events)
+        assert 'choices' not in w.text
+
+    @pytest.mark.asyncio
+    async def test_reasoning_text_fragmented(self):
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        mid = len(token) // 2
+        evt1 = {
+            'type': 'response.reasoning_text.delta',
+            'delta': token[:mid],
+            'sequence_number': 1,
+        }
+        evt2 = {
+            'type': 'response.reasoning_text.delta',
+            'delta': token[mid:],
+            'sequence_number': 2,
+        }
+        cb, rb, ab = await holder._handle_responses_event(w, evt1, '', t2p, '', '', '')
+        assert rb == token[:mid]
+        cb, rb, ab = await holder._handle_responses_event(w, evt2, '', t2p, cb, rb, ab)
+        assert 'p@ssword123' in w.text
+        assert rb == ''
+
+    @pytest.mark.asyncio
+    async def test_function_call_arguments_fragmented(self):
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        mid = len(token) // 2
+        evt1 = {
+            'type': 'response.function_call_arguments.delta',
+            'delta': token[:mid],
+            'sequence_number': 1,
+        }
+        evt2 = {
+            'type': 'response.function_call_arguments.delta',
+            'delta': token[mid:] + '}',
+            'sequence_number': 2,
+        }
+        cb, rb, ab = await holder._handle_responses_event(w, evt1, '', t2p, '', '', '')
+        assert ab == token[:mid]
+        cb, rb, ab = await holder._handle_responses_event(w, evt2, '', t2p, cb, rb, ab)
+        assert 'p@ssword123' in w.text
+        assert ab == ''
+
+    @pytest.mark.asyncio
+    async def test_completed_flushes_pending_and_passthrough(self):
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        evt1 = {
+            'type': 'response.output_text.delta',
+            'delta': 'text ' + token[:8],
+            'sequence_number': 1,
+        }
+        cb, _, _ = await holder._handle_responses_event(w, evt1, '', t2p, '', '', '')
+        # 第一片：safe='text ' 已输出，content_buf 只保留 pending（token 前缀）
+        assert cb == token[:8]
+        assert 'text ' in w.text
+        completed_line = 'data: {"type":"response.completed","sequence_number":2}'
+        cb, _, _ = await holder._handle_responses_event(
+            w,
+            {'type': 'response.completed', 'sequence_number': 2},
+            completed_line,
+            t2p,
+            cb,
+            '',
+            '',
+        )
+        # 残留中的 safe 部分以 Responses delta 事件 flush；partial token 前缀被清理
+        assert cb == ''
+        events = w.parsed_events()
+        assert any(
+            e['type'] == 'response.output_text.delta' and e['delta'] == 'text '
+            for e in events
+        )
+        # 不完整的 token 前缀不应泄漏
+        assert token[:8] not in w.text
+        # completed 事件本身原样透传
+        assert 'response.completed' in w.text
+        assert 'chat.completion' not in w.text  # 无 chat 格式污染
+
+    @pytest.mark.asyncio
+    async def test_completed_pure_prefix_flushed_empty(self):
+        """残留为纯 token 前缀时 flush 无输出（前缀被清理），completed 仍透传。"""
+        holder = TestSSEHolder()
+        token = await holder._register_secret('p@ssword123')
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        cb, _, _ = await holder._handle_responses_event(
+            w,
+            {
+                'type': 'response.output_text.delta',
+                'delta': token[:8],
+                'sequence_number': 1,
+            },
+            '',
+            t2p,
+            '',
+            '',
+            '',
+        )
+        assert cb == token[:8]
+        completed_line = 'data: {"type":"response.completed","sequence_number":2}'
+        cb, _, _ = await holder._handle_responses_event(
+            w,
+            {'type': 'response.completed', 'sequence_number': 2},
+            completed_line,
+            t2p,
+            cb,
+            '',
+            '',
+        )
+        assert cb == ''
+        # 只透传 completed，无残留事件
+        assert w.text == completed_line + '\n'
+        assert token[:8] not in w.text
+
+    @pytest.mark.asyncio
+    async def test_other_event_passthrough_no_pollution(self):
+        holder = TestSSEHolder()
+        await holder._register_secret(
+            'p@ssword123'
+        )  # 注册秘密，确保 active_t2p 非空路径
+        t2p = dict(holder.token_to_pwd)
+        w = FakeWriter()
+        line = 'data: {"type":"response.created","sequence_number":0}'
+        _, _, _ = await holder._handle_responses_event(
+            w,
+            {'type': 'response.created', 'sequence_number': 0},
+            line,
+            t2p,
+            '',
+            '',
+            '',
+        )
+        assert w.text == line + '\n'
+        assert 'choices' not in w.text
+
+    @pytest.mark.asyncio
+    async def test_no_token_plain_text(self):
+        holder = TestSSEHolder()
+        w = FakeWriter()
+        evt = {
+            'type': 'response.output_text.delta',
+            'delta': 'hello world',
+            'sequence_number': 1,
+        }
+        cb, _, _ = await holder._handle_responses_event(w, evt, '', {}, '', '', '')
+        events = w.parsed_events()
+        assert len(events) == 1
+        assert events[0]['type'] == 'response.output_text.delta'
+        assert events[0]['delta'] == 'hello world'
+        assert cb == ''
+
+    @pytest.mark.asyncio
+    async def test_unicode_content_roundtrip(self):
+        """中文内容不转义（ensure_ascii=False），保证下游可读。"""
+        holder = TestSSEHolder()
+        w = FakeWriter()
+        evt = {
+            'type': 'response.output_text.delta',
+            'delta': '你好，旅行者',
+            'sequence_number': 1,
+        }
+        _, _, _ = await holder._handle_responses_event(w, evt, '', {}, '', '', '')
+        assert '你好，旅行者' in w.text
+        assert '\\u' not in w.text
