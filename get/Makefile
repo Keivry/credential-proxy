@@ -1,6 +1,6 @@
 .PHONY: build clean install
 
-BINARY = get
+BINARY ?= ./get-credential-linux-amd64
 
 build:
 	go build -o $(BINARY) .

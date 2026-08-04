@@ -17,9 +17,9 @@ services:
       - MATRIX_ACCESS_TOKEN=${MATRIX_ACCESS_TOKEN:?MATRIX_ACCESS_TOKEN is required}
 
       # ── 三因子认证（v0.8.0+，强烈建议开启）──
-      # 开启后仅 get 可通过认证直接通信，curl/Python 直调被 403 拒绝。
+      # 开启后仅 get 二进制可通过认证直接通信，curl/Python 直调被 403 拒绝。
       # GET_BINARY_HASH: get 二进制的 SHA256 哈希值
-      #   sha256sum get | cut -d' ' -f1
+      #   sha256sum $(which get) | cut -d' ' -f1
       # GET_BINARY_SECRET: 部署密钥（Hermes 容器与 Proxy 容器共享）
       #   openssl rand -hex 32
       # 两个都必须设置才生效；都为空时跳过认证（兼容/开发模式）。

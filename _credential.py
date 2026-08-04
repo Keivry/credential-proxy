@@ -240,7 +240,7 @@ class CredentialMixin:
             return web.json_response(
                 {
                     'error': (
-                        '仅允许通过 get 获取凭据（缺少 caller_hash）。'
+                        '仅允许通过 get 二进制获取凭据（缺少 caller_hash）。'
                         '使用: get credential <条目> [字段]'
                     ),
                 },
