@@ -633,6 +633,7 @@ class LlmMixin:
                             )
                             byte_buf = bytearray()
                             resp_log_path = None
+                            sse_event_count = 0  # 空流检测：统计 data 事件数
 
                             async def _flush(
                                 c: str = '',
@@ -689,6 +690,8 @@ class LlmMixin:
 
                                         payload = line[5:]
                                         payload = payload.removeprefix(' ')
+
+                                        sse_event_count += 1
 
                                         # [DONE] 标记：先 flush 累积内容
                                         if payload.strip() == '[DONE]':
@@ -1242,6 +1245,14 @@ class LlmMixin:
                                     BrokenPipeError,
                                 ):
                                     logger.debug('SSE 残余写入失败')
+                            if sse_event_count == 0 and upstream_resp.status == 200:
+                                logger.warning(
+                                    'LLM 上游返回空流(0 data events, %d bytes): %s %s '
+                                    '(client may see EmptyStreamError)',
+                                    len(byte_buf),
+                                    request.method,
+                                    target_url,
+                                )
                             try:
                                 await resp.write_eof()
                             except (
@@ -1256,6 +1267,7 @@ class LlmMixin:
                             # ── Fast path: active_t2p 为空，逐行 text-level 还原 ──
                             byte_buf = bytearray()
                             resp_log_path = None
+                            fast_sse_event_count = 0
                             try:
                                 async for chunk in upstream_resp.content.iter_chunked(
                                     SSE_CHUNK_SIZE,
@@ -1278,6 +1290,8 @@ class LlmMixin:
                                         if line.startswith('data:'):
                                             payload = line[5:]
                                             payload = payload.removeprefix(' ')
+
+                                            fast_sse_event_count += 1
 
                                             if resp_log_path:
                                                 # 后续 event 保存 response 行
@@ -1361,6 +1375,14 @@ class LlmMixin:
                                     BrokenPipeError,
                                 ):
                                     logger.debug('SSE 残余写入失败')
+                            if fast_sse_event_count == 0 and upstream_resp.status == 200:
+                                logger.warning(
+                                    'LLM 上游返回空流(0 data events, %d bytes): %s %s '
+                                    '(client may see EmptyStreamError)',
+                                    len(byte_buf),
+                                    request.method,
+                                    target_url,
+                                )
                             try:
                                 await resp.write_eof()
                             except (
@@ -1375,6 +1397,18 @@ class LlmMixin:
                     else:
                         # ── 非流式 ──
                         resp_body = await upstream_resp.read()
+
+                        if not resp_body and upstream_resp.status == 200 and (
+                            tail.rstrip('/').endswith('chat/completions')
+                            or tail.rstrip('/').endswith('v1/messages')
+                        ):
+                            logger.warning(
+                                'LLM 上游返回空响应体(%d bytes): %s %s '
+                                '(client may see EmptyStreamError)',
+                                len(resp_body),
+                                request.method,
+                                target_url,
+                            )
 
                         if _debug_save_eligible:
                             try:
