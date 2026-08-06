@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-08-06
+goal: 将 credential-proxy 升级为通用 LLM 隐私保护与安全审计中间层：1) 不止 proxy
+  获取的凭据，其他隐私敏感信息（PII）也脱敏；2) 对 LLM 返回文本做安全审计，危险脚本/工具调用需审批

@@ -1,0 +1,41 @@
+schema: spec-driven
+
+# Project context (optional)
+# This is shown to AI when creating artifacts.
+# Add your tech stack, conventions, style guides, domain knowledge, etc.
+context: |
+  Tech stack: Python 3.12+ (aiohttp, asyncio, Mixin 模式多文件拆分), Go CLI (get/), Docker 部署
+  项目：credential-proxy — Matrix 审批 + TPM 解封 + KeePassXC 后端的凭据代理 + LLM 反向代理
+  核心文件：proxy.py 主入口 + _token.py(凭据脱敏/还原) + _tpm.py + _matrix.py(审批) + _credential.py(凭据API) + _registry.py + _llm.py(LLM 代理+SSE 流式+JSON-aware token 还原, 1462 行) + _sse.py
+  轻量入口：llm-proxy-only.py / credential-proxy-only.py（仅 aiohttp 依赖）
+  已支持协议：OpenAI chat/completions、Anthropic /v1/messages、Responses API，SSE 流式全适配（含 tool call 分片 arg_buf 累积、content_block_stop/output_item.done 完成事件）
+  现有脱敏机制：被动式——仅替换通过 /credential API 注册的秘密（pwd_to_token/token_to_pwd 映射，__VG_CRED_NNNNNN__ token 格式）
+  现有审批机制：Matrix reactions（✅/❎）+ pending requests + _ask
+  测试：pytest 132 passed，ruff check + format --check 必须通过
+  代码规范：Mixin 模式、锁外网络 I/O、快照安全、Python 3.10 f-string 引号兼容（部署主机 Ubuntu 22.04）、_redact/_restore 按长度降序替换
+  部署：Docker 容器 ghcr.io/keivry/credential-proxy，LLM_8878/LLM_8879 端口反向代理
+  用户偏好：数据精确型、schema 精简、简单直接、先建议后执行、结构化报告（问题→根因→修复→验证）
+  GitHub Actions：master push → Docker 镜像；v* tag → 全量构建（Docker + Go 二进制 Release）
+  注意：public repo，push 前禁止内网 IP/主机名/宿主路径
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing

@@ -11,3 +11,4 @@ tpm/*
 !tpm/.gitkeep
 db/*.kdbx
 db/*.key
+.hermes/
