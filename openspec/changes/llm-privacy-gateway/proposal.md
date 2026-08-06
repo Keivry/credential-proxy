@@ -27,8 +27,8 @@
 
 ## Impact
 
-- **新增文件**：`_pii.py`（PII 检测/替换）、`_audit.py`（输出审计策略引擎）、`_audit_store.py` 或复用 `_registry.py` 持久化审计日志
-- **修改文件**：`_llm.py`（请求 redact 前插 PII 检测、tool call 完成事件挂审计钩子、审批等待/注入拒绝响应的流式处理）、`_token.py`（PII token 注册与 TTL 支持）、`_matrix.py`（审批消息类型扩展）、`proxy.py`（feature flag 配置解析）、`docker-entrypoint.sh` / `docker-compose.yml`（新环境变量）
+- **新增文件**：`_pii.py`（PII 检测/替换）、`_audit.py`（输出审计策略引擎，审计日志 JSON Lines 追加写 `DATA_DIR/audit.log`）
+- **修改文件**：`_llm.py`（请求 redact 前插 PII 检测、tool call 完成事件挂审计钩子、审批等待/注入拒绝响应的流式处理）、`_token.py`（PII token 注册与 TTL 支持）、`_matrix.py`（审批消息类型扩展 + 审批人白名单校验）、`proxy.py`（feature flag 配置解析）、`docker-entrypoint.sh` / `docker-compose.yml`（新环境变量）
 - **API**：无对外 API 变更；新增配置环境变量（如 `PII_REDACTION_ENABLED`、`AUDIT_MODE`、`AUDIT_POLICY_FILE`）
 - **依赖**：Phase 1 零新增依赖（正则/规则引擎）；Phase 3 可选 Presidio（feature flag，不进默认镜像）
 - **测试**：新增 `test_pii.py`、`test_audit.py`、SSE 流式审计集成测试；全量 pytest + ruff 必须保持通过

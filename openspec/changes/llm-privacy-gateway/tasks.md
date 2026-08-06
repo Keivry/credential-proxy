@@ -1,52 +1,67 @@
 ## 1. PII 请求级 token 机制
 
-- [ ] 1.1 扩展 `_token.py`：新增请求级映射容器（`RequestScopedTokens`），支持独立于全局 `pwd_to_token` 的 `pii_p2t`/`pii_t2p`、`__PII_*__` token 前缀生成、`_restore` 时请求级优先全局兜底
-- [ ] 1.2 单元测试：请求级映射生命周期（创建/还原/清理）、与全局凭据映射互不串扰、token 前缀不冲突
+- [ ] 1.1 扩展 `_token.py`：新增请求级映射容器（`RequestScopedTokens`），支持独立于全局 `pwd_to_token` 的 `pii_p2t`/`pii_t2p`、`__PII_*__` token 前缀生成（**含随机段，见 design D2 token 不可预测性**）、同值去重复用 token、`_restore` 时请求级优先全局兜底（**PII 路径禁止触达全局凭据映射**）
+  - 验收：请求级映射创建/还原/清理测试通过；同值复用同一 token；`__PII_` token 不进入全局 `pwd_to_token`
+- [ ] 1.2 单元测试：请求级映射生命周期（创建/还原/清理）、与全局凭据映射互不串扰、token 前缀不冲突、越界/格式不符 token 原样保留并记审计事件
+- [ ] 1.3 **PII 正则等价物**：为 `__PII_` 前缀新增独立的分片残缺清理正则（仿照 `_PARTIAL_TOKEN_RE` 但**独立常量、不 import 凭据正则**），并同步扩展 `_FULL_TOKEN_RE`/`TOKEN_STR_RE` 等价物与 `_split_safe_hold` hold 判定
+  - 验收：`__PII_0000` 残缺前缀在流式分片边界被清理不泄漏；模型幻觉的完整 `__PII_*__` token 被剥离；凭据正则不受影响
 
 ## 2. PII 检测器（`_pii.py`）
 
 - [ ] 2.1 实现 `PiiDetector` 接口与 recognizer 注册表（正则 + 校验位/上下文强化）：大陆身份证（含校验位验证）、手机号（前缀段验证）、邮箱、银行卡（Luhn 校验）、IPv4、常见 API key 格式（sk-、ghp_ 等）
-- [ ] 2.2 实现 `PiiMixin`：`detect_and_redact(text)`（检测→注册请求级 token→替换）、`restore(text)`（请求级还原）、请求级映射生命周期管理
-- [ ] 2.3 单元测试：每种 recognizer 的命中/漏报/边界（误报如纯数字订单号、连续数字串）、还原正确性
+- [ ] 2.2 实现 `PiiMixin`：`detect_and_redact(text)`（检测→注册请求级 token→替换）、`restore(text)`（请求级还原）、请求级映射生命周期管理；**字段范围**：请求侧 content（字符串+数组 parts）/system prompt/tool 参数/tool 结果，响应侧 content/reasoning/tool 参数 delta，**排除图片 base64 data URL**（见 design D1）
+- [ ] 2.3 单元测试：每种 recognizer 的命中/漏报/边界（误报如纯数字订单号、连续数字串）、还原正确性、base64 data URL 不误报、重复 PII 去重复用 token
 
 ## 3. PII 脱敏接入 `_llm.py`
 
-- [ ] 3.1 请求侧：`_llm.py` handler 中在现有 `_redact` 前插入 PII 检测（`PII_REDACTION_ENABLED` 时），统一输出脱敏 body；`used_tokens` 收集同时覆盖凭据与 PII token
-- [ ] 3.2 响应侧：`_restore` 后追加响应侧 PII 检测（默认开启），对未脱敏的 PII 回显替换为占位符；非流式与流式（SSE 各协议路径）都要覆盖
-- [ ] 3.3 集成测试：请求含 PII + 凭据混合、流式响应还原、响应回显 PII 拦截
+- [ ] 3.1 请求侧：`_llm.py` handler 中在现有 `_redact` 前插入 PII 检测（`PII_REDACTION_ENABLED` 时），统一输出脱敏 body；`used_tokens` 收集同时覆盖凭据与 PII token；**门控判定同步扩展**（`_llm.py` 579 字节快路径 `__VG_CRED_`、658 JSON-aware、1300 fast path 三处须加 `__PII_`，纯 PII 请求不得走不还原的 fast path）
+  - 验收：纯 PII 请求（无凭据）流式响应正确还原；三处门控含 PII 判定
+- [ ] 3.2 响应侧：按「**还原 → 响应侧检测 → 转发**」顺序执行（见 design D2）：`_restore` 还原请求级占位符 → 检测并**跳过 `pii_p2t` 已有值**（还原出的明文不再掩码）→ 新检测值注册实时请求级映射；未脱敏 PII 回显替换为占位符；非流式与流式（SSE 各协议路径）都要覆盖
+  - 验收：模型回显占位符场景客户端收到脱敏文本而非明文；还原后明文不被二次掩码
+- [ ] 3.3 集成测试：请求含 PII + 凭据混合、流式响应还原、响应回显 PII 拦截、**明文 PII 跨分片切断的累积还原**（含断连残留不泄漏，见 design D2 明文分片累积）
 
 ## 4. 输出审计钩子（tool call 检测）
 
-- [ ] 4.1 新增 OpenAI chat/completions `delta.tool_calls` 分片累积（按 index 分组 name + arguments），复用 `_split_safe_hold`/`_PARTIAL_TOKEN_RE` 模式，在 `finish_reason == 'tool_calls'` 或流末触发审计点；注意跨分片伪还原与 null 值防御
-- [ ] 4.2 审计触发点对齐已有完成事件：Anthropic `block_stop`、Responses `item_done`（读取 arg_buf 完整参数）
-- [ ] 4.3 集成测试：三种协议流式 tool call 分片累积 + 审计触发（真实 aiohttp，参考 `test_sse_stream_loop.py` 模式）
+- [ ] 4.1 新增 OpenAI chat/completions `delta.tool_calls` 分片累积（按 index 分组 name + arguments），**全程缓冲至审计 verdict 前不 flush**，在 `finish_reason == 'tool_calls'` 或流末触发审计点；注意跨分片伪还原与 null 值防御
+  - 验收：三种协议 tool call 累积测试通过、PII/凭据残缺不泄漏、未出 verdict 无 tool call 事件流出
+- [ ] 4.2 审计触发点对齐已有完成事件：Anthropic `block_stop`、Responses `item_done`（读取 arg_buf 完整参数）；**审计读掩码前原始 arg_buf，PII 掩码在 flush 阶段**（见 design D3 审计对抗性）
+- [ ] 4.3 集成测试：三种协议流式 tool call 分片累积 + 审计触发（真实 aiohttp，参考 `sse_stream_loop_test.py` 模式）
+- [ ] 4.4 非流式整包响应审计：三协议提取 tool calls（OpenAI `choices[0].message.tool_calls` / Anthropic `content[].tool_use` / Responses `output[]`）+ 审计 + 阻断注入集成测试（不因缺 SSE 完成事件跳过）
+  - 验收：三协议非流式危险 tool call 均被拦截；安全 tool call 原样转发
 
 ## 5. 策略引擎与阻断模式（`_audit.py`）
 
-- [ ] 5.1 实现 `AuditMixin`：`audit_tool_call(name, args_json) -> AuditVerdict`（allow/deny 名单 + 危险模式规则：危险 shell 命令、敏感路径写入、网络外传）
-- [ ] 5.2 内置默认策略 + `AUDIT_POLICY_FILE` 可选 YAML/JSON 加载（schema 精简）
-- [ ] 5.3 阻断处置：危险 tool call 替换为「无 tool_calls 的 assistant 拒绝消息」（`finish_reason: stop`），后续流正常；非流式整包响应同样支持
-- [ ] 5.4 单元测试：策略匹配（allow/deny/危险模式/边界）、阻断注入的协议结构合法性
+- [ ] 5.1 实现 `AuditMixin`：`audit_tool_call(name, args_json) -> AuditVerdict`（allow/deny 名单 + 危险模式规则：危险 shell 命令、敏感路径写入、网络外传）；**参数规范化**：合并重复空白、解析 `\uXXXX`/`\xXX` 转义、拆 `;`/`&&`/`|` 命令链、单层变量展开、`/bin/rm`/`find -delete` 别名形态（见 design D3 审计对抗性）
+- [ ] 5.2 内置默认策略 + `AUDIT_POLICY_FILE` 可选 YAML/JSON 加载（schema 精简）；**补 `examples/audit-policy.yaml` 示例策略文件**（含「检测器」维度示例与防护边界注释）
+- [ ] 5.3 阻断处置：危险 tool call 替换为「无 tool_calls 的 assistant 拒绝消息」（`finish_reason: stop`），后续流正常；非流式整包响应同样支持；**Anthropic/Responses 在首个可疑 delta 进入缓冲时即暂停 flush，阻断后发出协议终止事件（`block_stop`/`item_done`）避免 tool_use 块 dangling**（见 design D4 状态机）
+- [ ] 5.4 单元测试：策略匹配（allow/deny/危险模式/边界/**规范化命中：双空格、`\u0072m` 转义、变量拼接、multiline**）、阻断注入的协议结构合法性（含终止事件）
 
 ## 6. 审批模式
 
-- [ ] 6.1 复用 `_matrix.py` `_ask`/pending/超时机制：危险 tool call 挂起 → Matrix ✅/❎ 审批消息（含工具名与参数摘要）→ 批准后补发原格式事件 / 拒绝后注入拒绝消息 / 超时默认拒绝
-- [ ] 6.2 流式挂起细节：挂起期间缓冲后续事件，审批完成统一放行/替换，不破坏 SSE 流结构
-- [ ] 6.3 集成测试：审批通过/拒绝/超时三种路径 + 流式完整性
+- [ ] 6.1 复用 `_matrix.py` `_ask`/pending/超时机制：危险 tool call 挂起 → Matrix ✅/❎ 审批消息（含工具名与**先脱敏后截断的参数摘要**、`[REDACTED:<type>]` 密钥形态、超时提示）→ 批准后补发原格式事件 / 拒绝后注入拒绝消息 / 超时默认拒绝；**审批白名单校验**（发送者 ∈ 白名单 + reaction event id 精确匹配 + 幂等，见 design D4）
+  - 验收：非白名单 reaction 被忽略；同请求重复 reaction 只生效首次；摘要不含明文密钥/PII
+- [ ] 6.2 流式挂起细节：挂起期间**继续读上游并缓冲**（上限 `AUDIT_HOLD_MAX_BYTES`，超限按 rejected fail-closed），审批完成统一放行/替换，不破坏 SSE 流结构；挂起期间按事件序缓冲后续 content
+- [ ] 6.3 集成测试：审批通过/拒绝/超时三种路径 + 流式完整性 + 白名单/幂等
+- [ ] 6.4 审批取消/收尾：流结束/异常/客户端断连 → 取消审批（`event.set()` + `_cleanup_request`）+ handler `try/finally` 清理请求级映射 + 周期清扫兜底（复用 `_matrix.py` CMD_LOCK）
+  - 验收：客户端断连后 pending_requests 无僵尸条目；僵尸审批消息再点 ✅ 无效
+- [ ] 6.5 **异常路径测试组**（注入失败场景，复用 `sse_stream_loop_test.py` 模式）：上游断连（ServerDisconnectedError）、SSE 流中断、坏 JSON、客户端提前断连（SSE_CLIENT_GONE）、超时、空流
+  - 验收：每条路径下 PII 映射清理、审批收尾、未审计 tool call fail-closed（不静默放行）
 
 ## 7. 审计日志
 
-- [ ] 7.1 追加写 `DATA_DIR/audit.log`（JSON Lines）：时间、检测类型、规则匹配、参数摘要（截断+脱敏）、处置结果
-- [ ] 7.2 单元测试：日志格式、敏感值不落盘、追加写与并发安全
+- [ ] 7.1 追加写 `DATA_DIR/audit.log`（JSON Lines）：时间、检测类型、规则匹配、参数摘要（**先脱敏后截断**）、处置结果；**日志行 `json.dumps` 强制转义 + 剥离控制字符 `\x00-\x1f`；文件权限 0600；大小轮转（10MB × 5 份）**
+- [ ] 7.2 单元测试：日志格式、敏感值不落盘、追加写与并发安全、**控制字符不产生伪造条目**、**写失败 fail-closed（阻断 + 告警）**、轮转触发
 
 ## 8. 配置与入口集成
 
-- [ ] 8.1 `proxy.py`：解析新环境变量（`PII_REDACTION_ENABLED`、`PII_RESPONSE_SIDE`、`AUDIT_MODE`、`AUDIT_TIMEOUT`、`AUDIT_POLICY_FILE`），组合 `PiiMixin` + `AuditMixin`
-- [ ] 8.2 轻量入口（llm-proxy-only / credential-proxy-only）按需引入 Mixin；Docker entrypoint/compose 增加环境变量透传与文档
+- [ ] 8.1 `proxy.py`：解析新环境变量（`PII_REDACTION_ENABLED`、`PII_RESPONSE_SIDE`、`AUDIT_MODE`、`AUDIT_TIMEOUT`、`AUDIT_HOLD_MAX_BYTES`、`AUDIT_POLICY_FILE`、审批人白名单），组合 `PiiMixin` + `AuditMixin`；`AUDIT_TIMEOUT` 取值校验 ≥1s（0/负值启动报错）
+  - 验收：非法 `AUDIT_TIMEOUT` 启动报错；`AUDIT_MODE=approve` 且无白名单配置时启动报错
+- [ ] 8.2 轻量入口（llm-proxy-only / credential-proxy-only）按需引入 Mixin；**approve 模式仅完整 proxy（含 MatrixMixin）支持，轻量入口配置 approve 时启动报错或降级 block**；Docker entrypoint/compose 增加环境变量透传与文档
 - [ ] 8.3 默认关闭回归验证：不配置新变量时全量测试通过、行为与现状一致
+- [ ] 8.4 **大 body 性能验证**：多 MB body（多模态 base64）逐 recognizer 扫描耗时上限（design 声称 μs 级，验证锚点）
 
 ## 9. 验证与发布
 
-- [ ] 9.1 ruff check + ruff format --check + 全量 pytest 全绿（132 + 新增）
-- [ ] 9.2 真实流量验证（llm-proxy-only 本地）：PII 请求/响应脱敏、危险 tool call 阻断、审批流程；验证 design.md Open Questions（`finish_reason` 可靠性、拒绝消息兼容性）
-- [ ] 9.3 版本 bump（v0.9.x）+ README changelog + Docker 镜像 tag + 打 tag 触发 CI 全量构建（Docker + Go 二进制）
+- [ ] 9.1 ruff check + ruff format --check + 全量 pytest 全绿（146 + 新增）
+- [ ] 9.2 真实流量验证（llm-proxy-only 本地）：PII 请求/响应脱敏、危险 tool call 阻断、审批流程；验证 design.md Open Questions（`finish_reason` 可靠性、拒绝消息兼容性）；**补充验证项**：拒绝消息 + 后续 content 共存、纯 PII 请求流式还原、无 `finish_reason` 的流
+- [ ] 9.3 版本 bump（v0.9.x）+ README changelog + Docker 镜像 tag + 打 tag 触发 CI 全量构建（Docker + Go 二进制）；README 补新环境变量配置表与防护边界声明
