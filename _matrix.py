@@ -188,11 +188,21 @@ class MatrixMixin:
                     pending['result'] = key
                     pending['event'].set()
                     # 后台 resolve（不阻塞 on_reaction）
-                    asyncio.create_task(
+                    hc_task = asyncio.create_task(
                         self._resolve_hash_change(
                             pending['reg_id'],
                             pending['new_hash'],
                             key,
+                        ),
+                    )
+                    hc_task.add_done_callback(
+                        lambda t, _logger=logger: (
+                            _logger.error(
+                                '哈希变更处理异常',
+                                exc_info=t.exception(),
+                            )
+                            if t.exception()
+                            else None
                         ),
                     )
                     reg_obj = (
@@ -255,11 +265,17 @@ class MatrixMixin:
         """
         if reactions is None:
             reactions = REACTIONS
-        resp = await self.client.room_send(
-            self.room_id,
-            'm.room.message',
-            {'msgtype': 'm.text', 'body': text},
-        )
+        # Matrix 断连/不可达时 room_send 会抛异常；此处捕获并返回 None，
+        # 让调用者的 `if msg_id is None:` 清理分支接管（unlock_event 等状态不残留）。
+        try:
+            resp = await self.client.room_send(
+                self.room_id,
+                'm.room.message',
+                {'msgtype': 'm.text', 'body': text},
+            )
+        except Exception:
+            logger.exception('_ask 发送审批消息失败')
+            return None
         eid = getattr(resp, 'event_id', None) or (
             resp.get('event_id') if isinstance(resp, dict) else None
         )

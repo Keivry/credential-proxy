@@ -8,6 +8,7 @@ import re as _re
 import uuid as _uuid
 
 from aiohttp import ClientSession, ClientTimeout, web
+from aiohttp.client_exceptions import ClientConnectionError, ServerDisconnectedError
 
 from _sse import SSE_CLIENT_GONE, filter_hop_headers
 from _token import TOKEN_RE, TOKEN_STR_RE
@@ -17,6 +18,8 @@ logger = logging.getLogger('credential-proxy')
 # ── Constants ──
 UPSTREAM_TOTAL_TIMEOUT = 600  # 上游总超时 (s)
 UPSTREAM_CONNECT_TIMEOUT = 30  # 上游连接超时 (s)
+MAX_UPSTREAM_RETRIES = 3  # 上游连接重试次数（含首次）
+UPSTREAM_RETRY_BACKOFF = 0.5  # 上游连接重试退避基数 (s)，指数增长
 SSE_CHUNK_SIZE = 4096  # SSE 流式块大小
 SSE_MAX_BUF = 1_048_576  # SSE 缓冲区上限 (1MB)
 # 流末清理：匹配 token 前缀/残缺形态（含完整但未还原的幻觉 token）。
@@ -591,13 +594,43 @@ class LlmMixin:
             headers = filter_hop_headers(dict(request.headers))
 
             try:
+                # 上游连接重试：仅对「拿到响应头之前」的瞬时连接异常重试。
+                # ServerDisconnectedError（上游主动断开）/ ClientConnectionError（连接层）/
+                # TimeoutError（connect 超时）均为瞬时故障，LLM chat 请求重试幂等安全。
+                # 一旦拿到 upstream_resp（进入 SSE 转发/读 body），绝不再重试。
+                upstream_resp = None
+                for attempt in range(MAX_UPSTREAM_RETRIES):
+                    try:
+                        upstream_resp = await session.request(
+                            request.method,
+                            target_url,
+                            headers=headers,
+                            data=out_body,
+                        )
+                        break
+                    except (
+                        ServerDisconnectedError,
+                        ClientConnectionError,
+                        TimeoutError,
+                    ) as e:
+                        if attempt == MAX_UPSTREAM_RETRIES - 1:
+                            raise
+                        delay = UPSTREAM_RETRY_BACKOFF * (2**attempt)
+                        logger.warning(
+                            'LLM 上游连接异常(%s)，%.1fs 后重试 %d/%d: %s %s',
+                            type(e).__name__,
+                            delay,
+                            attempt + 2,
+                            MAX_UPSTREAM_RETRIES,
+                            request.method,
+                            target_url,
+                        )
+                        await asyncio.sleep(delay)
+
+                # 循环内要么 break 要么 raise，到达此处必非 None
+                assert upstream_resp is not None
                 # async with 确保上游响应在 SSE 客户端断连时正确释放连接
-                async with session.request(
-                    request.method,
-                    target_url,
-                    headers=headers,
-                    data=out_body,
-                ) as upstream_resp:
+                async with upstream_resp:
                     content_type = upstream_resp.content_type or ''
 
                     # Log non-2xx upstream responses, only for chat completion endpoints
@@ -1375,7 +1408,10 @@ class LlmMixin:
                                     BrokenPipeError,
                                 ):
                                     logger.debug('SSE 残余写入失败')
-                            if fast_sse_event_count == 0 and upstream_resp.status == 200:
+                            if (
+                                fast_sse_event_count == 0
+                                and upstream_resp.status == 200
+                            ):
                                 logger.warning(
                                     'LLM 上游返回空流(0 data events, %d bytes): %s %s '
                                     '(client may see EmptyStreamError)',
@@ -1398,9 +1434,13 @@ class LlmMixin:
                         # ── 非流式 ──
                         resp_body = await upstream_resp.read()
 
-                        if not resp_body and upstream_resp.status == 200 and (
-                            tail.rstrip('/').endswith('chat/completions')
-                            or tail.rstrip('/').endswith('v1/messages')
+                        if (
+                            not resp_body
+                            and upstream_resp.status == 200
+                            and (
+                                tail.rstrip('/').endswith('chat/completions')
+                                or tail.rstrip('/').endswith('v1/messages')
+                            )
                         ):
                             logger.warning(
                                 'LLM 上游返回空响应体(%d bytes): %s %s '

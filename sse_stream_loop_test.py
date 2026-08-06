@@ -32,6 +32,11 @@ PROXY_PORT = 9931
 BASE = f'http://127.0.0.1:{PROXY_PORT}/v1/messages'
 HEADERS = {'Content-Type': 'application/json', 'x-api-key': 'sk-test'}
 
+# 重试测试专用端口（避免与 env() fixture 冲突）
+FLAKY_UPSTREAM_PORT = 9934
+FLAKY_PROXY_PORT = 9933
+FLAKY_BASE = f'http://127.0.0.1:{FLAKY_PROXY_PORT}/v1/messages'
+
 
 async def make_upstream():
     """起 mock 上游：按请求 body 的 case 返回不同 SSE 流。"""
@@ -161,3 +166,64 @@ async def test_done_marker_passthrough():
             raw = await r.text()
             assert 'data: [DONE]' in raw
             assert '"text":"hi"' in raw
+
+
+@pytest.mark.asyncio
+async def test_upstream_disconnect_retry():
+    """上游首次在响应头前断开连接（ServerDisconnectedError）→ 代理重试第二次成功。
+
+    模拟用户环境现象：opencode-go 网关间歇性 Server disconnected。
+    断言：客户端最终拿到 200 + 正常 SSE；上游被调用 2 次（1 次断开 + 1 次重试）。
+    """
+    call_count = 0
+
+    async def flaky_handler(request):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # 在响应头发送前关闭 TCP 连接，模拟上游主动断开（FIN → ServerDisconnectedError）
+            request.transport.close()
+            return web.Response(status=503)
+        resp = web.StreamResponse(headers={'Content-Type': 'text/event-stream'})
+        await resp.prepare(request)
+        await resp.write(b'event: message_start\n')
+        await resp.write(
+            b'data: {"type":"message_start","message":{"id":"msg_retry"}}\n\n'
+        )
+        await resp.write(b'data: {"type":"message_stop"}\n\n')
+        await resp.write_eof()
+        return resp
+
+    app = web.Application()
+    app.router.add_route('*', '/{tail:.*}', flaky_handler)
+    up_runner = web.AppRunner(app, access_log=None)
+    await up_runner.setup()
+    await web.TCPSite(up_runner, '127.0.0.1', FLAKY_UPSTREAM_PORT).start()
+
+    class Proxy(TokenMixin, LlmMixin):
+        pass
+
+    proxy = Proxy()
+    proxy._lock = asyncio.Lock()
+    proxy.token_to_pwd = {}
+    proxy._token_seq = 0
+    proxy.pwd_to_token = {}
+    proxy.proxies = {FLAKY_PROXY_PORT: f'http://127.0.0.1:{FLAKY_UPSTREAM_PORT}'}
+    proxy._runners = []
+    await proxy.start_llm_proxies()
+    try:
+        async with ClientSession() as s:
+            body = json.dumps({'case': 'normal'})
+            async with s.post(FLAKY_BASE, headers=HEADERS, data=body) as r:
+                assert r.status == 200
+                raw = await r.text()
+                assert '"type":"message_stop"' in raw
+        assert call_count == 2, (
+            f'上游应被调用 2 次（1 次断开 + 1 次重试），实际 {call_count}'
+        )
+    finally:
+        for r in proxy._runners:
+            await r.cleanup()
+        if proxy._shared_session:
+            await proxy._shared_session.close()
+        await up_runner.cleanup()
