@@ -12,7 +12,7 @@
   - 阻断模式（默认）：检测到危险调用 → 注入「被安全策略拒绝」的响应给客户端，不阻塞
   - 审批模式（可选）：复用 Matrix reactions 审批，危险操作挂起等待 ✅/❎，与现有凭据审批体验一致
 - **审计日志**：记录每次检测/阻断/审批事件（时间、请求方、检测类型、处置结果）
-- 所有新功能**默认关闭**（环境变量/配置文件 feature flag 开启），不改变现有行为，不破坏现有 132 个测试
+- 所有新功能**默认关闭**（环境变量/配置文件 feature flag 开启），不改变现有行为，不破坏现有 146 个测试
 
 ## Capabilities
 
@@ -29,7 +29,7 @@
 
 - **新增文件**：`_pii.py`（PII 检测/替换）、`_audit.py`（输出审计策略引擎，审计日志 JSON Lines 追加写 `DATA_DIR/audit.log`）
 - **修改文件**：`_llm.py`（请求 redact 前插 PII 检测、tool call 完成事件挂审计钩子、审批等待/注入拒绝响应的流式处理）、`_token.py`（PII token 注册与 TTL 支持）、`_matrix.py`（审批消息类型扩展 + 审批人白名单校验）、`proxy.py`（feature flag 配置解析）、`docker-entrypoint.sh` / `docker-compose.yml`（新环境变量）
-- **API**：无对外 API 变更；新增配置环境变量（如 `PII_REDACTION_ENABLED`、`AUDIT_MODE`、`AUDIT_POLICY_FILE`）
+- **API**：无对外 API 变更；新增配置环境变量（如 `PII_REDACTION_ENABLED`、`AUDIT_MODE`、`AUDIT_POLICY_FILE`、`APPROVAL_WHITELIST`）
 - **依赖**：Phase 1 零新增依赖（正则/规则引擎）；Phase 3 可选 Presidio（feature flag，不进默认镜像）
-- **测试**：新增 `test_pii.py`、`test_audit.py`、SSE 流式审计集成测试；全量 pytest + ruff 必须保持通过
+- **测试**：新增 `pii_test.py`、`audit_test.py`（与仓库 `*_test.py` 命名约定一致）、SSE 流式审计集成测试；全量 pytest + ruff 必须保持通过
 - **部署**：Docker 镜像 tag 升级；Hermes 侧 custom provider 配置不变
