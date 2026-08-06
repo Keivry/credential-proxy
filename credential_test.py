@@ -426,6 +426,103 @@ async def test_approval_approved_default_tokenized():
 
 
 @pytest.mark.asyncio
+async def test_approval_msg_shows_registered_caller():
+    """已注册调用方 → 审批消息包含 name/description/script_path。"""
+    p = MockProxy()
+    p.master_password = 'pw'
+    approval_text = None
+
+    # 模拟已注册 caller：无自动放行（走审批）但注册记录可查
+    fake_reg = types.SimpleNamespace(
+        name='backup-db',
+        description='每日数据库备份',
+        script_path='/opt/scripts/backup.sh',
+    )
+    p._check_auto_approve = AsyncMock(return_value=(None, fake_reg, ''))
+
+    async def ask_side(text):
+        nonlocal approval_text
+        approval_text = text
+        async with p._lock:
+            for rid, rd in list(p.pending_requests.items()):
+                rd['approved'] = True
+                rd['event'].set()
+        return 'msg_id'
+
+    p._ask_mock.side_effect = ask_side
+    auth = {'caller_hash': 'sha256:abc', 'caller_path': '/opt/scripts/backup.sh'}
+    req = make_request({'entry': 'MyEntry', 'field': 'password', 'auth': auth})
+    await p.handle_credential(req)
+    assert approval_text is not None
+    assert 'backup-db' in approval_text
+    assert '每日数据库备份' in approval_text
+    assert '/opt/scripts/backup.sh' in approval_text
+    assert 'MyEntry - password (脱敏)' in approval_text
+
+
+@pytest.mark.asyncio
+async def test_approval_msg_shows_unregistered_caller():
+    """未注册调用方 → 审批消息显示脚本路径 + 未注册标记。"""
+    p = MockProxy()
+    p.master_password = 'pw'
+    approval_text = None
+
+    async def ask_side(text):
+        nonlocal approval_text
+        approval_text = text
+        async with p._lock:
+            for rid, rd in list(p.pending_requests.items()):
+                rd['approved'] = True
+                rd['event'].set()
+        return 'msg_id'
+
+    p._ask_mock.side_effect = ask_side
+    auth = {'caller_hash': 'sha256:new', 'caller_path': '/tmp/new-script.sh'}
+    req = make_request({'entry': 'MyEntry', 'auth': auth})
+    await p.handle_credential(req)
+    assert approval_text is not None
+    assert '/tmp/new-script.sh' in approval_text
+    assert '未注册' in approval_text
+    assert 'MyEntry (脱敏)' in approval_text
+
+
+@pytest.mark.asyncio
+async def test_approval_msg_terminal_direct():
+    """终端直调（caller_hash == GET_BINARY_HASH）→ 标记为终端直调。"""
+    p = MockProxy()
+    p.master_password = 'pw'
+    approval_text = None
+
+    async def ask_side(text):
+        nonlocal approval_text
+        approval_text = text
+        async with p._lock:
+            for rid, rd in list(p.pending_requests.items()):
+                rd['approved'] = True
+                rd['event'].set()
+        return 'msg_id'
+
+    p._ask_mock.side_effect = ask_side
+    _credential.GET_BINARY_HASH = 'sha256:binhash'
+    _credential.GET_BINARY_SECRET = 'testsecret'
+    try:
+        auth = {
+            'get_binary_hash': 'sha256:binhash',
+            'get_binary_secret': 'testsecret',
+            'caller_hash': 'sha256:binhash',
+            'caller_path': '/usr/local/bin/get',
+        }
+        req = make_request({'entry': 'MyEntry', 'auth': auth})
+        await p.handle_credential(req)
+    finally:
+        _credential.GET_BINARY_HASH = ''
+        _credential.GET_BINARY_SECRET = ''
+    assert approval_text is not None
+    assert '终端直调' in approval_text
+    assert 'MyEntry (脱敏)' in approval_text
+
+
+@pytest.mark.asyncio
 async def test_approval_timeout():
     """审批超时 → 返回 408。"""
     p = MockProxy()

@@ -269,7 +269,7 @@ cd get && make build  # → /tmp/get-credential-linux-amd64
 
 ## 版本历史
 
-- **v0.8.11** — LLM 上游连接重试：`session.request()` 对瞬时连接异常（`ServerDisconnectedError` / `ClientConnectionError` / `TimeoutError`）指数退避重试 3 次（0.5s→1s→2s），仅在拿到响应头之前重试，修复 opencode-go 网关间歇性 Server disconnected 导致下游 500；同时修复 `_ask` 的 `room_send` 无异常保护（Matrix 断连时 unlock_event 状态残留 → 永久 408 死锁）与 `_resolve_hash_change` task 异常无人检索。新增集成测试（真实 aiohttp 模拟上游断开）+ matrix 单元测试
+- **v0.8.11** — ① LLM 上游连接重试：`session.request()` 对瞬时连接异常（`ServerDisconnectedError` / `ClientConnectionError` / `TimeoutError`）指数退避重试 3 次（0.5s→1s→2s），仅在拿到响应头之前重试，修复 opencode-go 网关间歇性 Server disconnected 导致下游 500；② Matrix 异常保护：`_ask` 的 `room_send` 加保护（断连时 unlock_event 状态残留 → 永久 408 死锁），`_resolve_hash_change` task 异常不再无人检索；③ 凭据审批消息显示调用方信息（已注册：名称/用途/脚本路径；未注册：脚本路径+提示；终端直调单独标记）。新增集成测试（真实 aiohttp 模拟上游断开）+ matrix/credential 单元测试
 - **v0.8.10** — LLM 代理空流检测：SSE 流结束且 0 个 data 事件（或非流式 200 空响应体）时打 WARNING（`LLM 上游返回空流...`），捕获上游 200+空 body 场景（客户端表现为 EmptyStreamError），此前该场景无任何日志
 - **v0.8.9** — 公开仓库安全清理：移除历史中的内网 IP（默认值改为 `127.0.0.1`）、主机名与本地绝对路径；重写全部 git 历史并重建 GHCR 镜像。功能无变化
 - **v0.8.8** — TPM 解封不再依赖持久化 primary.ctx：primary key 由 storage seed 确定性派生，每次解封前现场 `tpm2_createprimary`（owner + rsa2048 + sha256）生成，`seal.pub/seal.priv` 跨重启永久有效。修复主机重启后 `tpm2_load` 报 `integrity check failed (0x1DF)` 导致 TPM 解锁失败的问题（旧 primary.ctx 是 transient context 快照，重启后失效）。部署只需保留 seal.pub/seal.priv

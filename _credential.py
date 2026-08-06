@@ -200,6 +200,34 @@ class CredentialMixin:
 
     # ── Credential ──
 
+    @staticmethod
+    def _format_caller_info(auth: dict, reg) -> str:
+        """构建审批消息的调用方信息行。
+
+        已注册（reg 非空）优先展示注册信息（name/description/script_path）；
+        未注册时退化为展示 auth 中的脚本路径；终端直调（caller_hash 等于
+        get 二进制自身 hash）标记为终端直调。无信息时返回空字符串。
+        """
+        lines = []
+        if reg is not None:
+            name = getattr(reg, 'name', '') or ''
+            desc = getattr(reg, 'description', '') or ''
+            path = getattr(reg, 'script_path', '') or ''
+            lines.append(f'👤 调用方: {name}')
+            if desc:
+                lines.append(f'📝 用途: {desc}')
+            if path:
+                lines.append(f'📁 脚本: {path}')
+        else:
+            auth = auth or {}
+            ch = auth.get('caller_hash', '')
+            path = auth.get('caller_path', '')
+            if ch and GET_BINARY_HASH and ch == GET_BINARY_HASH:
+                lines.append('👤 调用方: 终端直调')
+            elif path:
+                lines.append(f'👤 调用方: {path}（未注册）')
+        return '\n'.join(lines) + ('\n' if lines else '')
+
     async def handle_credential(self, request) -> web.Response:
         """处理凭据查询请求。
 
@@ -370,7 +398,7 @@ class CredentialMixin:
                 'event': evt,
             }
 
-        # 构建审批提示：展示条目 + 属性 + 是否原始值
+        # 构建审批提示：展示条目 + 属性 + 是否原始值 + 调用方信息
         desc = entry_name
         if field:
             desc += f' - {field}'
@@ -378,8 +406,9 @@ class CredentialMixin:
             desc += ' (脱敏)'
         else:
             desc += ' (原始值)'
+        caller_info = self._format_caller_info(auth, reg)
         msg_id = await self._ask(
-            f'🔑 凭据请求: {desc}\n点 ✅ 批准 或 ❎ 拒绝',
+            f'🔑 凭据请求: {desc}\n{caller_info}点 ✅ 批准 或 ❎ 拒绝',
         )
         if msg_id is None:
             async with self._lock:
