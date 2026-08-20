@@ -19,12 +19,13 @@ import sys
 from collections import OrderedDict
 
 from _llm import LlmMixin, parse_llm_proxy_env
+from _pii import PiiMixin
 from _token import TokenMixin
 
 logger = logging.getLogger('llm-proxy')
 
 
-class LlmOnlyProxy(TokenMixin, LlmMixin):
+class LlmOnlyProxy(TokenMixin, PiiMixin, LlmMixin):
     """轻量版 LLM 代理，不含凭据管理/审批功能。"""
 
     def __init__(self):
@@ -35,6 +36,57 @@ class LlmOnlyProxy(TokenMixin, LlmMixin):
         self.proxies = parse_llm_proxy_env()
         self._shared_session = None
         self._runners: list = []
+
+        # ── PII 配置（Batch 8.1）──
+        from _pii import parse_pii_env_config
+
+        pii_cfg = parse_pii_env_config()
+        self.pii_enabled = pii_cfg['enabled']
+        self.pii_response_side = pii_cfg['response_side']
+        self.pii_hold_max = pii_cfg['hold_max']
+        self._init_pii()
+        if pii_cfg['errors']:
+            for e in pii_cfg['errors']:
+                logger.error('PII 配置错误: %s', e)
+            raise SystemExit(f'PII 配置错误: {pii_cfg["errors"][0]}')
+        if self.pii_enabled:
+            logger.info(
+                'PII 脱敏启用: response_side=%s hold_max=%d',
+                self.pii_response_side,
+                self.pii_hold_max,
+            )
+
+        # ── 审计配置（Batch 8.1/8.2）──
+        # 轻量入口无 MatrixMixin → approve 模式不支持，降级 block 并明确告警
+        from _audit import parse_audit_env_config
+
+        audit_cfg = parse_audit_env_config(require_whitelist=False)
+        if audit_cfg['errors']:
+            for e in audit_cfg['errors']:
+                logger.error('审计配置错误: %s', e)
+            raise SystemExit(f'审计配置错误: {audit_cfg["errors"][0]}')
+        if audit_cfg['mode'] == 'approve':
+            logger.warning(
+                '轻量入口不支持 AUDIT_MODE=approve（无 Matrix 审批），降级为 block 模式'
+            )
+            audit_cfg['mode'] = 'block'
+        self.audit_enabled_flag = audit_cfg['mode'] in ('block', 'approve')
+        self.audit_mode = audit_cfg['mode'] if self.audit_enabled_flag else 'block'
+        self.audit_timeout = audit_cfg['timeout']
+        self.audit_hold_max_bytes = audit_cfg['hold_max']
+        self.approval_whitelist = audit_cfg['whitelist']
+        self._audit_approval_pending = {}
+        self._audit_approval_msgs = {}
+        self._audit_pending_seq = 0
+        self._audit_log_ring = []
+        self._audit_log_fail_count = 0
+        if self.audit_enabled_flag:
+            logger.info(
+                '审计已启用: mode=%s timeout=%ds hold_max=%dB',
+                self.audit_mode,
+                self.audit_timeout,
+                self.audit_hold_max_bytes,
+            )
 
         for port, url in sorted(self.proxies.items()):
             logger.info('LLM 代理 → 0.0.0.0:%d → %s', port, url)

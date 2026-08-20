@@ -13,6 +13,7 @@
 
 import asyncio
 import logging
+import os
 import re as _re
 from concurrent.futures import ThreadPoolExecutor
 
@@ -26,6 +27,54 @@ PII_RE_DOS_BUDGET = 0.1  # 自定义正则单规则超时预算 100ms
 PII_RE_DOS_MAX_WORKERS = 2  # 独立线程池（与日志写 run_in_executor 不同池）
 PII_RE_DOS_STRIKES = 3  # 连续超时 3 次临时停用
 PII_SCAN_INPUT_LIMIT = 1_048_576  # 单次扫描输入上限 1MB
+
+
+# ═══════════════════════════════════════════════════════════
+# 配置校验（Batch 8.1：proxy/轻量入口启动时调用）
+# ═══════════════════════════════════════════════════════════
+
+
+def parse_pii_env_config() -> dict:
+    """解析并校验 PII 相关环境变量。
+
+    - PII_REDACTION_ENABLED（1/true/True/yes → 启用，默认关）
+    - PII_RESPONSE_SIDE（1/true/True/yes → 响应侧检测启用，默认开）
+    - PII_HOLD_MAX（尾部持有上限，默认 64，取值 ≥1 正整数）
+
+    返回: {'enabled', 'response_side', 'hold_max', 'errors': [str]}
+    """
+    errors: list[str] = []
+    enabled = os.environ.get('PII_REDACTION_ENABLED') in (
+        '1',
+        'true',
+        'True',
+        'yes',
+    )
+    response_side = os.environ.get('PII_RESPONSE_SIDE') in (
+        '1',
+        'true',
+        'True',
+        'yes',
+    )
+    if os.environ.get('PII_RESPONSE_SIDE') is None:
+        response_side = True  # 默认开（响应侧检测）
+    hold_max = PII_HOLD_MAX_DEFAULT
+    raw_h = os.environ.get('PII_HOLD_MAX', str(PII_HOLD_MAX_DEFAULT))
+    try:
+        hold_max = int(raw_h)
+        if hold_max < 1:
+            errors.append(f'PII_HOLD_MAX 必须 ≥1 正整数: {raw_h!r}')
+            hold_max = PII_HOLD_MAX_DEFAULT
+    except (ValueError, TypeError):
+        errors.append(f'PII_HOLD_MAX 非法整数: {raw_h!r}')
+
+    return {
+        'enabled': enabled,
+        'response_side': response_side,
+        'hold_max': hold_max,
+        'errors': errors,
+    }
+
 
 # 粗筛：无这些字符的纯文本直接跳过全量扫描（25x 加速）
 _COARSE_FILTER_RE = _re.compile(r'[\dA-Za-z@.\-]')

@@ -31,6 +31,19 @@ services:
       - LLM_8878=https://api.opencode.ai
       - LLM_8879=https://api.deepseek.com
 
+      # ── PII 脱敏（默认关闭，启用需显式设置）──
+      # - PII_REDACTION_ENABLED=1
+      # - PII_RESPONSE_SIDE=1
+      # - PII_HOLD_MAX=64
+
+      # ── 输出审计（默认关闭，启用需显式设置）──
+      # block = 自动拦截危险 tool call；approve = Matrix 人工审批（需 APPROVAL_WHITELIST）
+      # - AUDIT_MODE=block
+      # - AUDIT_TIMEOUT=90          # 禁止 110-130（上游断连竞态窗口）
+      # - AUDIT_HOLD_MAX_BYTES=1048576
+      # - AUDIT_POLICY_FILE=/data/audit-policy.yaml
+      # - APPROVAL_WHITELIST=@admin:matrix.example.com
+
       # ── 可选参数 ──
       # - CREDENTIAL_PORT=8877
       # - DATA_DIR=/data

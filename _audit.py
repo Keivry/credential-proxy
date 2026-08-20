@@ -525,11 +525,21 @@ class AuditMixin:
         if not hasattr(self, 'audit_enabled_flag'):
             policy_file = os.environ.get('AUDIT_POLICY_FILE') or None
             self._init_audit(policy_file)
-            if os.environ.get('AUDIT_ENABLED') in ('1', 'true', 'True', 'yes'):
-                self.audit_enabled_flag = True
-            mode = os.environ.get('AUDIT_MODE', 'block')
+            # 总开关：AUDIT_MODE 三值（off/block/approve，默认 off）
+            # 兼容旧 AUDIT_ENABLED=1（此时 AUDIT_MODE 未设 → block）
+            mode = os.environ.get('AUDIT_MODE', 'off')
             if mode in ('block', 'approve'):
+                self.audit_enabled_flag = True
                 self.audit_mode = mode
+            elif mode == 'off':
+                self.audit_enabled_flag = False
+                # 旧变量兼容：AUDIT_ENABLED=1 且 AUDIT_MODE 未设 → block
+                if (
+                    os.environ.get('AUDIT_ENABLED') in ('1', 'true', 'True', 'yes')
+                    and 'AUDIT_MODE' not in os.environ
+                ):
+                    self.audit_enabled_flag = True
+                    self.audit_mode = 'block'
             # 审批超时（AUDIT_TIMEOUT，默认 90s）；非法值回落默认
             try:
                 t = int(os.environ.get('AUDIT_TIMEOUT', '90'))
@@ -891,3 +901,81 @@ def redact_summary(text: str, max_len: int = 120) -> str:
         except UnicodeEncodeError:
             cut = cut[:-1]
     return cut + '…'
+
+
+# ═══════════════════════════════════════════════════════════
+# 配置校验（Batch 8.1：proxy/轻量入口启动时调用）
+# ═══════════════════════════════════════════════════════════
+
+# AUDIT_TIMEOUT 竞态区间：上游 ~120s 断连特征两侧各留 ~10s 安全余量
+AUDIT_TIMEOUT_RACE_MIN = 110
+AUDIT_TIMEOUT_RACE_MAX = 130
+
+
+def parse_audit_env_config(require_whitelist: bool = False) -> dict:
+    """解析并校验审计相关环境变量，返回配置字典 + 错误列表。
+
+    校验（design D5 / tasks 8.1）：
+    - AUDIT_MODE ∈ {off, block, approve}（默认 off）
+    - AUDIT_TIMEOUT ≥1s 且拒绝 110-130s 竞态区间（0/负/竞态区间 → 错误）
+    - AUDIT_HOLD_MAX_BYTES ≥1（非法 → 错误）
+    - require_whitelist=True（完整 proxy）：AUDIT_MODE=approve 且无
+      APPROVAL_WHITELIST → 错误
+
+    返回: {'mode', 'timeout', 'hold_max', 'whitelist', 'errors': [str]}
+    """
+    errors: list[str] = []
+    mode = os.environ.get('AUDIT_MODE', 'off')
+    if mode not in ('off', 'block', 'approve'):
+        errors.append(f'AUDIT_MODE 非法: {mode!r}（取值 off/block/approve）')
+        mode = 'off'
+    # 向后兼容：AUDIT_ENABLED=1 且 AUDIT_MODE 未设 → block
+    # （与 _ensure_audit_init 语义一致；显式 AUDIT_MODE 优先）
+    if os.environ.get('AUDIT_MODE') is None and os.environ.get('AUDIT_ENABLED') in (
+        '1',
+        'true',
+        'True',
+        'yes',
+    ):
+        mode = 'block'
+
+    timeout = 90
+    raw_t = os.environ.get('AUDIT_TIMEOUT', '90')
+    try:
+        timeout = int(raw_t)
+        if timeout < 1:
+            errors.append(f'AUDIT_TIMEOUT 必须 ≥1s: {raw_t!r}')
+        elif AUDIT_TIMEOUT_RACE_MIN <= timeout <= AUDIT_TIMEOUT_RACE_MAX:
+            errors.append(
+                f'AUDIT_TIMEOUT 不得落在 {AUDIT_TIMEOUT_RACE_MIN}-'
+                f'{AUDIT_TIMEOUT_RACE_MAX}s 竞态区间（上游 ~120s 断连窗口）: '
+                f'{timeout}s'
+            )
+    except (ValueError, TypeError):
+        errors.append(f'AUDIT_TIMEOUT 非法整数: {raw_t!r}')
+
+    hold_max = 1048576
+    raw_h = os.environ.get('AUDIT_HOLD_MAX_BYTES', '1048576')
+    try:
+        hold_max = int(raw_h)
+        if hold_max < 1:
+            errors.append(f'AUDIT_HOLD_MAX_BYTES 必须 ≥1: {raw_h!r}')
+    except (ValueError, TypeError):
+        errors.append(f'AUDIT_HOLD_MAX_BYTES 非法整数: {raw_h!r}')
+
+    whitelist: set[str] = set()
+    wl = os.environ.get('APPROVAL_WHITELIST', '')
+    if wl:
+        whitelist = {u.strip() for u in wl.split(',') if u.strip()}
+    if require_whitelist and mode == 'approve' and not whitelist:
+        errors.append(
+            'AUDIT_MODE=approve 必须配置 APPROVAL_WHITELIST（审批人 Matrix user id）'
+        )
+
+    return {
+        'mode': mode,
+        'timeout': timeout,
+        'hold_max': hold_max,
+        'whitelist': whitelist,
+        'errors': errors,
+    }

@@ -184,6 +184,28 @@ get revoke --name "check-mail"
 | `TPM_DIR` | TPM 密封文件目录 | `$DATA_DIR/tpm` |
 | `DB_DIR` | KeePass 数据库目录 | `$DATA_DIR/db` |
 | `LLM_<PORT>` | LLM 脱敏代理端口 → 上游 URL | — |
+| `PII_REDACTION_ENABLED` | 启用 PII 脱敏（请求/响应检测） | `0`（默认关闭） |
+| `PII_RESPONSE_SIDE` | 启用响应侧 PII 检测（还原后新明文掩码） | `1` |
+| `PII_HOLD_MAX` | 流式响应尾部持有上限（字符） | `64` |
+| `AUDIT_MODE` | 输出审计模式：`off`/`block`/`approve` | `off`（默认关闭） |
+| `AUDIT_TIMEOUT` | 审批超时（秒）；**禁止 110-130s**（上游断连竞态窗口） | `90` |
+| `AUDIT_HOLD_MAX_BYTES` | 审批挂起缓冲上限（字节） | `1048576` |
+| `AUDIT_POLICY_FILE` | 审计策略文件（JSON 或极简 YAML） | 空（内置默认策略） |
+| `APPROVAL_WHITELIST` | 审批人 Matrix user id（逗号分隔），`AUDIT_MODE=approve` 必填 | 空 |
+
+> **⚠️ 安全警示：PII 脱敏与输出审计默认关闭（fail-open）**
+>
+> 未显式启用前：**LLM 代理请求/响应中的明文敏感信息（身份证/手机号/密钥等）不脱敏**，危险 tool call（`rm -rf` 等）**不审计不拦截**。生产部署必须显式配置：
+>
+> ```bash
+> # 启用 PII 脱敏
+> PII_REDACTION_ENABLED=1
+> # 启用输出审计（block = 自动拦截危险调用；approve = Matrix 人工审批）
+> AUDIT_MODE=block        # 或 approve（需同时配置 APPROVAL_WHITELIST）
+> APPROVAL_WHITELIST='@admin:matrix.example.com'
+> ```
+>
+> 完整 proxy（`proxy.py`）支持 `AUDIT_MODE=approve`（含 Matrix 审批）；轻量入口（`llm-proxy-only.py` / `credential-proxy-only.py`）无 Matrix 审批能力，配置 `approve` 时会**降级为 block 并打印告警**。
 
 ### Caller 注册
 

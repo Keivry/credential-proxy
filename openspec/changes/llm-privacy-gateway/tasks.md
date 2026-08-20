@@ -73,13 +73,13 @@
 
 ## 8. 配置与入口集成
 
-- [ ] 8.1 `proxy.py`：解析新环境变量（`PII_REDACTION_ENABLED`、`PII_RESPONSE_SIDE`、`PII_HOLD_MAX`（尾部持有上限，默认 64，取值 ≥1 正整数）、`AUDIT_MODE`、`AUDIT_TIMEOUT`、`AUDIT_HOLD_MAX_BYTES`、`AUDIT_POLICY_FILE`、`APPROVAL_WHITELIST`），组合 `PiiMixin` + `AuditMixin`；`AUDIT_TIMEOUT` 取值校验 **≥1s 且拒绝 110-130s 区间**（0/负值/竞态区间启动报错）；`AUDIT_MODE=approve` 且无 `APPROVAL_WHITELIST` 启动报错
+- [x] 8.1 `proxy.py`：解析新环境变量（`PII_REDACTION_ENABLED`、`PII_RESPONSE_SIDE`、`PII_HOLD_MAX`（尾部持有上限，默认 64，取值 ≥1 正整数）、`AUDIT_MODE`、`AUDIT_TIMEOUT`、`AUDIT_HOLD_MAX_BYTES`、`AUDIT_POLICY_FILE`、`APPROVAL_WHITELIST`），组合 `PiiMixin` + `AuditMixin`；`AUDIT_TIMEOUT` 取值校验 **≥1s 且拒绝 110-130s 区间**（0/负值/竞态区间启动报错）；`AUDIT_MODE=approve` 且无 `APPROVAL_WHITELIST` 启动报错
   - 验收：非法 `AUDIT_TIMEOUT`（0/负/110-130）启动报错；`AUDIT_MODE=approve` 且无白名单配置时启动报错；`AUDIT_MODE=approve` 且配置白名单时正常启动；`PII_HOLD_MAX` 默认 64、非法值（0/负/非整数）启动报错
-- [ ] 8.2 轻量入口（llm-proxy-only / credential-proxy-only）按需引入 Mixin；**approve 模式仅完整 proxy（含 MatrixMixin）支持，轻量入口配置 approve 时启动报错或降级 block**；Docker entrypoint/compose 增加环境变量透传与文档；**README 配置表 + 默认关闭安全警示**（PII/审计默认关闭 = 未启用前明文与危险调用不受保护，见 design D5 安全警示）
+- [x] 8.2 轻量入口（llm-proxy-only / credential-proxy-only）按需引入 Mixin；**approve 模式仅完整 proxy（含 MatrixMixin）支持，轻量入口配置 approve 时启动报错或降级 block**；Docker entrypoint/compose 增加环境变量透传与文档；**README 配置表 + 默认关闭安全警示**（PII/审计默认关闭 = 未启用前明文与危险调用不受保护，见 design D5 安全警示）
   - 验收：轻量入口配置 approve 时明确报错或降级（不静默忽略）；文档含新环境变量配置表 + 默认关闭安全警示
-- [ ] 8.3 默认关闭回归验证：不配置新变量时全量测试通过、行为与现状一致
+- [x] 8.3 默认关闭回归验证：不配置新变量时全量测试通过、行为与现状一致
   - 验收：全量测试全绿；对照基线请求/响应字节级一致（无默认路径行为变化）
-- [ ] 8.4 **大 body 性能验证**：多 MB body（多模态 base64）逐 recognizer 扫描耗时上限（**分层锚点，见 design D1 性能策略**：扫描 ~90ms/1MB 联合正则、~0.8ms 纯文本粗筛、~124µs/1KB chunk、<100KB 请求扫描 ~9ms、字典启用时另计 ~5ms/100KB、每事件还原/分割/写出另计）；**粗筛 25x 仅在纯非 ASCII 无数字文本成立**（混合文本不适用）；**流式增量扫描锚点**：1MB 增量 ~90ms（**口径说明：1MB 增量锚点 = 联合正则 1MB 全量扫描 90ms**——增量扫描仅省去已处理部分，锚点值本身仍是全量扫描口径；2.3s 全量重扫为 200 chunk 场景的对照值，90x 为该场景比值，非 1MB 全量对照）
+- [x] 8.4 **大 body 性能验证**：多 MB body（多模态 base64）逐 recognizer 扫描耗时上限（**分层锚点，见 design D1 性能策略**：扫描 ~90ms/1MB 联合正则、~0.8ms 纯文本粗筛、~124µs/1KB chunk、<100KB 请求扫描 ~9ms、字典启用时另计 ~5ms/100KB、每事件还原/分割/写出另计）；**粗筛 25x 仅在纯非 ASCII 无数字文本成立**（混合文本不适用）；**流式增量扫描锚点**：1MB 增量 ~90ms（**口径说明：1MB 增量锚点 = 联合正则 1MB 全量扫描 90ms**——增量扫描仅省去已处理部分，锚点值本身仍是全量扫描口径；2.3s 全量重扫为 200 chunk 场景的对照值，90x 为该场景比值，非 1MB 全量对照）
   - 验收：多 MB body 扫描耗时在声明锚点内（记录实测值，超限则修订 design 声明）；性能断言覆盖联合正则/粗筛/字典独立/增量扫描
 
 ## 9. 验证与发布
