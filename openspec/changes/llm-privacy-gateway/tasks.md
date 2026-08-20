@@ -42,13 +42,13 @@
 
 ## 5. 策略引擎与阻断模式（`_audit.py`）
 
-- [ ] 5.1 实现 `AuditMixin`：`audit_tool_call(name, args_json) -> AuditVerdict`（allow/deny 名单 + 危险模式规则：危险 shell 命令、敏感路径写入、网络外传）；**参数规范化**：合并重复空白、解析 `\uXXXX`/`\xXX` 转义、拆 `;`/`&&`/`|` 命令链、单层变量展开、`/bin/rm`/`find -delete` 别名形态、**`..` 路径段规范化**（见 design D3 审计对抗性）；**外部域名判定**：配置化内网域名后缀列表 + 公网后缀启发式，不解析 DNS（见 design D3）
+- [x] 5.1 实现 `AuditMixin`：`audit_tool_call(name, args_json) -> AuditVerdict`（allow/deny 名单 + 危险模式规则：危险 shell 命令、敏感路径写入、网络外传）；**参数规范化**：合并重复空白、解析 `\uXXXX`/`\xXX` 转义、拆 `;`/`&&`/`|` 命令链、单层变量展开、`/bin/rm`/`find -delete` 别名形态、**`..` 路径段规范化**（见 design D3 审计对抗性）；**外部域名判定**：配置化内网域名后缀列表 + 公网后缀启发式，不解析 DNS（见 design D3）
   - 验收：规范化后规则命中（双空格、转义、变量拼接、multiline）与未规范化时失配的对照用例全绿
-- [ ] 5.2 内置默认策略 + `AUDIT_POLICY_FILE` 可选 YAML/JSON 加载（schema 精简）；**补 `examples/audit-policy.yaml` 示例策略文件**（含「检测器」维度示例与防护边界注释）
+- [x] 5.2 内置默认策略 + `AUDIT_POLICY_FILE` 可选 YAML/JSON 加载（schema 精简）；**补 `examples/audit-policy.yaml` 示例策略文件**（含「检测器」维度示例与防护边界注释）
   - 验收：策略文件加载/缺省默认策略/非法策略文件报错三路径覆盖；示例文件可被 loader 解析
-- [ ] 5.3 阻断处置：危险 tool call 替换为「无 tool_calls 的 assistant 拒绝消息」（`finish_reason: stop`），后续流正常；非流式整包响应同样支持；**Anthropic/Responses 在首个可疑 delta 进入缓冲时即暂停 flush，阻断后发出协议终止事件（`block_stop`/`item_done`）避免 tool_use 块 dangling**（见 design D4 状态机）
+- [x] 5.3 阻断处置：危险 tool call 替换为「无 tool_calls 的 assistant 拒绝消息」（`finish_reason: stop`），后续流正常；非流式整包响应同样支持；**Anthropic/Responses 在首个可疑 delta 进入缓冲时即暂停 flush（`audit_precheck` 已实现，接线到 flush 路径随 Batch 6 预检暂停完成），阻断后发出协议终止事件（`block_stop`/`item_done`）避免 tool_use 块 dangling**（见 design D4 状态机）
   - 验收：注入消息协议结构合法（无 tool_calls、finish_reason: stop）；A/R 阻断后收到终止事件无 dangling tool_use 块；后续 content 照常转发
-- [ ] 5.4 单元测试：策略匹配（allow/deny/危险模式/边界/**规范化命中：双空格、`\\u0072m` 转义、变量拼接、multiline**）、阻断注入的协议结构合法性（含终止事件）
+- [x] 5.4 单元测试：策略匹配（allow/deny/危险模式/边界/**规范化命中：双空格、`\u0072m` 转义、变量拼接、multiline**）、阻断注入的协议结构合法性（含终止事件）
   - 验收：以对应测试通过为验收（audit_test.py 全绿）
 
 ## 6. 审批模式

@@ -1,0 +1,50 @@
+# audit-policy.yaml — LLM 输出审计策略示例（llm-privacy-gateway）
+#
+# 防护边界（重要，请阅读）：
+# 本策略引擎「防意外、不防对抗」——纯字符串/正则匹配可被系统性绕过。
+# 已知未覆盖形态（不在承诺内）：
+#   - base64 包装（echo <b64>|base64 -d|sh）
+#   - ANSI-C quoting（$'\x72m'）
+#   - 相邻字符串字面量拼接（'r''m'）
+#   - 动态生成命令（运行时拼装）
+# 网络外传判定不解析 DNS（锁外网络 I/O 约束）：内网域名后缀列表 + 启发式
+# （.local/.internal/.localhost → 内网；其余 → 外传，fail-closed 方向安全）。
+#
+# 字段说明：
+#   allow:  工具名白名单（精确匹配，直接放行，不匹配危险模式）
+#   deny:   工具名黑名单（精确匹配，直接拒绝）
+#   dangerous: 危险模式规则列表 [{pattern: 正则, reason: 说明}]
+#           匹配「规范化后参数」或「原始参数」任一即判危险
+#   internal_suffixes: 内网域名后缀列表（网络外传判定用）
+
+allow:
+  - web_search
+  - web_extract
+  - read_file
+  - search_files
+  - patch
+  - session_search
+  - memory
+  - skill_view
+  - todo
+  - get_credential
+
+deny:
+  - dangerous_tool_example
+
+dangerous:
+  - pattern: '\brm\s+-rf\b'
+    reason: 危险删除 rm -rf
+  - pattern: '\bmkfs\b'
+    reason: 格式化磁盘 mkfs
+  - pattern: '\bshutdown\b|\breboot\b|\bpoweroff\b'
+    reason: 关机/重启
+  - pattern: '\b(write_file|patch|tee|cp|mv)\b[^\n]*\b(/etc/(passwd|shadow|sudoers)|/root/|/boot/)'
+    reason: 敏感路径写入
+  - pattern: '\b(curl|wget|nc|ncat|telnet|ssh)\b[^\n]*(?:https?://|ftp://)'
+    reason: 网络外传
+
+internal_suffixes:
+  - .corp.example
+  - .local
+  - .internal

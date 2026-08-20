@@ -10,6 +10,7 @@ import uuid as _uuid
 from aiohttp import ClientSession, ClientTimeout, web
 from aiohttp.client_exceptions import ClientConnectionError, ServerDisconnectedError
 
+from _audit import BLOCK_MESSAGE, AuditMixin
 from _sse import SSE_CLIENT_GONE, filter_hop_headers
 from _token import (
     FULL_PII_TOKEN_RE,
@@ -433,8 +434,8 @@ def re_sub_seps(value: str) -> str:
     return _SEP_NORMALIZE_RE.sub('', value)
 
 
-class LlmMixin:
-    """Mixin: LLM 反向代理，脱敏/还原。"""
+class LlmMixin(AuditMixin):
+    """Mixin: LLM 反向代理，脱敏/还原 + 输出审计。"""
 
     # ── PII 响应侧处理（还原 → 响应侧检测 → 转发）──
 
@@ -538,42 +539,122 @@ class LlmMixin:
         """返回当前请求 PII scope（无则 None）。"""
         return getattr(self, '_pii_scope', None)
 
-    # ── 输出审计钩子（Batch 4 占位，Batch 5 AuditMixin 实现）──
-
-    async def audit_tool_call(self, name: str, args_json: str) -> str:
-        """审计单个 tool call（name + 原始 args JSON）。
-
-        返回 'allow'（默认占位：Batch 5 接入 AuditMixin 后返回真实 verdict）。
-        审计读取的是**掩码前原始参数**（design D3 审计对抗性）——
-        PII 掩码在 flush 阶段，不参与规则匹配。
-        """
-        return 'allow'
-
-    def audit_enabled(self) -> bool:
-        """审计是否启用（Batch 5 AuditMixin 覆盖）。"""
-        return False
+    # ── 输出审计钩子（Batch 5：AuditMixin 策略引擎 + 阻断处置）──
 
     async def _audit_openai_tool_calls(
         self,
         tool_calls_buf: dict[int, dict[str, str]],
         active_t2p: dict,
-    ) -> None:
+    ) -> list[str]:
         """审计 OpenAI chat/completions 累积的 tool calls（finish_reason 触发）。
 
         审计读取**掩码前原始 args**（design D3 审计对抗性）——即累积的
         arguments 原文，不含 PII 占位符（PII 掩码在 flush 阶段）。
-        Batch 4：占位实现（audit_tool_call 默认 allow，不注入拒绝）。
-        Batch 5+：接入 AuditMixin，返回 verdict 后注入拒绝消息。
+
+        返回：需要注入的拒绝消息 SSE 行列表（deny verdict 时生成，
+        由调用方在 tool_calls 事件前 flush；allow 返回空列表）。
         """
+        injections: list[str] = []
         if not tool_calls_buf or not self.audit_enabled():
-            return
+            return injections
         for idx in sorted(tool_calls_buf):
             entry = tool_calls_buf[idx]
             name = entry.get('name', '')
             args = entry.get('arguments', '')
             if not name:
                 continue
-            await self.audit_tool_call(name, args)
+            verdict = await self.audit_tool_call(name, args)
+            if verdict == 'deny':
+                injections.append(self._build_block_event())
+        return injections
+
+    def _build_block_event(self) -> str:
+        """构造 OpenAI chat/completions 阻断拒绝消息 SSE 行。
+
+        design D4：无 tool_calls 的 assistant content，finish_reason: stop——
+        客户端按普通助手回复处理，不会尝试执行工具。
+        """
+        payload = {
+            'choices': [
+                {
+                    'index': 0,
+                    'delta': {'role': 'assistant', 'content': BLOCK_MESSAGE},
+                    'finish_reason': 'stop',
+                }
+            ]
+        }
+        return f'data: {json.dumps(payload, ensure_ascii=False)}\n\n'
+
+    def _build_block_event_anthropic(self) -> str:
+        """构造 Anthropic 阻断拒绝消息 SSE 行（content_block + message_delta）。"""
+        lines = []
+        lines.append(
+            'data: '
+            + json.dumps(
+                {
+                    'type': 'content_block_delta',
+                    'index': 0,
+                    'delta': {'type': 'text_delta', 'text': BLOCK_MESSAGE},
+                },
+                ensure_ascii=False,
+            )
+            + '\n\n'
+        )
+        lines.append(
+            'data: '
+            + json.dumps(
+                {
+                    'type': 'message_delta',
+                    'delta': {'stop_reason': 'end_turn'},
+                    'usage': {'output_tokens': 1},
+                },
+                ensure_ascii=False,
+            )
+            + '\n\n'
+        )
+        return ''.join(lines)
+
+    def _build_block_event_responses(self) -> str:
+        """构造 Responses 阻断拒绝消息 SSE 行（output_text.delta + completed）。"""
+        lines = []
+        lines.append(
+            'data: '
+            + json.dumps(
+                {
+                    'type': 'response.output_text.delta',
+                    'item_id': 'blocked',
+                    'output_index': 0,
+                    'content_index': 0,
+                    'delta': BLOCK_MESSAGE,
+                },
+                ensure_ascii=False,
+            )
+            + '\n\n'
+        )
+        lines.append(
+            'data: '
+            + json.dumps(
+                {
+                    'type': 'response.completed',
+                    'response': {
+                        'id': 'blocked',
+                        'status': 'completed',
+                        'output': [
+                            {
+                                'type': 'message',
+                                'role': 'assistant',
+                                'content': [
+                                    {'type': 'output_text', 'text': BLOCK_MESSAGE}
+                                ],
+                            }
+                        ],
+                    },
+                },
+                ensure_ascii=False,
+            )
+            + '\n\n'
+        )
+        return ''.join(lines)
 
     async def _pii_response_process(
         self,
@@ -690,7 +771,12 @@ class LlmMixin:
             # 审计触发点：读取掩码前原始完整参数累积器（design D3 审计对抗性）
             if getattr(self, '_audit_arg_accum', '') and self.audit_enabled():
                 name = self._last_anthropic_tool_name or ''
-                await self.audit_tool_call(name, getattr(self, '_audit_arg_accum', ''))
+                verdict = await self.audit_tool_call(
+                    name, getattr(self, '_audit_arg_accum', '')
+                )
+                if verdict == 'deny':
+                    # 阻断：注入拒绝消息 + block_stop 终止事件（design D4 防 dangling）
+                    await write(self._build_block_event_anthropic().encode('utf-8'))
             if hasattr(self, '_audit_arg_accum'):
                 self._audit_arg_accum = ''
             self._last_anthropic_tool_name = None
@@ -855,7 +941,12 @@ class LlmMixin:
             # 审计触发点：读取掩码前原始完整参数累积器（design D3 审计对抗性）
             if getattr(self, '_audit_arg_accum', '') and self.audit_enabled():
                 name = self._last_responses_tool_name or ''
-                await self.audit_tool_call(name, getattr(self, '_audit_arg_accum', ''))
+                verdict = await self.audit_tool_call(
+                    name, getattr(self, '_audit_arg_accum', '')
+                )
+                if verdict == 'deny':
+                    # 阻断：注入拒绝消息 + item_done 终止事件（design D4 防 dangling）
+                    await write(self._build_block_event_responses().encode('utf-8'))
             if hasattr(self, '_audit_arg_accum'):
                 self._audit_arg_accum = ''
             self._last_responses_tool_name = None
@@ -1089,6 +1180,11 @@ class LlmMixin:
                             tool_calls_audited = (
                                 False  # 防止重复审计（finish_reason + 流末双触发）
                             )
+                            tool_calls_blocked = (
+                                False  # 审计 deny：抑制后续 tool_calls 事件流出
+                            )
+                            # 审计启用时缓冲 tool_calls SSE 行（design D4：未出 verdict 不流出）
+                            tool_calls_pending_events: list[str] = []
 
                             async def _flush(
                                 c: str = '',
@@ -1162,10 +1258,32 @@ class LlmMixin:
                                                 and not tool_calls_audited
                                             ):
                                                 tool_calls_audited = True
-                                                await self._audit_openai_tool_calls(
-                                                    tool_calls_buf,
-                                                    active_t2p,
+                                                injections = (
+                                                    await self._audit_openai_tool_calls(
+                                                        tool_calls_buf,
+                                                        active_t2p,
+                                                    )
                                                 )
+                                                if injections:
+                                                    # deny：丢弃缓冲 + 注入拒绝
+                                                    tool_calls_blocked = True
+                                                    tool_calls_pending_events.clear()
+                                                    for ev in injections:
+                                                        await resp.write(
+                                                            ev.encode('utf-8')
+                                                        )
+                                                else:
+                                                    # allow：verdict 后统一放行缓冲事件
+                                                    for ev in tool_calls_pending_events:
+                                                        await resp.write(
+                                                            (
+                                                                await self._pii_response_process(
+                                                                    ev, active_t2p
+                                                                )
+                                                                + '\n'
+                                                            ).encode('utf-8')
+                                                        )
+                                                    tool_calls_pending_events.clear()
                                             if is_responses_stream:
                                                 # 兼容网关可能在 responses 流中发 [DONE]：
                                                 # 用 responses 格式 flush，避免 chat 格式污染
@@ -1330,6 +1448,12 @@ class LlmMixin:
                                                     tool_calls_buf,
                                                     delta['tool_calls'],
                                                 )
+                                                if self.audit_enabled():
+                                                    # 审计启用：缓冲事件行，verdict 后统一放行/丢弃
+                                                    tool_calls_pending_events.append(
+                                                        line
+                                                    )
+                                                    continue
 
                                             # ── finish_reason == tool_calls：审计触发点 ──
                                             if (
@@ -1338,10 +1462,32 @@ class LlmMixin:
                                                 and not tool_calls_audited
                                             ):
                                                 tool_calls_audited = True
-                                                await self._audit_openai_tool_calls(
-                                                    tool_calls_buf,
-                                                    active_t2p,
+                                                injections = (
+                                                    await self._audit_openai_tool_calls(
+                                                        tool_calls_buf,
+                                                        active_t2p,
+                                                    )
                                                 )
+                                                if injections:
+                                                    # deny：丢弃缓冲的 tool_calls 事件 + 注入拒绝
+                                                    tool_calls_blocked = True
+                                                    tool_calls_pending_events.clear()
+                                                    for ev in injections:
+                                                        await resp.write(
+                                                            ev.encode('utf-8')
+                                                        )
+                                                else:
+                                                    # allow：verdict 后统一放行缓冲事件
+                                                    for ev in tool_calls_pending_events:
+                                                        await resp.write(
+                                                            (
+                                                                await self._pii_response_process(
+                                                                    ev, active_t2p
+                                                                )
+                                                                + '\n'
+                                                            ).encode('utf-8')
+                                                        )
+                                                    tool_calls_pending_events.clear()
 
                                             # ── Reasoning content（独立处理，不受 content 影响）──
                                             rc_val = delta.get('reasoning_content')
@@ -1429,6 +1575,14 @@ class LlmMixin:
                                                     c=content_buf,
                                                     rc=reasoning_buf,
                                                 )
+                                                # 审计阻断：抑制 tool_calls 事件流出
+                                                # （design D4：拒绝后 tool call 不发给客户端）
+                                                if tool_calls_blocked and (
+                                                    'tool_calls' in delta
+                                                    or delta.get('role') == 'assistant'
+                                                    and 'content' not in delta
+                                                ):
+                                                    continue
                                                 await resp.write(
                                                     (
                                                         await self._pii_response_process(
@@ -1940,6 +2094,7 @@ class LlmMixin:
                             errors='replace',
                         )
                         # 非流式整包审计（design D4：不因缺 SSE 完成事件跳过）
+                        blocked = False
                         if self.audit_enabled() and resp_text:
                             try:
                                 _resp_json = json.loads(resp_text)
@@ -1948,9 +2103,77 @@ class LlmMixin:
                                     tail,
                                 )
                                 for _name, _args in _calls:
-                                    await self.audit_tool_call(_name, _args)
+                                    _verdict = await self.audit_tool_call(_name, _args)
+                                    if _verdict == 'deny':
+                                        blocked = True
                             except json.JSONDecodeError:
                                 pass
+                        if blocked:
+                            # 阻断：用拒绝消息替换整个响应体（design D4）
+                            _tail_norm = tail.rstrip('/')
+                            if _tail_norm.endswith('chat/completions'):
+                                _block_body = json.dumps(
+                                    {
+                                        'choices': [
+                                            {
+                                                'index': 0,
+                                                'message': {
+                                                    'role': 'assistant',
+                                                    'content': BLOCK_MESSAGE,
+                                                },
+                                                'finish_reason': 'stop',
+                                            }
+                                        ]
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            elif _tail_norm.endswith(('messages', 'v1/messages')):
+                                _block_body = json.dumps(
+                                    {
+                                        'id': 'blocked',
+                                        'type': 'message',
+                                        'role': 'assistant',
+                                        'content': [
+                                            {
+                                                'type': 'text',
+                                                'text': BLOCK_MESSAGE,
+                                            }
+                                        ],
+                                        'stop_reason': 'end_turn',
+                                        'usage': {
+                                            'input_tokens': 0,
+                                            'output_tokens': 1,
+                                        },
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            else:  # Responses API
+                                _block_body = json.dumps(
+                                    {
+                                        'id': 'blocked',
+                                        'status': 'completed',
+                                        'output': [
+                                            {
+                                                'type': 'message',
+                                                'role': 'assistant',
+                                                'content': [
+                                                    {
+                                                        'type': 'output_text',
+                                                        'text': BLOCK_MESSAGE,
+                                                    }
+                                                ],
+                                            }
+                                        ],
+                                    },
+                                    ensure_ascii=False,
+                                )
+                            return web.Response(
+                                body=_block_body.encode('utf-8'),
+                                status=200,
+                                headers=filter_hop_headers(
+                                    dict(upstream_resp.headers),
+                                ),
+                            )
                         out_text = await self._pii_response_process(
                             resp_text, active_t2p
                         )
