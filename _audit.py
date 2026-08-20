@@ -253,8 +253,8 @@ def normalize_args(args: str) -> str:
     s = _normalize_dotdot(s)
     # 3. 单层变量展开（在拆链前，保持 CMD=rm;$CMD -rf 的赋值-引用关系）
     s = _expand_vars(s)
-    # 4. 拆命令链（用空格分隔独立段，保留关键动词）
-    s = _re.sub(r'\s*(?:;|&&|\|\||\n)\s*', ' ', s)
+    # 4. 拆命令链（用空格分隔独立段，保留关键动词；|| 优先于单 | 匹配）
+    s = _re.sub(r'\s*(?:;|&&|\|\||\||\n)\s*', ' ', s)
     # 5. 别名形态
     s = _expand_aliases(s)
     return s

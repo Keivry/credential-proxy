@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import re as _re
+import time as _time
 from concurrent.futures import ThreadPoolExecutor
 
 from _token import RequestScopedTokens
@@ -641,10 +642,47 @@ class PiiMixin:
         上下文）；detector 指向它（请求期/响应期注册都进该作用域，
         响应期值标记 response_side 不还原）。
         """
-        scope = RequestScopedTokens()
+        scope = RequestScopedTokens(audit_cb=self._pii_audit_cb)
         self._pii_detector.request_tokens = scope
         self._pii_scope = scope
         return scope
+
+    def _pii_audit_cb(self, ev: str, ctx: dict) -> None:
+        """PII 格式不符/未注册 token 审计事件回调（同步，RequestScopedTokens 调用）。
+
+        design D2 硬性：格式不符 token 原样保留并记审计事件 + 聚合限流
+        （限流在 RequestScopedTokens._audit_malformed 内完成，此处只落盘）。
+        宿主组合 AuditMixin 时写入审计日志（与 tool call 审计同文件、
+        同 JSONL 格式、同 0600/轮转语义）；纯 PiiMixin 单测环境退化为
+        logger.warning（不阻断、不抛异常）。
+        """
+        try:
+            category = ctx.get('category', 'malformed')
+            token = ctx.get('token', '')
+            record = {
+                'ts': _time.time(),
+                'tool': 'pii_restore',
+                'verdict': 'malformed',
+                'rule': category,
+                'summary': f'[REDACTED:{category}]',
+                'note': f'pii_restore_malformed token={token!r}',
+            }
+            path = getattr(self, 'audit_log_path', '') or ''
+            if path:
+                from _audit import _append_audit_log
+
+                _append_audit_log(path, record)
+            ring = getattr(self, '_audit_log_ring', None)
+            if ring is not None:
+                ring.append(record)
+                ring_max = getattr(self, '_audit_log_ring_max', 100)
+                if len(ring) > ring_max:
+                    del ring[: len(ring) - ring_max]
+            else:
+                logger.warning('PII 格式不符 token 审计事件: %s', category)
+        except Exception:
+            # 审计事件不得阻断 PII 还原路径（fail-open 但必报）
+            logger.exception('PII 审计事件回调异常')
 
     def _pii_active(self) -> bool:
         """当前请求是否有活跃 PII 作用域（PII 启用且已建 scope）。"""

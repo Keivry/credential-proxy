@@ -15,6 +15,7 @@ import pytest
 from _llm import (
     LlmMixin,
     _split_safe_hold,
+    _strip_partials,
 )
 from _pii import PiiMixin
 from _token import RequestScopedTokens, TokenMixin
@@ -417,3 +418,38 @@ class TestIncrementalScan:
             f'incremental {t_inc * 1000:.1f}ms not < 1/10 of full {t_full * 1000:.1f}ms'
         )
         proxy._pii_cleanup()
+
+
+# ═══════════════════════════════════════════════════════════
+# F-02 回归：PII 残缺 token 流式清理生产接线
+# ═══════════════════════════════════════════════════════════
+
+
+def test_strip_partials_removes_pii_partial_forms():
+    """生产清理入口 _strip_partials 必须剥离 __PII_ 残缺前缀。
+
+    回归 F-02：此前所有 flush 路径只用凭据版 _PARTIAL_TOKEN_RE，
+    `__PII_1_ab` 等残缺随 safe 输出泄漏。_strip_partials 统一两套正则。
+    """
+    cases = [
+        ('text __PII', 'text '),
+        ('text __PII_', 'text '),
+        ('text __PII_0001', 'text '),
+        ('text __PII_0001_', 'text '),
+        ('text __PII_0001_ab', 'text '),
+        ('text __PII_1_ab12cd34__', 'text '),  # 幻觉完整 token 也剥离
+    ]
+    for inp, expected in cases:
+        assert _strip_partials(inp) == expected, f'{inp!r} -> {_strip_partials(inp)!r}'
+
+
+def test_strip_partials_keeps_cred_partials_and_plain():
+    """凭据残缺同样清理；普通文本/带标点完整 token 不受影响。"""
+    # 凭据残缺
+    assert _strip_partials('x __VG_CRED_0001') == 'x '
+    # 普通文本（__ 开头但不是 token 前缀）
+    assert _strip_partials('__Python__ 和 __PIIX') == '__Python__ 和 __PIIX'
+    # 带尾部标点的完整 token（流末清理只剥离真正残缺前缀）
+    assert _strip_partials('__PII_0001_ab,') == '__PII_0001_ab,'
+    # 空输入
+    assert _strip_partials('') == ''

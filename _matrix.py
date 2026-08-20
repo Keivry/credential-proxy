@@ -219,14 +219,13 @@ class MatrixMixin:
                     say_text = f'{key} 哈希变更: {name or hc_id} → {action}'
 
             # ── 4. 凭据审批分支 ──
+            # 精确匹配：只有「审计审批消息」之外的 orig 落入此处（审计消息
+            # 由分支 5 处理，见下）。负向守卫形态（not ... → pass）曾吞掉
+            # 审计 reaction——审计消息 orig 不在 approval_msgs，恒命中守卫
+            # 导致分支 5 不可达。修复：分支 4 改为正向匹配 + 显式排除审计消息。
             elif (
-                not (req_id := self.approval_msgs.get(orig))
-                or not (req := self.pending_requests.get(req_id))
-                or req['approved'] is not None
-            ):
-                pass
-            elif (
-                (req_id := self.approval_msgs.get(orig))
+                orig not in self._audit_approval_msgs
+                and (req_id := self.approval_msgs.get(orig))
                 and (req := self.pending_requests.get(req_id))
                 and req['approved'] is None
             ):

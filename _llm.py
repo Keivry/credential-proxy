@@ -13,6 +13,7 @@ from aiohttp.client_exceptions import ClientConnectionError, ServerDisconnectedE
 from _audit import BLOCK_MESSAGE, AuditMixin, redact_summary
 from _sse import SSE_CLIENT_GONE, filter_hop_headers
 from _token import (
+    _PII_PARTIAL_TOKEN_RE,
     FULL_PII_TOKEN_RE,
     PII_TOKEN_RE,
     PII_TOKEN_STR_RE,
@@ -21,6 +22,18 @@ from _token import (
 )
 
 logger = logging.getLogger('credential-proxy')
+
+
+def _strip_partials(text: str) -> str:
+    """流末/安全输出前清理残缺 token 前缀（凭据 + PII 两套）。
+
+    design D2 硬性：PII 残缺形态（`__PII_…` 前缀在分片边界被切断）必须与
+    凭据残缺同规则清理，否则 `__PII_1_ab` 等残缺会随 safe 输出泄漏给客户端。
+    统一入口替换散落的 `_PARTIAL_TOKEN_RE.sub`，避免新增路径漏接 PII 版。
+    """
+    out = _PARTIAL_TOKEN_RE.sub('', text)
+    return _PII_PARTIAL_TOKEN_RE.sub('', out)
+
 
 # ── Constants ──
 UPSTREAM_TOTAL_TIMEOUT = 600  # 上游总超时 (s)
@@ -761,7 +774,7 @@ class LlmMixin(AuditMixin):
         else:
             restored = self._restore(buf, active_t2p)
         if not keep_pending:
-            restored = _PARTIAL_TOKEN_RE.sub('', restored)
+            restored = _strip_partials(restored)
             if not restored:
                 return ''
             try:
@@ -777,7 +790,7 @@ class LlmMixin(AuditMixin):
             return ''
         safe, pending = _split_safe_hold(restored, active_t2p, pii_scope)
         if safe:
-            safe = _PARTIAL_TOKEN_RE.sub('', safe)
+            safe = _strip_partials(safe)
         if safe:
             try:
                 await write(
@@ -1087,7 +1100,7 @@ class LlmMixin(AuditMixin):
         else:
             restored = self._restore(buf, active_t2p)
         if not keep_pending:
-            restored = _PARTIAL_TOKEN_RE.sub('', restored)
+            restored = _strip_partials(restored)
             if not restored:
                 return ''
             try:
@@ -1103,7 +1116,7 @@ class LlmMixin(AuditMixin):
             return ''
         safe, pending = _split_safe_hold(restored, active_t2p, pii_scope)
         if safe:
-            safe = _PARTIAL_TOKEN_RE.sub('', safe)
+            safe = _strip_partials(safe)
         if safe:
             try:
                 await write(_mk_responses_flush_event(event_type, safe).encode('utf-8'))
@@ -1507,12 +1520,12 @@ class LlmMixin(AuditMixin):
                                         c = await self._pii_response_process(
                                             c, active_t2p
                                         )
-                                        c = _PARTIAL_TOKEN_RE.sub('', c)
+                                        c = _strip_partials(c)
                                     if rc:
                                         rc = await self._pii_response_process(
                                             rc, active_t2p
                                         )
-                                        rc = _PARTIAL_TOKEN_RE.sub('', rc)
+                                        rc = _strip_partials(rc)
                                     await resp.write(
                                         _mk_sse_event(
                                             content=c,
@@ -1835,11 +1848,8 @@ class LlmMixin(AuditMixin):
                                                     reasoning_buf = await self._pii_response_process(
                                                         reasoning_buf, active_t2p
                                                     )
-                                                    reasoning_buf = (
-                                                        _PARTIAL_TOKEN_RE.sub(
-                                                            '',
-                                                            reasoning_buf,
-                                                        )
+                                                    reasoning_buf = _strip_partials(
+                                                        reasoning_buf
                                                     )
                                                     await resp.write(
                                                         _mk_sse_event(
@@ -1877,9 +1887,8 @@ class LlmMixin(AuditMixin):
                                                     content_buf = await self._pii_response_process(
                                                         content_buf, active_t2p
                                                     )
-                                                    content_buf = _PARTIAL_TOKEN_RE.sub(
-                                                        '',
-                                                        content_buf,
+                                                    content_buf = _strip_partials(
+                                                        content_buf
                                                     )
                                                     await resp.write(
                                                         _mk_sse_event(
@@ -2020,9 +2029,8 @@ class LlmMixin(AuditMixin):
                                                     rc_restored = await self._pii_response_process(
                                                         rc_combined, active_t2p
                                                     )
-                                                    rc_restored = _PARTIAL_TOKEN_RE.sub(
-                                                        '',
-                                                        rc_restored,
+                                                    rc_restored = _strip_partials(
+                                                        rc_restored
                                                     )
                                                     await resp.write(
                                                         _mk_sse_event(
@@ -2042,10 +2050,7 @@ class LlmMixin(AuditMixin):
                                                     restored = await self._pii_response_process(
                                                         combined, active_t2p
                                                     )
-                                                    restored = _PARTIAL_TOKEN_RE.sub(
-                                                        '',
-                                                        restored,
-                                                    )
+                                                    restored = _strip_partials(restored)
                                                     await resp.write(
                                                         _mk_sse_event(
                                                             content=restored,
@@ -2246,18 +2251,12 @@ class LlmMixin(AuditMixin):
                                     content_buf = await self._pii_response_process(
                                         content_buf, active_t2p
                                     )
-                                    content_buf = _PARTIAL_TOKEN_RE.sub(
-                                        '',
-                                        content_buf,
-                                    )
+                                    content_buf = _strip_partials(content_buf)
                                 if reasoning_buf:
                                     reasoning_buf = await self._pii_response_process(
                                         reasoning_buf, active_t2p
                                     )
-                                    reasoning_buf = _PARTIAL_TOKEN_RE.sub(
-                                        '',
-                                        reasoning_buf,
-                                    )
+                                    reasoning_buf = _strip_partials(reasoning_buf)
                                 if content_buf or reasoning_buf:
                                     try:
                                         await resp.write(

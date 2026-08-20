@@ -9,10 +9,25 @@
 
 import asyncio
 
+# ── nio mock（_matrix 依赖；matrix_test.py 同模式，幂等）──
+import sys
+import types
+from unittest.mock import MagicMock
+
 import pytest
 
 from _audit import BLOCK_MESSAGE, redact_summary
 from _llm import LlmMixin
+
+if 'nio' not in sys.modules:
+    nio = types.ModuleType('nio')
+    nio.AsyncClient = MagicMock()
+    nio.RoomMessageText = MagicMock()
+    nio.ReactionEvent = MagicMock()
+    sys.modules['nio'] = nio
+
+from _matrix import MatrixMixin
+from _sse import REACTION_APPROVE, REACTION_REJECT
 
 
 class ApproveStub(LlmMixin):
@@ -259,3 +274,179 @@ class TestWhitelistIdempotency:
         # 模拟 on_reaction 中的守卫
         if ap2 and ap2.get('approved') is None:
             raise AssertionError('重复 reaction 不应生效')
+
+
+# ═══════════════════════════════════════════════════════════
+# 真实 on_reaction 集成测试（F-01 回归：审计审批分支可达性）
+# ═══════════════════════════════════════════════════════════
+
+
+class ReactionStub(MatrixMixin, LlmMixin):
+    """组合 MatrixMixin + LlmMixin 的最小桩，驱动真实 on_reaction。"""
+
+    __test__ = False
+
+    def __init__(self):
+        # MatrixMixin 依赖
+        self._lock = asyncio.Lock()
+        self.client = MagicMock()
+        self.room_id = '!test:example.org'
+        self._start_ts = 0
+        self.master_password = None
+        self.unlock_event = None
+        self._unlock_msg_id = None
+        self._unlock_in_progress = False
+        self._unlock_generation = 0
+        self.pending_requests = {}
+        self.approval_msgs = {}
+        self._registration_msgs = {}
+        self._registration_pending = {}
+        self._hash_change_msgs = {}
+        self._hash_change_pending = {}
+        self.pwd_to_token = {}
+        self.token_to_pwd = {}
+        self._base_dir = '/tmp'
+        # LlmMixin 审计依赖（AuditMixin 属性）
+        self.audit_enabled_flag = True
+        self.audit_mode = 'approve'
+        self.policy = {}
+        self.audit_timeout = 1
+        self._audit_approval_pending = {}
+        self._audit_approval_msgs = {}
+        self._audit_pending_seq = 0
+        self.approval_whitelist = set()
+        self._say_texts: list[str] = []
+
+    async def _say(self, text: str):
+        self._say_texts.append(text)
+
+    def _mk_reaction_event(self, orig: str, key: str, sender: str):
+        """构造 Matrix ReactionEvent 形状的简单对象（驱动真实 on_reaction）。"""
+        evt = MagicMock()
+        evt.server_timestamp = 9999999999999
+        evt.source = {
+            'sender': sender,
+            'content': {
+                'm.relates_to': {
+                    'event_id': orig,
+                    'key': key,
+                },
+            },
+        }
+        room = MagicMock()
+        room.room_id = self.room_id
+        return room, evt
+
+    def _seed_audit_pending(self, msg_id: str = 'audit-msg-1') -> str:
+        """注册一条待审批的审计请求，返回 req_id。"""
+        req_id = f'audit-{self._audit_pending_seq}'
+        self._audit_pending_seq += 1
+        evt = asyncio.Event()
+        self._audit_approval_pending[req_id] = {
+            'name': 'bash',
+            'args': '{}',
+            'approved': None,
+            'event': evt,
+        }
+        self._audit_approval_msgs[msg_id] = req_id
+        return req_id
+
+
+@pytest.mark.asyncio
+async def test_on_reaction_audit_approve_reaches_branch5():
+    """真实 on_reaction：审计审批 reaction ✅ → 分支 5 生效（approved=True + event set）。
+
+    回归 F-01：旧 elif 链分支 4 负向守卫吞掉审计消息，分支 5 永远不可达。
+    """
+    stub = ReactionStub()
+    req_id = stub._seed_audit_pending()
+    room, evt = stub._mk_reaction_event(
+        'audit-msg-1', REACTION_APPROVE, '@admin:example.com'
+    )
+    await stub.on_reaction(room, evt)
+    ap = stub._audit_approval_pending[req_id]
+    assert ap['approved'] is True
+    assert ap['event'].is_set()
+    assert any('审计审批' in t for t in stub._say_texts)
+
+
+@pytest.mark.asyncio
+async def test_on_reaction_audit_reject_branch5():
+    """真实 on_reaction：审计审批 reaction ❎ → rejected。"""
+    stub = ReactionStub()
+    req_id = stub._seed_audit_pending()
+    room, evt = stub._mk_reaction_event(
+        'audit-msg-1', REACTION_REJECT, '@admin:example.com'
+    )
+    await stub.on_reaction(room, evt)
+    ap = stub._audit_approval_pending[req_id]
+    assert ap['approved'] is False
+    assert ap['event'].is_set()
+
+
+@pytest.mark.asyncio
+async def test_on_reaction_audit_whitelist_blocks_non_member():
+    """白名单非空 + 发送者不在白名单 → 审计审批被忽略（approved 保持 None）。"""
+    stub = ReactionStub()
+    stub.approval_whitelist = {'@admin:example.com'}
+    req_id = stub._seed_audit_pending()
+    room, evt = stub._mk_reaction_event(
+        'audit-msg-1', REACTION_APPROVE, '@evil:example.com'
+    )
+    await stub.on_reaction(room, evt)
+    ap = stub._audit_approval_pending[req_id]
+    assert ap['approved'] is None
+    assert not ap['event'].is_set()
+
+
+@pytest.mark.asyncio
+async def test_on_reaction_audit_idempotent():
+    """幂等：approved 已定后重复 reaction 不改变结果。"""
+    stub = ReactionStub()
+    req_id = stub._seed_audit_pending()
+    room, evt = stub._mk_reaction_event(
+        'audit-msg-1', REACTION_APPROVE, '@admin:example.com'
+    )
+    await stub.on_reaction(room, evt)
+    ap = stub._audit_approval_pending[req_id]
+    assert ap['approved'] is True
+    # 重复 reaction（不同 key）
+    room2, evt2 = stub._mk_reaction_event(
+        'audit-msg-1', REACTION_REJECT, '@admin:example.com'
+    )
+    await stub.on_reaction(room2, evt2)
+    assert stub._audit_approval_pending[req_id]['approved'] is True
+
+
+@pytest.mark.asyncio
+async def test_on_reaction_credential_branch_still_works():
+    """凭据审批消息仍走分支 4（回归：正向精确匹配不破坏凭据审批）。"""
+    stub = ReactionStub()
+    req_id = 'cred-0'
+    evt = asyncio.Event()
+    stub.pending_requests[req_id] = {
+        'entry': 'db_password',
+        'approved': None,
+        'event': evt,
+        'field': 'password',
+        'use_token': True,
+    }
+    stub.approval_msgs['cred-msg-1'] = req_id
+    room, revt = stub._mk_reaction_event(
+        'cred-msg-1', REACTION_APPROVE, '@admin:example.com'
+    )
+    await stub.on_reaction(room, revt)
+    assert stub.pending_requests[req_id]['approved'] is True
+    assert evt.is_set()
+    assert any('已批准' in t for t in stub._say_texts)
+
+
+@pytest.mark.asyncio
+async def test_on_reaction_unmatched_orig_noop():
+    """未知 orig（无审批映射）→ on_reaction 不抛异常、无副作用。"""
+    stub = ReactionStub()
+    room, evt = stub._mk_reaction_event(
+        'unknown-msg', REACTION_APPROVE, '@admin:example.com'
+    )
+    await stub.on_reaction(room, evt)  # 不应抛异常
+    assert not stub._say_texts

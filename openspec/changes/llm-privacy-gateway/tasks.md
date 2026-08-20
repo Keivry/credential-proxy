@@ -68,8 +68,8 @@
 
 - [x] 7.1 追加写 `DATA_DIR/audit.log`（JSON Lines）：时间、检测类型、规则匹配、参数摘要（**先脱敏后截断**）、处置结果；**日志行 `json.dumps` 强制转义 + 剥离控制字符 `\\x00-\\x1f`；文件权限 0600；大小轮转（10MB × 5 份）**；**摘要脱敏使用实时请求级映射（含响应期新注册 PII），不得从掩码前快照取摘要**（见 design Risks）
   - 验收：日志行合法单 JSON；控制字符被剥离；0600 权限；轮转触发；响应期新 PII 明文不落盘
-- [x] 7.2 单元测试：日志格式、敏感值不落盘、追加写与并发安全、**控制字符不产生伪造条目**、**写失败 fail-closed（阻断 + 告警）**、轮转触发
-  - 验收：以对应测试通过为验收（audit_test.py 日志组全绿）
+- [x] 7.2 单元测试：日志格式、敏感值不落盘、追加写与并发安全、**控制字符不产生伪造条目**、**写失败双层 fail-closed（危险调用仍阻断 + 告警；放行调用降级告警不阻断 + 内存计数，连续 10 次升级熔断告警通道）**、轮转触发
+  - 验收：以对应测试通过为验收（audit_test.py 日志组全绿，含 `test_write_fail_deny_still_blocks` / `test_write_fail_allow_not_block`）
 
 ## 8. 配置与入口集成
 
@@ -90,3 +90,15 @@
   - 验收：每项验证输出实测记录（真实流量/日志截图）；Open Questions 结论回填 design.md
 - [x] 9.3 版本 bump（v0.9.x）+ README changelog + Docker 镜像 tag + 打 tag 触发 CI 全量构建（Docker + Go 二进制）；README 补新环境变量配置表与防护边界声明
   - 验收：v0.9.x tag 存在且 CI 全绿；README 含配置表与防护边界声明
+
+## 10. 修复记录（Round 15 审查，2026-08-21）
+
+第六轮审查（三子任务 + 主代理复验）发现 3 个接线层缺陷，已全部修复：
+
+- **F-01（🔴）审计审批分支不可达**：`_matrix.py` on_reaction elif 链分支 4 原为负向守卫形态（`not (req_id := self.approval_msgs.get(orig))` → pass），审计审批消息的 orig 不在 `approval_msgs` 中恒命中守卫，分支 5（白名单 + event id 精确匹配 + 幂等）永远不可达 → `AUDIT_MODE=approve` 审批完全失效。修复：分支 4 改为正向精确匹配并显式排除 `_audit_approval_msgs`。回归测试：`audit_approve_test.py` 新增 6 个真实 `on_reaction` 集成测试（`ReactionStub(MatrixMixin, LlmMixin)`），旧代码下 3 个 FAIL（approved 保持 None）证明回归有效。原 `TestWhitelistIdempotency` 为手工模拟分支逻辑的测试桩（从不调用真实 `on_reaction`），已由真实集成测试取代。
+- **F-02（🔴）PII 残缺 token 流式清理未接线**：`_token.py:36` 定义 `_PII_PARTIAL_TOKEN_RE`（design D2 硬性要求）但 `_llm.py` 生产代码零调用——所有 flush 路径只用凭据版 `_PARTIAL_TOKEN_RE`，`__PII_1_ab` 等残缺前缀随 safe 输出泄漏。修复：新增 `_llm._strip_partials()` 统一清理凭据 + PII 两套残缺，替换全部 14 处散落的 `_PARTIAL_TOKEN_RE.sub` 调用点。回归测试：`pii_llm_test.py` 新增 `test_strip_partials_removes_pii_partial_forms` / `test_strip_partials_keeps_cred_partials_and_plain`（含带尾部标点形态不误伤断言）。
+- **F-03（🔴）audit_cb 未传参**：`_pii.py:644` `RequestScopedTokens()` 构造未传 `audit_cb` → `_audit_malformed` 的格式不符审计事件永不触发（tasks 1.1/1.2 勾选不实）。修复：`PiiMixin._pii_request_scope` 传 `audit_cb=self._pii_audit_cb`，新增同步回调（宿主有 `audit_log_path` 时经 `_append_audit_log` 写审计日志 JSONL，含内存环形计数；纯 PiiMixin 环境退化为 logger.warning；时间戳用 `time.time()` 避免无运行循环上下文崩溃）。回归测试：`pii_token_test.py` 新增 2 个接线测试（scope._audit_cb 非 None + 事件写入 `_audit_log_ring`）。
+- **F-05（🟡）私有域名脱敏**：审查发现默认 `internal_suffixes` 策略、示例策略文件与 2 个测试文件含部署私有域名后缀（真实 `.ren` 私有域）——已全部替换为 `.corp.example` 占位（public repo 脱敏）。
+- **F-06（🟡）`normalize_args` 未拆单管道**：`_audit.py:257` 拆链正则缺单 `|`（design D3/spec 声明拆 `;`/`&&`/`|`/`||` 命令链）。修复：正则补 `\|`（`||` 优先匹配）。回归测试：`audit_test.py` 新增 `test_single_pipe_split` / `test_double_pipe_priority`，旧正则下 FAIL 证明回归有效。
+
+全部修复后：`openspec validate --strict` 通过；369 pytest 全绿；ruff check/format 全绿。

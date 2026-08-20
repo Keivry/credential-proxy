@@ -220,3 +220,75 @@ def test_pii_regex_independent_of_cred_regex():
 
     assert _token._PII_PARTIAL_TOKEN_RE is not _token.TOKEN_RE
     assert _token.PII_TOKEN_STR_RE.pattern != _token.TOKEN_STR_RE.pattern
+
+
+# ═══════════════════════════════════════════════════════════
+# F-03 回归：PiiMixin._pii_request_scope 必须接线 audit_cb
+# ═══════════════════════════════════════════════════════════
+
+
+class _AuditHost:
+    """模拟组合 AuditMixin 的宿主（提供 audit_log_path + _audit_log_ring）。"""
+
+    __test__ = False
+
+    def __init__(self):
+        self.audit_log_path = ''
+        self._audit_log_ring: list[dict] = []
+        self._audit_log_ring_max = 100
+        self.warnings: list[str] = []
+
+    def _pii_scope_or_none(self):
+        return getattr(self, '_pii_scope', None)
+
+
+def test_pii_request_scope_wires_audit_cb():
+    """_pii_request_scope 创建的 scope 必须带 audit_cb（接线断言）。"""
+    from _pii import PiiMixin
+
+    class Host(PiiMixin):
+        def __init__(self):
+            self._pii_detector = None
+            self.pii_enabled = True
+            self._pii_scope = None
+
+    h = Host()
+    # 手动初始化 detector（简化：复用 PiiMixin._init_pii 逻辑需要完整依赖）
+    from _pii import PiiDetector
+
+    h._pii_detector = PiiDetector()
+    scope = h._pii_request_scope()
+    # 核心断言：audit_cb 已接线（F-03 修复前为 None）
+    assert scope._audit_cb is not None
+    # 触发格式不符 token 还原 → 审计事件真实回调（聚合限流：同类只记一次）
+    scope.restore('__PII_1_zz__')
+    scope.restore('__PII_1_zz__')  # 重复 → 不重复回调
+    assert scope._malformed_counts['malformed'] == 2
+    assert scope._audit_cb is not None
+    # 宿主无审计路径（audit_log_path=''）→ 不抛异常（logger.warning 路径）
+    scope.clear()
+
+
+def test_pii_audit_cb_writes_ring_when_host_has_ring():
+    """宿主有 _audit_log_ring → 审计事件进入内存环形（可查询）。"""
+    from _pii import PiiDetector, PiiMixin
+
+    class Host(PiiMixin):
+        def __init__(self):
+            self._pii_detector = None
+            self.pii_enabled = True
+            self._pii_scope = None
+
+    h = Host()
+    h._pii_detector = PiiDetector()
+    # 给宿主挂审计环形（模拟 AuditMixin 组合）
+    h.audit_log_path = ''
+    h._audit_log_ring = []
+    h._audit_log_ring_max = 100
+    scope = h._pii_request_scope()
+    scope.restore('__PII_2_bad__')
+    assert len(h._audit_log_ring) == 1
+    rec = h._audit_log_ring[0]
+    assert rec['tool'] == 'pii_restore'
+    assert rec['verdict'] == 'malformed'
+    assert rec['rule'] == 'malformed'

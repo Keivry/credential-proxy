@@ -122,6 +122,23 @@ class TestNormalizeArgs:
         norm = normalize_args('{"cmd":"rm\\n-rf\\n/"}')
         assert 'rm -rf' in norm
 
+    def test_single_pipe_split(self):
+        """单管道命令链拆分（F-06 回归：`rm -rf / | sh` 必须拆开）。
+
+        旧实现拆链正则缺单 `|`，管道后的命令段与管道前粘连。
+        """
+        norm = normalize_args('{"cmd":"rm -rf /tmp | sh"}')
+        # 管道被空格替代，命令段独立
+        assert '|' not in norm
+        assert 'rm -rf /tmp' in norm
+        assert ' sh' in norm
+
+    def test_double_pipe_priority(self):
+        """`||` 作为整体拆分（不被单 `|` 误拆为两段）。"""
+        norm = normalize_args('{"cmd":"a || b"}')
+        assert '||' not in norm
+        assert 'a' in norm and 'b' in norm
+
     def test_dotdot_path_normalize(self):
         """/tmp/../etc → /etc（路径规范化后命中敏感路径）。"""
         norm = normalize_args('{"path":"/tmp/../etc/passwd"}')
