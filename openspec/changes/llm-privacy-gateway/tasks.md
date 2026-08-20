@@ -88,5 +88,5 @@
   - 验收：ruff 零告警；全量测试全绿
 - [x] 9.2 真实流量验证（llm-proxy-only 本地）：PII 请求/响应脱敏、危险 tool call 阻断、审批流程；验证 design.md Open Questions（`finish_reason` 可靠性、拒绝消息兼容性）；**补充验证项**：拒绝消息 + 后续 content 共存、纯 PII 请求流式还原、无 `finish_reason` 的流
   - 验收：每项验证输出实测记录（真实流量/日志截图）；Open Questions 结论回填 design.md
-- [ ] 9.3 版本 bump（v0.9.x）+ README changelog + Docker 镜像 tag + 打 tag 触发 CI 全量构建（Docker + Go 二进制）；README 补新环境变量配置表与防护边界声明
+- [x] 9.3 版本 bump（v0.9.x）+ README changelog + Docker 镜像 tag + 打 tag 触发 CI 全量构建（Docker + Go 二进制）；README 补新环境变量配置表与防护边界声明
   - 验收：v0.9.x tag 存在且 CI 全绿；README 含配置表与防护边界声明
