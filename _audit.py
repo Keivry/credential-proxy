@@ -17,8 +17,68 @@ import json
 import logging
 import os
 import re as _re
+import shutil
 
 logger = logging.getLogger('credential-proxy')
+
+# ═══════════════════════════════════════════════════════════
+# 审计日志（design D5：追加写 JSONL，0600，10MB×5 轮转，
+# 写失败 fail-closed 两层作用域 + 内存环形计数）
+# ═══════════════════════════════════════════════════════════
+
+AUDIT_LOG_MAX_BYTES = 10 * 1024 * 1024  # 10MB
+AUDIT_LOG_BACKUPS = 5  # 轮转保留份数
+AUDIT_LOG_WRITE_FAIL_LIMIT = 10  # 连续写失败升级阈值
+
+# 控制字符（日志注入防护：剥离 \x00-\x1f，保留 \n 由 json 转义处理）
+_CTRL_CHAR_RE = _re.compile(r'[\x00-\x1f]')
+
+
+def _strip_ctrl(s: str) -> str:
+    """剥离控制字符（design D5：防日志注入伪造条目）。"""
+    return _CTRL_CHAR_RE.sub('', s)
+
+
+def _rotate_audit_log(path: str) -> None:
+    """大小轮转：audit.log → .1 → .2 → … → .5，最老删除。"""
+    for i in range(AUDIT_LOG_BACKUPS - 1, 0, -1):
+        src = f'{path}.{i}'
+        dst = f'{path}.{i + 1}'
+        if os.path.exists(src):
+            if os.path.exists(dst):
+                os.remove(dst)
+            shutil.move(src, dst)
+    if os.path.exists(path):
+        dst = f'{path}.1'
+        if os.path.exists(dst):
+            os.remove(dst)
+        shutil.move(path, dst)
+
+
+def _append_audit_log(path: str, record: dict) -> bool:
+    """追加一条审计日志（JSON Lines）。返回 True=写入成功。
+
+    - json.dumps 强制转义 + 剥离控制字符（防日志注入伪造条目）
+    - 大小轮转（10MB × 5 份）
+    - 写失败返回 False（调用方按 fail-closed 两层作用域处置）
+    """
+    try:
+        line = json.dumps(record, ensure_ascii=False, default=str)
+        line = _strip_ctrl(line)
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        # 轮转检查（文件超限先轮转）
+        if os.path.exists(path) and os.path.getsize(path) > AUDIT_LOG_MAX_BYTES:
+            _rotate_audit_log(path)
+        # 权限 0600（新建时）
+        if not os.path.exists(path):
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            os.close(fd)
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
+        return True
+    except OSError:
+        return False
+
 
 # ═══════════════════════════════════════════════════════════
 # 极简 YAML 子集解析（仅支持策略文件所需结构）
@@ -448,6 +508,17 @@ class AuditMixin:
         self._audit_approval_pending: dict[str, dict] = {}  # req_id → pending 条目
         self._audit_approval_msgs: dict[str, str] = {}  # msg_id → req_id
         self._audit_pending_seq = 0
+        # ── 审计日志（design D5）──
+        _data_dir = os.environ.get('DATA_DIR', '')
+        self.audit_log_path = os.environ.get(
+            'AUDIT_LOG',
+            os.path.join(_data_dir, 'audit.log') if _data_dir else '',
+        )
+        # 内存环形计数（写失败 fail-closed 可观测性）
+        self._audit_log_ring: list[dict] = []  # 最近事件（含触发规则摘要）
+        self._audit_log_ring_max = 100
+        self._audit_log_fail_count = 0  # 连续写失败计数（升级熔断阈值）
+        self._audit_log_fail_limit = AUDIT_LOG_WRITE_FAIL_LIMIT
 
     def _ensure_audit_init(self):
         """lazy 初始化（首次访问时读取环境变量）。"""
@@ -550,6 +621,9 @@ class AuditMixin:
             return 'allow'
         # deny 名单（精确匹配）
         if name in self.policy.get('deny', []):
+            await self._audit_log_event(
+                'deny', name, args_json, 'deny-list', 'deny 名单精确匹配'
+            )
             return 'deny'
         # 危险模式（规范化后匹配）——对所有工具生效。
         # 规则匹配「工具名 + 参数」拼接文本（敏感路径规则依赖工具名）。
@@ -579,6 +653,15 @@ class AuditMixin:
                         if isinstance(rule, dict)
                         else pattern,
                     )
+                    await self._audit_log_event(
+                        'deny',
+                        name,
+                        args_json,
+                        rule.get('reason', pattern)
+                        if isinstance(rule, dict)
+                        else pattern,
+                        '危险模式命中',
+                    )
                     return 'deny'
             except _re.error:
                 logger.error('审计规则正则编译失败: %r', pattern)
@@ -606,11 +689,106 @@ class AuditMixin:
                         name,
                         host,
                     )
+                    await self._audit_log_event(
+                        'deny', name, args_json, 'network-exfil', '网络外传目标'
+                    )
                     return 'deny'
         # allow 名单（精确匹配）
         if name in self.policy.get('allow', []):
+            await self._audit_log_event(
+                'allow', name, args_json, 'allow-list', 'allow 名单'
+            )
             return 'allow'
+        await self._audit_log_event('allow', name, args_json, '', '默认放行')
         return 'allow'
+
+    # ── 审计日志（design D5）──
+
+    def _audit_live_redact(self, text: str) -> str:
+        """实时请求级映射脱敏（含响应期新注册 PII）。
+
+        design D5 硬性：日志摘要不得从掩码前快照取——若 PII scope 可用，
+        先把占位符还原为明文，再经 redact_summary 的密钥形态替换盖住
+        （还原出的明文在 redact_summary 内被 [REDACTED:<type>] 替换）。
+        无 scope（纯 AuditMixin 单测）时退化为仅 secret 形态替换。
+        """
+        if not text:
+            return ''
+        scope_fn = getattr(self, '_pii_scope_or_none', None)
+        if scope_fn is not None:
+            try:
+                scope = scope_fn()
+                if scope is not None:
+                    pii_t2p = getattr(scope, 'pii_t2p', {})
+                    resp_t2p = getattr(scope, 'resp_t2p', {})
+                    for tok, plain in pii_t2p.items():
+                        if tok and plain:
+                            text = text.replace(tok, plain)
+                    # 响应期新注册 PII：token 原样保留（脱敏由 redact_summary 完成）
+                    for tok in resp_t2p:
+                        if tok:
+                            text = text.replace(tok, tok)
+            except (
+                AttributeError,
+                TypeError,
+            ) as e:  # pragma: no cover — scope 异常不影响审计
+                logger.debug('审计日志脱敏 scope 访问异常: %s', e)
+        return redact_summary(text)
+
+    async def _audit_log_event(
+        self,
+        verdict: str,
+        name: str,
+        args_json: str,
+        rule_hit: str = '',
+        note: str = '',
+    ) -> None:
+        """写一条审计日志（JSONL 追加）。
+
+        fail-closed 两层作用域（design D5 硬性）：
+        - deny/危险路径写失败：仍阻断 + 告警 + 内存环形计数（不静默放行）
+        - allow/放行路径写失败：告警不阻断 + 内存计数，连续
+          AUDIT_LOG_WRITE_FAIL_LIMIT 次 → 升级熔断告警
+        """
+        self._ensure_audit_init()
+        summary = self._audit_live_redact(args_json)
+        record = {
+            'ts': asyncio.get_event_loop().time(),
+            'tool': name,
+            'verdict': verdict,
+            'rule': rule_hit,
+            'summary': summary,
+            'note': note,
+        }
+        # 内存环形计数（进程存活期内可查询——告警通道不可用时事件不无痕）
+        ring = getattr(self, '_audit_log_ring', [])
+        ring.append(record)
+        if len(ring) > getattr(self, '_audit_log_ring_max', 100):
+            del ring[: len(ring) - getattr(self, '_audit_log_ring_max', 100)]
+        path = getattr(self, 'audit_log_path', '') or ''
+        if not path:
+            return  # 未配置路径（测试环境）→ 仅内存
+        ok = await asyncio.get_running_loop().run_in_executor(
+            None, _append_audit_log, path, record
+        )
+        if ok:
+            self._audit_log_fail_count = 0
+            return
+        # 写失败：两层 fail-closed
+        self._audit_log_fail_count = getattr(self, '_audit_log_fail_count', 0) + 1
+        if verdict == 'deny':
+            # 危险调用写失败：仍阻断（调用方已 deny），告警 + 环形计数
+            logger.error('审计日志写失败（危险调用，已阻断）: %s (%s)', name, path)
+        else:
+            # 放行调用写失败：告警不阻断；连续失败升级熔断
+            logger.error('审计日志写失败: %s (%s)', name, path)
+            if self._audit_log_fail_count >= getattr(self, '_audit_log_fail_limit', 10):
+                logger.critical(
+                    '审计日志连续 %d 次写失败（熔断告警）: %s',
+                    self._audit_log_fail_count,
+                    path,
+                )
+                self._audit_log_fail_count = 0
 
     def audit_precheck(self, name: str, args_prefix: str) -> bool:
         """预检（design D4）：同步廉价前缀匹配，判定前暂停 flush。

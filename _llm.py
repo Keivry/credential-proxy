@@ -569,8 +569,11 @@ class LlmMixin(AuditMixin):
                     # 审批模式：发起 Matrix 审批；approved → 放行（不注入拒绝）
                     result = await self._request_audit_approval(name, args)
                     if result == 'approved':
+                        # 审批通过：补记审计日志（verdict=allow, note=approved）
+                        await self._audit_log_event('allow', name, args, '', '审批通过')
                         continue
                     # rejected/expired/failed → 注入拒绝
+                    await self._audit_log_event('deny', name, args, '', f'审批{result}')
                 injections.append(self._build_block_event())
         return injections
 

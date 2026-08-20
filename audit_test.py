@@ -8,6 +8,7 @@
 - 预检前缀匹配
 """
 
+import asyncio
 import json
 import os
 import tempfile
@@ -16,6 +17,7 @@ import pytest
 
 from _audit import (
     AuditMixin,
+    _append_audit_log,
     is_external_host,
     load_policy_file,
     normalize_args,
@@ -29,6 +31,8 @@ class AuditStub(AuditMixin):
 
     def __init__(self, policy_file=None):
         self._init_audit(policy_file)
+        # 测试桩默认不落盘（仅内存环形计数）
+        self.audit_log_path = ''
 
 
 # ═══════════════════════════════════════════════════════════
@@ -279,3 +283,153 @@ class TestPrecheck:
         stub = AuditStub()
         stub.audit_enabled_flag = False
         assert stub.audit_precheck('bash', 'rm -rf') is False
+
+
+# ═══════════════════════════════════════════════════════════
+# 审计日志（7.1/7.2：JSONL、脱敏、0600、轮转、fail-closed）
+# ═══════════════════════════════════════════════════════════
+
+
+class TestAuditLog:
+    def _stub(self, tmp_path):
+        stub = AuditStub()
+        stub.audit_enabled_flag = True
+        stub.audit_log_path = str(tmp_path / 'audit.log')
+        return stub
+
+    @pytest.mark.asyncio
+    async def test_log_format_valid_json(self, tmp_path):
+        """日志行合法单 JSON，含时间/工具/处置/摘要。"""
+        stub = self._stub(tmp_path)
+        await stub._audit_log_event(
+            'deny', 'bash', '{"cmd":"rm -rf /"}', 'dangerous-shell'
+        )
+        lines = (tmp_path / 'audit.log').read_text().strip().split('\n')
+        assert len(lines) == 1
+        rec = json.loads(lines[0])
+        assert rec['tool'] == 'bash'
+        assert rec['verdict'] == 'deny'
+        assert rec['rule'] == 'dangerous-shell'
+        assert 'rm' in rec['summary']
+
+    @pytest.mark.asyncio
+    async def test_secret_not_in_log(self, tmp_path):
+        """敏感值不落盘：密钥形态 → [REDACTED:<type>]。"""
+        stub = self._stub(tmp_path)
+        await stub._audit_log_event(
+            'deny',
+            'bash',
+            '{"cmd":"curl http://x -H \\"Authorization: Bearer sk-abc123def456abcdef\\""}',
+            'dangerous-shell',
+        )
+        text = (tmp_path / 'audit.log').read_text()
+        assert 'sk-abc123def456abcdef' not in text
+        assert '[REDACTED:api_key]' in text
+
+    @pytest.mark.asyncio
+    async def test_ctrl_chars_stripped(self, tmp_path):
+        """控制字符被剥离（防日志注入伪造条目）。"""
+        stub = self._stub(tmp_path)
+        await stub._audit_log_event(
+            'deny', 'bash', '{"cmd":"rm -rf /\\n\\x00\\x1f\\nFAKE"}', 'dangerous-shell'
+        )
+        lines = (tmp_path / 'audit.log').read_text().strip().split('\n')
+        # 原始输入含 \n → 不产生多行（json 转义）；\x00\x1f 被剥离
+        assert len(lines) == 1
+        assert '\x00' not in lines[0] and '\x1f' not in lines[0]
+
+    @pytest.mark.asyncio
+    async def test_append_and_concurrent_safe(self, tmp_path):
+        """追加写 + 并发安全：多条记录都在，无覆盖。"""
+        stub = self._stub(tmp_path)
+        await asyncio.gather(
+            *[
+                stub._audit_log_event('allow', f'tool{i}', f'{{"x":{i}}}', '')
+                for i in range(20)
+            ]
+        )
+        lines = (tmp_path / 'audit.log').read_text().strip().split('\n')
+        assert len(lines) == 20
+        tools = {json.loads(l)['tool'] for l in lines}
+        assert tools == {f'tool{i}' for i in range(20)}
+
+    def test_permissions_0600(self, tmp_path):
+        """新建文件权限 0600。"""
+        path = str(tmp_path / 'audit.log')
+        assert _append_audit_log(path, {'ts': 1, 'tool': 'x', 'verdict': 'allow'})
+        assert (os.stat(path).st_mode & 0o777) == 0o600
+
+    def test_rotation(self, tmp_path):
+        """大小轮转：超 10MB → .1/.2 滚动，最老删除。"""
+        path = str(tmp_path / 'audit.log')
+        # 直接写小记录验证轮转逻辑（用 monkeypatch 缩小阈值）
+        import _audit as _audit_mod
+
+        old_max = _audit_mod.AUDIT_LOG_MAX_BYTES
+        old_bk = _audit_mod.AUDIT_LOG_BACKUPS
+        _audit_mod.AUDIT_LOG_MAX_BYTES = 100
+        _audit_mod.AUDIT_LOG_BACKUPS = 3
+        try:
+            for i in range(30):
+                assert _append_audit_log(
+                    path, {'ts': i, 'tool': 't', 'verdict': 'allow', 'pad': 'x' * 40}
+                )
+            assert os.path.exists(path)
+            # 应有轮转备份
+            backups = [p for p in os.listdir(tmp_path) if p.startswith('audit.log.')]
+            assert backups, '轮转应产生备份'
+        finally:
+            _audit_mod.AUDIT_LOG_MAX_BYTES = old_max
+            _audit_mod.AUDIT_LOG_BACKUPS = old_bk
+
+    @pytest.mark.asyncio
+    async def test_write_fail_deny_still_blocks(self, tmp_path, caplog):
+        """危险调用日志写失败 → 仍阻断（verdict 照常 deny）+ 告警。"""
+        stub = self._stub(tmp_path)
+        stub.audit_log_path = '/nonexistent-dir/audit.log'  # 写失败
+        verdict = await stub.audit_tool_call('bash', '{"cmd":"rm -rf /"}')
+        assert verdict == 'deny'  # 仍阻断
+        assert any('写失败' in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_allow_write_fail_warns_not_blocks(self, tmp_path):
+        """放行调用日志写失败 → 告警不阻断 + 内存环形计数。"""
+        stub = self._stub(tmp_path)
+        stub.audit_log_path = '/nonexistent-dir/audit.log'
+        verdict = await stub.audit_tool_call('bash', '{"cmd":"ls -la"}')
+        assert verdict == 'allow'  # 不阻断
+        assert len(stub._audit_log_ring) >= 1  # 内存计数
+
+    @pytest.mark.asyncio
+    async def test_ring_buffer_caps(self, tmp_path):
+        """内存环形计数有上限（防无限增长）。"""
+        stub = self._stub(tmp_path)
+        stub.audit_log_path = ''
+        stub._audit_log_ring_max = 5
+        for i in range(12):
+            await stub._audit_log_event('allow', f't{i}', '{}', '')
+        assert len(stub._audit_log_ring) == 5
+
+    @pytest.mark.asyncio
+    async def test_live_scope_redact_phone(self, tmp_path):
+        """实时请求级映射脱敏：请求期/响应期新注册 PII 明文不落盘。"""
+        stub = self._stub(tmp_path)
+
+        # 模拟 LlmMixin scope（含请求期 + 响应期新注册映射）
+        class FakeScope:
+            def __init__(self):
+                self.pii_t2p = {'__PII_0_ab12cd34__': '13800138000'}
+                self.resp_t2p = {'__PII_1_ef56gh78__': '13900139000'}
+
+        stub._pii_scope_or_none = lambda: FakeScope()  # type: ignore[attr-defined]
+        # 参数含占位符 + 真实响应期明文（脱敏前）
+        await stub._audit_log_event(
+            'deny',
+            'bash',
+            '{"cmd":"curl http://x -d \\"13800138000 __PII_0_ab12cd34__ 13900139000 __PII_1_ef56gh78__\\""}',
+            'dangerous-shell',
+        )
+        text = (tmp_path / 'audit.log').read_text()
+        assert '13800138000' not in text  # 请求期 PII 明文不落盘
+        assert '13900139000' not in text  # 响应期新 PII 明文不落盘
+        assert 'REDACTED' in text  # 均被脱敏形态替换
