@@ -1,6 +1,6 @@
 ## 1. PII 请求级 token 机制
 
-- [ ] 1.1 扩展 `_token.py`：新增请求级映射容器（`RequestScopedTokens`），支持独立于全局 `pwd_to_token` 的 `pii_p2t`/`pii_t2p`、`__PII_<seq>_<rand8>__` token 前缀生成（**含随机段，见 design D2 token 不可预测性**；rand8 = 8 位 hex 随机段，防占位符枚举）、同值去重复用 token、`_restore` 时请求级优先且**仅还原请求期注册 token**（响应期注册 token 形态匹配也原样保留）——**PII 未命中不查全局、原样保留；全局兜底仅凭据路径**（**PII 路径禁止触达全局凭据映射**）
+- [ ] 1.1 扩展 `_token.py`：新增请求级映射容器（`RequestScopedTokens`），支持独立于全局 `pwd_to_token` 的 `pii_p2t`/`pii_t2p`、`__PII_<seq>_<rand8>__` token 前缀生成（**含随机段，见 design D2 token 不可预测性**；rand8 = 8 位 hex 随机段，**必须用 CSPRNG 生成（`secrets.token_hex(4)`，禁止 `random`/时间派生）**，防占位符枚举；**格式不符 token 审计事件聚合限流**：同请求同类事件只记一次 + 计数，防批量注入刷审计日志）、同值去重复用 token、`_restore` 时请求级优先且**仅还原请求期注册 token**（响应期注册 token 形态匹配也原样保留）——**PII 未命中不查全局、原样保留；全局兜底仅凭据路径**（**PII 路径禁止触达全局凭据映射**）
   - 验收：请求级映射创建/还原/清理测试通过；同值复用同一 token；`__PII_` token 不进入全局 `pwd_to_token`
 - [ ] 1.2 单元测试：请求级映射生命周期（创建/还原/清理）、与全局凭据映射互不串扰、token 前缀不冲突、越界/格式不符 token 原样保留并记审计事件
   - 验收：上述四类用例全部覆盖且断言通过；PII 还原路径不触达全局凭据映射（代码级隔离断言）
@@ -26,8 +26,8 @@
   - 验收：纯 PII 请求（无凭据）流式响应正确还原；三处门控含 PII 判定
 - [ ] 3.2 响应侧：按「**还原 → 响应侧检测 → 转发**」顺序执行（见 design D2）：`_restore` 还原请求级占位符 → 检测并**仅跳过本次还原路径产出的明文**（还原产物标记位判定，非值级跳过——模型独立输出与请求期同值 PII 仍掩码）→ 新检测值注册实时请求级映射；未脱敏 PII 回显替换为占位符；非流式与流式（SSE 各协议路径）都要覆盖；**增量扫描**（每 chunk 只扫新增 + 尾部持有，禁止全量重扫累积文本）
   - 验收：模型回显占位符场景客户端收到脱敏文本而非明文；还原后明文不被二次掩码；模型独立输出同值明文被掩码（非还原产物不放行）；200 chunk 流增量扫描耗时 < 全量重扫 1/10（性能断言）
-- [ ] 3.3 集成测试：请求含 PII + 凭据混合、流式响应还原、响应回显 PII 拦截、**明文 PII 跨分片切断的累积还原**（含断连残留不泄漏，见 design D2 明文分片累积）、**标点边界缓冲**（语义边界 flush + 字节窗口兜底）、**候选值感知切分**（IP/邮箱跨标点切断不漏检，`8.8.`+`8.8` 拼回完整 IP 后命中）、**超长明文 API key 切断**（>64 字符，验证泄漏窗口声明）、**残缺 token 处理**（完整保留/残缺前缀剥离/残缺后缀暂存/流末丢弃，含 `__PII_0001_ab,` 尾部标点形态）——**测试配置引用见 8.1 环境变量清单**（`PII_REDACTION_ENABLED`/`PII_RESPONSE_SIDE`，与 8.1 保持一致）
-  - 验收：混合请求两套 token 各还原各的互不串扰；断连残留按不完整明文处理不泄漏；标点边界下 safe 完整 flush、hold <64 字符；候选值切断不漏检；残缺 token（含尾部标点）不泄漏结构
+- [ ] 3.3 集成测试：请求含 PII + 凭据混合、流式响应还原、响应回显 PII 拦截、**明文 PII 跨分片切断的累积还原**（含断连残留不泄漏，见 design D2 明文分片累积）、**标点边界缓冲**（语义边界 flush + 字节窗口兜底）、**候选值感知切分**（IP/邮箱跨标点切断不漏检：`8.`/`8.8.`/`8.8.8.` 三种部分 IP 尾部形态 + `8.8.`+`8.8` 拼回完整 IP 后命中；IPv6 部分形态 `fe80::` 同理）、**超长明文 API key 切断**（`sk-ant-` 前缀 key 跨 3 chunk 切断不泄漏明文片段，见 design D2 明文长值切断边界声明）、**残缺 token 处理**（完整保留/残缺前缀剥离/残缺后缀暂存/流末丢弃，含 `__PII_0001_ab,` 尾部标点形态）——**测试配置引用见 8.1 环境变量清单**（`PII_REDACTION_ENABLED`/`PII_RESPONSE_SIDE`/`PII_HOLD_MAX`，与 8.1 保持一致）
+  - 验收：混合请求两套 token 各还原各的互不串扰；断连残留按不完整明文处理不泄漏；标点边界下 safe 完整 flush、hold <64 字符；候选值切断（1/2/3 段尾点形态）不漏检；超长 key 跨 3 chunk 不泄漏明文片段；残缺 token（含尾部标点）不泄漏结构
 
 ## 4. 输出审计钩子（tool call 检测）
 
@@ -57,8 +57,8 @@
   - 验收：非白名单 reaction 被忽略；同请求重复 reaction 只生效首次；摘要不含明文密钥/PII；`_ask` 返回 None 时 pending 立即清理且客户端收到拒绝结果
 - [ ] 6.2 流式挂起细节：挂起期间**继续读上游并缓冲**（上限 `AUDIT_HOLD_MAX_BYTES`，超限按 rejected fail-closed），审批完成统一放行/替换，不破坏 SSE 流结构；挂起期间按事件序缓冲后续 content；**缓冲中出现新的危险 tool call 一律 fail-closed 拒绝，不得未经审批放行**（见 design Risks）
   - 验收：缓冲超限按 rejected 注入拒绝且 pending 清理；挂起期间新危险调用被拒绝；缓冲 content 按事件序放行/替换
-- [ ] 6.3 集成测试：审批通过/拒绝/超时三种路径 + 流式完整性 + 白名单/幂等 + **发送失败**（`_ask`→None）+ **预检误判恢复**（首个可疑 delta 暂停 flush → 完整审计通过 → 恢复续传剩余 delta，无重复 flush）
-  - 验收：七条路径（含发送失败、预检恢复）全绿；流式完整性断言（无重复拼接/无 dangling tool_use）
+- [ ] 6.3 集成测试：审批通过/拒绝/超时三种路径 + 流式完整性 + 白名单/幂等 + **发送失败**（`_ask`→None）+ **预检误判恢复**（首个可疑 delta 暂停 flush → 完整审计通过 → 恢复续传剩余 delta，无重复 flush）+ **预检同步暂停**（delta 到达同步置 pause，前缀匹配（`rm`→`rm -rf`）触发，await 判定不先于暂停）+ **正常结束不完整 tool call**（`finish_reason`/`[DONE]` 前正常结束但无终止事件 → fail-closed 丢弃 + 注入终止事件，不 flush 残缺参数）+ **拒绝后缓冲 content 丢弃**（rejected/expired/upstream_down 终态缓冲 content 不转发）
+  - 验收：七条路径（含发送失败、预检恢复、预检同步暂停、正常结束不完整、拒绝缓冲丢弃）全绿；流式完整性断言（无重复拼接/无 dangling tool_use）
 - [ ] 6.4 审批取消/收尾：流结束/异常/客户端断连 → 取消审批（`event.set()` + `_cleanup_request`）+ handler `try/finally` 清理请求级映射 + 周期清扫兜底（**后台定时任务 60s 扫描孤儿 pending 置 rejected 并清理**——`_matrix.py` CMD_LOCK 为 lock 触发的一次性清空，语义不同，仅作启发参考，见 design D4）
   - 验收：客户端断连后 pending_requests 无僵尸条目；僵尸审批消息再点 ✅ 无效；周期清扫能回收模拟泄漏的孤儿条目
 - [ ] 6.5 **异常路径测试组**（注入失败场景，复用 `sse_stream_loop_test.py` 模式）：上游断连（ServerDisconnectedError）、SSE 流中断、坏 JSON、客户端提前断连（SSE_CLIENT_GONE）、超时、空流、**缓冲超限（hold overflow）**、**超时与上游断连同时触发（竞态，验证处置幂等——后到者发现 pending 已删则跳过）**
@@ -73,13 +73,13 @@
 
 ## 8. 配置与入口集成
 
-- [ ] 8.1 `proxy.py`：解析新环境变量（`PII_REDACTION_ENABLED`、`PII_RESPONSE_SIDE`、`AUDIT_MODE`、`AUDIT_TIMEOUT`、`AUDIT_HOLD_MAX_BYTES`、`AUDIT_POLICY_FILE`、`APPROVAL_WHITELIST`），组合 `PiiMixin` + `AuditMixin`；`AUDIT_TIMEOUT` 取值校验 **≥1s 且拒绝 110-130s 区间**（0/负值/竞态区间启动报错）；`AUDIT_MODE=approve` 且无 `APPROVAL_WHITELIST` 启动报错
-  - 验收：非法 `AUDIT_TIMEOUT`（0/负/110-130）启动报错；`AUDIT_MODE=approve` 且无白名单配置时启动报错；`AUDIT_MODE=approve` 且配置白名单时正常启动
+- [ ] 8.1 `proxy.py`：解析新环境变量（`PII_REDACTION_ENABLED`、`PII_RESPONSE_SIDE`、`PII_HOLD_MAX`（尾部持有上限，默认 64，取值 ≥1 正整数）、`AUDIT_MODE`、`AUDIT_TIMEOUT`、`AUDIT_HOLD_MAX_BYTES`、`AUDIT_POLICY_FILE`、`APPROVAL_WHITELIST`），组合 `PiiMixin` + `AuditMixin`；`AUDIT_TIMEOUT` 取值校验 **≥1s 且拒绝 110-130s 区间**（0/负值/竞态区间启动报错）；`AUDIT_MODE=approve` 且无 `APPROVAL_WHITELIST` 启动报错
+  - 验收：非法 `AUDIT_TIMEOUT`（0/负/110-130）启动报错；`AUDIT_MODE=approve` 且无白名单配置时启动报错；`AUDIT_MODE=approve` 且配置白名单时正常启动；`PII_HOLD_MAX` 默认 64、非法值（0/负/非整数）启动报错
 - [ ] 8.2 轻量入口（llm-proxy-only / credential-proxy-only）按需引入 Mixin；**approve 模式仅完整 proxy（含 MatrixMixin）支持，轻量入口配置 approve 时启动报错或降级 block**；Docker entrypoint/compose 增加环境变量透传与文档；**README 配置表 + 默认关闭安全警示**（PII/审计默认关闭 = 未启用前明文与危险调用不受保护，见 design D5 安全警示）
   - 验收：轻量入口配置 approve 时明确报错或降级（不静默忽略）；文档含新环境变量配置表 + 默认关闭安全警示
 - [ ] 8.3 默认关闭回归验证：不配置新变量时全量测试通过、行为与现状一致
   - 验收：全量测试全绿；对照基线请求/响应字节级一致（无默认路径行为变化）
-- [ ] 8.4 **大 body 性能验证**：多 MB body（多模态 base64）逐 recognizer 扫描耗时上限（**分层锚点，见 design D1 性能策略**：扫描 ~90ms/1MB 联合正则、~0.8ms 纯文本粗筛、~124µs/1KB chunk、<100KB 请求扫描 ~9ms、字典启用时另计 ~5ms/100KB、每事件还原/分割/写出另计）；**粗筛 25x 仅在纯非 ASCII 无数字文本成立**（混合文本不适用）；**流式增量扫描锚点**：1MB 增量 ~90ms（注：2.3s 全量重扫为 200 chunk 场景的对照值，90x 为该场景比值，非 1MB 全量对照）
+- [ ] 8.4 **大 body 性能验证**：多 MB body（多模态 base64）逐 recognizer 扫描耗时上限（**分层锚点，见 design D1 性能策略**：扫描 ~90ms/1MB 联合正则、~0.8ms 纯文本粗筛、~124µs/1KB chunk、<100KB 请求扫描 ~9ms、字典启用时另计 ~5ms/100KB、每事件还原/分割/写出另计）；**粗筛 25x 仅在纯非 ASCII 无数字文本成立**（混合文本不适用）；**流式增量扫描锚点**：1MB 增量 ~90ms（**口径说明：1MB 增量锚点 = 联合正则 1MB 全量扫描 90ms**——增量扫描仅省去已处理部分，锚点值本身仍是全量扫描口径；2.3s 全量重扫为 200 chunk 场景的对照值，90x 为该场景比值，非 1MB 全量对照）
   - 验收：多 MB body 扫描耗时在声明锚点内（记录实测值，超限则修订 design 声明）；性能断言覆盖联合正则/粗筛/字典独立/增量扫描
 
 ## 9. 验证与发布
