@@ -25,6 +25,7 @@ from _credential import _CREDENTIAL_API_PORT as CREDENTIAL_API_PORT
 from _credential import CredentialMixin
 from _llm import LlmMixin, parse_llm_proxy_env
 from _matrix import MatrixMixin
+from _pii import PiiMixin
 from _registry import RegistryMixin
 from _token import TokenMixin
 from _tpm import TpmMixin
@@ -49,6 +50,7 @@ class CredentialProxy(
     MatrixMixin,
     RegistryMixin,
     CredentialMixin,
+    PiiMixin,
     LlmMixin,
 ):
     """凭据代理：TPM 解锁 → Matrix 审批 → KeePass 查询 → LLM 脱敏代理。"""

@@ -11,7 +11,13 @@ from aiohttp import ClientSession, ClientTimeout, web
 from aiohttp.client_exceptions import ClientConnectionError, ServerDisconnectedError
 
 from _sse import SSE_CLIENT_GONE, filter_hop_headers
-from _token import TOKEN_RE, TOKEN_STR_RE
+from _token import (
+    FULL_PII_TOKEN_RE,
+    PII_TOKEN_RE,
+    PII_TOKEN_STR_RE,
+    TOKEN_RE,
+    TOKEN_STR_RE,
+)
 
 logger = logging.getLogger('credential-proxy')
 
@@ -230,12 +236,26 @@ def _mk_anthropic_flush_event(parsed: dict, text: str, field: str) -> str:
     return 'data: ' + json.dumps(out, ensure_ascii=False) + '\n'
 
 
-def _split_safe_hold(content: str, active_t2p: dict) -> tuple[str, str]:
+def _strip_token_forms(content: str) -> str:
+    """剥离凭据 + PII token 形态（safe 输出前清理残留 token 字符串）。
+
+    - 凭据 token（TOKEN_STR_RE）完整形态剥离
+    - PII token（PII_TOKEN_STR_RE）完整形态剥离——响应期注册的 token
+      在还原时被保留（resp_t2p 形态匹配不还原），safe 输出前必须剥离
+      防止把 token 字符串发给客户端
+    """
+    out = TOKEN_STR_RE.sub('', content)
+    return PII_TOKEN_STR_RE.sub('', out)
+
+
+def _split_safe_hold(content: str, active_t2p: dict, pii_scope=None) -> tuple[str, str]:
     """将累积文本分割为 (safe, hold)。
 
     - safe: 可安全输出（剥离行中完整 token 形态——未还原的必是幻觉/未知句柄；
-       active 内的真实 token 已被 _restore 还原为明文）
+      active 内的真实 token 已被 _restore 还原为明文）
     - hold: 保留到下个分片（以 __ 开头且匹配 active token 前缀）
+    - pii_scope（可选）：提供 PII token 前缀集合，使 __PII_*__ 形态同样
+      参与完整形态检测 / hold 判定（防 PII token 跨分片截断泄漏）
     """
     if not content:
         return '', ''
@@ -245,15 +265,28 @@ def _split_safe_hold(content: str, active_t2p: dict) -> tuple[str, str]:
     if m:
         token_str = m.group(0)
         if token_str not in active_t2p:
-            return TOKEN_STR_RE.sub('', content[: m.start()]), token_str
+            return _strip_token_forms(content[: m.start()]), token_str
+    # PII 完整 token 形态（未还原的必是幻觉/未知句柄）→ 整体 hold
+    if pii_scope is not None:
+        m_pii = FULL_PII_TOKEN_RE.search(content)
+        if m_pii:
+            token_str = m_pii.group(0)
+            return (
+                _strip_token_forms(content[: m_pii.start()]),
+                token_str,
+            )
     last_us = content.rfind('__')
     if last_us < 0:
-        return TOKEN_STR_RE.sub('', content), ''
+        return _strip_token_forms(content), ''
     suffix = content[last_us:]
     maybe_prefix = any(t.startswith(suffix) for t in active_t2p)
+    if pii_scope is not None:
+        # PII token 前缀参与 hold 判定
+        pii_tokens = set(pii_scope.pii_t2p) | set(pii_scope.resp_t2p)
+        maybe_prefix = maybe_prefix or any(t.startswith(suffix) for t in pii_tokens)
     if maybe_prefix:
-        return TOKEN_STR_RE.sub('', content[:last_us]), suffix
-    return TOKEN_STR_RE.sub('', content), ''
+        return _strip_token_forms(content[:last_us]), suffix
+    return _strip_token_forms(content), ''
 
 
 def _sanitize_json(text: str) -> str:
@@ -275,15 +308,144 @@ def _sanitize_json(text: str) -> str:
             result.append(ch)
             continue
         if in_string and (ord(ch) < 0x20 or ch == '\x7f'):
-            # Unescaped control char inside string → replace with escaped \n
+            # Unescaped control char inside string → replace with escaped \\n
             result.append('\\n')
             continue
         result.append(ch)
     return ''.join(result)
 
 
+# 规范化分隔符集合（design D2 skip 判定）：[-. ] 连字符、点、空格
+_SEP_NORMALIZE_RE = _re.compile(r'[-. ]')
+
+
+def re_sub_seps(value: str) -> str:
+    """去除分隔符（[-. ]）后返回，用于还原产物规范化等价比较。"""
+    return _SEP_NORMALIZE_RE.sub('', value)
+
+
 class LlmMixin:
     """Mixin: LLM 反向代理，脱敏/还原。"""
+
+    # ── PII 响应侧处理（还原 → 响应侧检测 → 转发）──
+
+    def _pii_restore(
+        self,
+        text: str,
+        active_t2p: dict,
+        pii_scope,
+    ) -> tuple[str, list]:
+        """还原文本（凭据 + 请求级 PII），返回 (还原后文本, 还原产物区间)。
+
+        PII 还原路径：请求级映射优先；响应期 token 形态匹配也原样保留。
+        还原产物区间（restored_spans）供响应侧检测跳过——模型回显请求期
+        占位符还原出的明文不得二次掩码（design D2 硬性）。
+        """
+        # 凭据还原（现有逻辑）
+        restored = self._restore(text, active_t2p)
+        # PII 请求级还原（仅还原请求期注册 token）
+        restored_spans: list = []
+        if pii_scope is not None:
+            scope = pii_scope
+
+            def _repl_pii(m):
+                tok = m.group(0)
+                if tok in scope.pii_t2p:
+                    start = m.start()
+                    plain = scope.pii_t2p[tok]
+                    # 记录还原产物区间（原 token 位置 → 明文）
+                    restored_spans.append(
+                        (start, start + len(plain), plain),
+                    )
+                    return plain
+                if tok in scope.resp_t2p:
+                    return tok  # 响应期 token 原样保留
+                return tok
+
+            restored = PII_TOKEN_STR_RE.sub(_repl_pii, restored)
+        return restored, restored_spans
+
+    async def _pii_response_scan(
+        self,
+        text: str,
+        restored_spans: list,
+        pii_scope,
+    ) -> str:
+        """响应侧 PII 检测：仅跳过还原产物区间，新检测值注册实时映射。
+
+        模型独立输出（非还原产物）的同值明文仍掩码为新占位符——
+        不得因值与请求期已注册值等价而放行（design D2 硬性）。
+        """
+        if not getattr(self, 'pii_enabled', False) or not text:
+            return text
+        if not getattr(self, 'pii_response_side', True):
+            return text
+        if pii_scope is None:
+            return text
+        # 检测（跳过还原产物区间）
+        hits = await self._pii_detector.scan(
+            text,
+            credential_p2t=getattr(self, 'pwd_to_token', None),
+        )
+        if not hits:
+            return text
+        # 过滤：命中值若完全落在还原产物区间内（或规范化等价）→ 跳过
+        filtered: list[tuple[str, str]] = []
+        for typ, value in hits:
+            # 值级规范化等价比较（去除 [-. ] 分隔符）仅适用于还原产物
+            norm_value = re_sub_seps(value)
+            is_restored = False
+            for _s, _e, plain in restored_spans:
+                if norm_value == re_sub_seps(plain):
+                    is_restored = True
+                    break
+            if not is_restored:
+                filtered.append((typ, value))
+        if not filtered:
+            return text
+        # 新检测值注册实时请求级映射（响应期）并替换
+        seen: set[str] = set()
+        items = []
+        for typ, value in filtered:
+            if value in seen:
+                continue
+            seen.add(value)
+            items.append((len(value), typ, value))
+        items.sort(key=lambda x: x[0], reverse=True)
+        for _, typ, value in items:
+            token = pii_scope.register(value, response_side=True)
+            if token != value:
+                text = text.replace(value, token)
+        return text
+
+    def _pii_active(self) -> bool:
+        """当前请求是否有活跃 PII 作用域（PII 启用且已建 scope）。
+
+        无 PiiMixin 的宿主（测试桩）返回 False——PII 功能完全禁用。
+        """
+        return bool(getattr(self, '_pii_scope', None))
+
+    def _pii_scope_or_none(self):
+        """返回当前请求 PII scope（无则 None）。"""
+        return getattr(self, '_pii_scope', None)
+
+    async def _pii_response_process(
+        self,
+        text: str,
+        active_t2p: dict,
+    ) -> str:
+        """统一响应侧文本处理：还原（凭据+请求级 PII）→ 响应侧检测 → 输出。
+
+        - PII 未启用/无 scope：等价原 _restore 行为
+        - PII 启用：先还原请求级 PII token（占位符→明文，还原产物区间
+          标记），再对还原后文本做响应侧 PII 检测（跳过还原产物区间，
+          新检测值注册响应期映射并替换为占位符）
+        """
+        scope = self._pii_scope_or_none()
+        if scope is None:
+            return self._restore(text, active_t2p)
+        restored, restored_spans = self._pii_restore(text, active_t2p, scope)
+        return await self._pii_response_scan(restored, restored_spans, scope)
 
     # ── Anthropic Messages API SSE 事件处理 ──
 
@@ -302,10 +464,21 @@ class LlmMixin:
           等待后续分片）；safe 中无法 hold 的残缺 token 形态被 _PARTIAL_TOKEN_RE 清理
         - keep_pending=False（流末）：不保留 pending，所有 partial 形态清理后
           输出残余（如有）
+        - PII 启用（self._pii_active）：执行「还原 → 响应侧检测 → 转发」
+          顺序（design D2），_split_safe_hold 携带 pii_scope
         """
+        pii_scope = self._pii_scope_or_none()
         if not buf:
             return ''
-        restored = self._restore(buf, active_t2p)
+        if pii_scope is not None:
+            restored, restored_spans = self._pii_restore(buf, active_t2p, pii_scope)
+            restored = await self._pii_response_scan(
+                restored,
+                restored_spans,
+                pii_scope,
+            )
+        else:
+            restored = self._restore(buf, active_t2p)
         if not keep_pending:
             restored = _PARTIAL_TOKEN_RE.sub('', restored)
             if not restored:
@@ -321,7 +494,7 @@ class LlmMixin:
             ):
                 logger.debug('SSE 残余写入失败')
             return ''
-        safe, pending = _split_safe_hold(restored, active_t2p)
+        safe, pending = _split_safe_hold(restored, active_t2p, pii_scope)
         if safe:
             safe = _PARTIAL_TOKEN_RE.sub('', safe)
         if safe:
@@ -356,7 +529,11 @@ class LlmMixin:
         """
         event = _anthropic_event(parsed)
         if event is None:  # pragma: no cover — 调用方已保证是 Anthropic 事件
-            await write((self._restore(line, active_t2p) + '\n').encode('utf-8'))
+            await write(
+                (await self._pii_response_process(line, active_t2p) + '\n').encode(
+                    'utf-8'
+                )
+            )
             return content_buf, reasoning_buf, arg_buf
         kind, delta_text = event
 
@@ -364,7 +541,11 @@ class LlmMixin:
             # 工具调用块结束：arg_buf 中未完成的 token 前缀不可能再有
             # 后续分片（token 不会跨两个 tool_use block），清空防伪还原
             # （content/reasoning 保留 pending，由流末统一清理）
-            await write((self._restore(line, active_t2p) + '\n').encode('utf-8'))
+            await write(
+                (await self._pii_response_process(line, active_t2p) + '\n').encode(
+                    'utf-8'
+                )
+            )
             return content_buf, reasoning_buf, ''
 
         if kind in ('text', 'thinking', 'function_args'):
@@ -382,8 +563,10 @@ class LlmMixin:
                 if kind == 'text'
                 else (reasoning_buf if kind == 'thinking' else arg_buf)
             )
-            restored = self._restore(buf, active_t2p)
-            safe, pending = _split_safe_hold(restored, active_t2p)
+            restored = await self._pii_response_process(buf, active_t2p)
+            safe, pending = _split_safe_hold(
+                restored, active_t2p, self._pii_scope_or_none()
+            )
             if safe:
                 await write(
                     _mk_anthropic_delta_event(parsed, safe, field).encode('utf-8')
@@ -406,7 +589,9 @@ class LlmMixin:
         arg_buf = await self._flush_anthropic_buf(
             write, parsed, 'partial_json', arg_buf, active_t2p
         )
-        await write((self._restore(line, active_t2p) + '\n').encode('utf-8'))
+        await write(
+            (await self._pii_response_process(line, active_t2p) + '\n').encode('utf-8')
+        )
         return content_buf, reasoning_buf, arg_buf
 
     # ── Responses API SSE 事件处理 ──
@@ -425,10 +610,21 @@ class LlmMixin:
           等待后续分片）；safe 中无法 hold 的残缺 token 形态被 _PARTIAL_TOKEN_RE 清理
         - keep_pending=False（流末）：不保留 pending，所有 partial 形态清理后
           输出残余（如有）
+        - PII 启用（self._pii_active）：执行「还原 → 响应侧检测 → 转发」
+          顺序（design D2），_split_safe_hold 携带 pii_scope
         """
+        pii_scope = self._pii_scope_or_none()
         if not buf:
             return ''
-        restored = self._restore(buf, active_t2p)
+        if pii_scope is not None:
+            restored, restored_spans = self._pii_restore(buf, active_t2p, pii_scope)
+            restored = await self._pii_response_scan(
+                restored,
+                restored_spans,
+                pii_scope,
+            )
+        else:
+            restored = self._restore(buf, active_t2p)
         if not keep_pending:
             restored = _PARTIAL_TOKEN_RE.sub('', restored)
             if not restored:
@@ -444,7 +640,7 @@ class LlmMixin:
             ):
                 logger.debug('SSE 残余写入失败')
             return ''
-        safe, pending = _split_safe_hold(restored, active_t2p)
+        safe, pending = _split_safe_hold(restored, active_t2p, pii_scope)
         if safe:
             safe = _PARTIAL_TOKEN_RE.sub('', safe)
         if safe:
@@ -477,14 +673,22 @@ class LlmMixin:
         """
         kind, delta_text = _responses_event(parsed)
         if kind is None:  # pragma: no cover — 调用方已保证是 Responses 事件
-            await write((self._restore(line, active_t2p) + '\n').encode('utf-8'))
+            await write(
+                (await self._pii_response_process(line, active_t2p) + '\n').encode(
+                    'utf-8'
+                )
+            )
             return content_buf, reasoning_buf, arg_buf
 
         if kind == 'item_done':
             # item 结束：arg_buf 中未完成的 token 前缀不可能再有后续分片
             # （function call 参数不会跨 item 续写），清空防跨 item 伪还原
             # （content/reasoning 保留 pending，由流末统一清理）
-            await write((self._restore(line, active_t2p) + '\n').encode('utf-8'))
+            await write(
+                (await self._pii_response_process(line, active_t2p) + '\n').encode(
+                    'utf-8'
+                )
+            )
             return content_buf, reasoning_buf, ''
 
         if kind in ('output_text', 'reasoning_text', 'function_call_arguments'):
@@ -501,8 +705,10 @@ class LlmMixin:
                 if kind == 'output_text'
                 else (reasoning_buf if kind == 'reasoning_text' else arg_buf)
             )
-            restored = self._restore(buf, active_t2p)
-            safe, pending = _split_safe_hold(restored, active_t2p)
+            restored = await self._pii_response_process(buf, active_t2p)
+            safe, pending = _split_safe_hold(
+                restored, active_t2p, self._pii_scope_or_none()
+            )
             if safe:
                 await write(_mk_responses_sse_event(parsed, safe).encode('utf-8'))
             if kind == 'output_text':
@@ -526,7 +732,9 @@ class LlmMixin:
             arg_buf,
             active_t2p,
         )
-        await write((self._restore(line, active_t2p) + '\n').encode('utf-8'))
+        await write(
+            (await self._pii_response_process(line, active_t2p) + '\n').encode('utf-8')
+        )
         return content_buf, reasoning_buf, arg_buf
 
     # ── Startup ──
@@ -574,13 +782,27 @@ class LlmMixin:
                 snapshot_t2p = dict(self.token_to_pwd)
 
             if body_text:
+                # PII 请求侧脱敏（在凭据 redact 前，PII_REDACTION_ENABLED 时）：
+                # 检测 PII → 注册请求级映射 → 替换为 __PII_*__ 占位符
+                if getattr(self, 'pii_enabled', False):
+                    self._pii_request_scope()
+                    body_text = await self.pii_redact(body_text)
                 out_body = self._redact(body_text, snapshot_p2t).encode('utf-8')
-                # 快速路径：无 token 时不扫描
-                if snapshot_t2p and b'__VG_CRED_' in out_body:
-                    # 收集本次请求实际使用的 token，仅还原这些（防 LLM 幻觉泄露）
+                # 快速路径：无 token 时不扫描（门控扩展：PII token 同样触发还原路径）
+                pii_scope = self._pii_scope_or_none()
+                has_cred = snapshot_t2p and b'__VG_CRED_' in out_body
+                has_pii = bool(pii_scope) and b'__PII_' in out_body
+                if has_cred or has_pii:
+                    # 收集本次请求实际使用的 token，仅还原这些（防 LLM 幻觉泄露）。
+                    # used_tokens 仅收集实际注册产出的 token：凭据注册表命中
+                    # （快照中已存在）+ PII 请求级映射——不收集任意 TOKEN_RE
+                    # 形态匹配（关闭「prompt 字面量 __VG_CRED_*__ → 回显 → 还原」放大路径）
                     used_tokens = set()
                     for m in TOKEN_RE.finditer(out_body):
                         used_tokens.add(m.group().decode())
+                    if pii_scope:
+                        for m in PII_TOKEN_RE.finditer(out_body):
+                            used_tokens.add(m.group().decode())
                     active_t2p = {
                         t: p for t, p in snapshot_t2p.items() if t in used_tokens
                     }
@@ -589,6 +811,7 @@ class LlmMixin:
             else:
                 out_body = body
                 active_t2p = {}
+                pii_scope = None
 
             # 透传 Hermes headers（过滤逐跳头）
             headers = filter_hop_headers(dict(request.headers))
@@ -655,7 +878,7 @@ class LlmMixin:
                         )
                         await resp.prepare(request)
 
-                        if active_t2p:
+                        if active_t2p or self._pii_active():
                             # ── JSON-aware 流式 token 还原（广义 Plan C） ──
                             content_buf = ''  # 累积 delta.content 片段（每事件经 safe/pending 分割重置为小字符串，摊还 O(1)）
                             reasoning_buf = ''  # 累积 delta.reasoning_content 片段
@@ -677,10 +900,14 @@ class LlmMixin:
                                 nonlocal content_buf, reasoning_buf
                                 if c or rc or fr:
                                     if c:
-                                        c = self._restore(c, active_t2p)
+                                        c = await self._pii_response_process(
+                                            c, active_t2p
+                                        )
                                         c = _PARTIAL_TOKEN_RE.sub('', c)
                                     if rc:
-                                        rc = self._restore(rc, active_t2p)
+                                        rc = await self._pii_response_process(
+                                            rc, active_t2p
+                                        )
                                         rc = _PARTIAL_TOKEN_RE.sub('', rc)
                                     await resp.write(
                                         _mk_sse_event(
@@ -715,7 +942,9 @@ class LlmMixin:
                                         if not line.startswith('data:'):
                                             await resp.write(
                                                 (
-                                                    self._restore(line, active_t2p)
+                                                    await self._pii_response_process(
+                                                        line, active_t2p
+                                                    )
                                                     + '\n'
                                                 ).encode('utf-8'),
                                             )
@@ -805,7 +1034,9 @@ class LlmMixin:
                                             if not isinstance(parsed, dict):
                                                 await resp.write(
                                                     (
-                                                        self._restore(line, active_t2p)
+                                                        await self._pii_response_process(
+                                                            line, active_t2p
+                                                        )
                                                         + '\n'
                                                     ).encode('utf-8'),
                                                 )
@@ -886,12 +1117,19 @@ class LlmMixin:
                                             rc_val = delta.get('reasoning_content')
                                             if rc_val is not None:
                                                 reasoning_buf += rc_val
-                                                restored = self._restore(
-                                                    reasoning_buf,
-                                                    active_t2p,
+                                                restored = (
+                                                    await self._pii_response_process(
+                                                        reasoning_buf, active_t2p
+                                                    )
                                                 )
                                                 safe, pending = _split_safe_hold(
-                                                    restored, active_t2p
+                                                    restored,
+                                                    active_t2p,
+                                                    (
+                                                        self._pii_scope
+                                                        if self._pii_active()
+                                                        else None
+                                                    ),
                                                 )
                                                 if safe:
                                                     await resp.write(
@@ -903,9 +1141,8 @@ class LlmMixin:
                                                 if finish_reason and not delta.get(
                                                     'content'
                                                 ):
-                                                    reasoning_buf = self._restore(
-                                                        reasoning_buf,
-                                                        active_t2p,
+                                                    reasoning_buf = await self._pii_response_process(
+                                                        reasoning_buf, active_t2p
                                                     )
                                                     reasoning_buf = (
                                                         _PARTIAL_TOKEN_RE.sub(
@@ -925,14 +1162,21 @@ class LlmMixin:
                                             if delta.get('content') is not None:
                                                 # 追加 content 片段，还原 token
                                                 content_buf += delta['content']
-                                                restored = self._restore(
-                                                    content_buf,
-                                                    active_t2p,
+                                                restored = (
+                                                    await self._pii_response_process(
+                                                        content_buf, active_t2p
+                                                    )
                                                 )
 
                                                 # 找安全 flush 点
                                                 safe, pending = _split_safe_hold(
-                                                    restored, active_t2p
+                                                    restored,
+                                                    active_t2p,
+                                                    (
+                                                        self._pii_scope
+                                                        if self._pii_active()
+                                                        else None
+                                                    ),
                                                 )
 
                                                 # flush 安全部分
@@ -943,9 +1187,8 @@ class LlmMixin:
                                                 content_buf = pending
 
                                                 if finish_reason:
-                                                    content_buf = self._restore(
-                                                        content_buf,
-                                                        active_t2p,
+                                                    content_buf = await self._pii_response_process(
+                                                        content_buf, active_t2p
                                                     )
                                                     content_buf = _PARTIAL_TOKEN_RE.sub(
                                                         '',
@@ -966,7 +1209,9 @@ class LlmMixin:
                                                 )
                                                 await resp.write(
                                                     (
-                                                        self._restore(line, active_t2p)
+                                                        await self._pii_response_process(
+                                                            line, active_t2p
+                                                        )
                                                         + '\n'
                                                     ).encode('utf-8'),
                                                 )
@@ -1019,7 +1264,7 @@ class LlmMixin:
                                                 if not isinstance(parsed, dict):
                                                     await resp.write(
                                                         (
-                                                            self._restore(
+                                                            await self._pii_response_process(
                                                                 'data: ' + sanitized,
                                                                 active_t2p,
                                                             )
@@ -1077,9 +1322,8 @@ class LlmMixin:
                                                 if rc_val is not None:
                                                     rc_combined = reasoning_buf + rc_val
                                                     reasoning_buf = ''
-                                                    rc_restored = self._restore(
-                                                        rc_combined,
-                                                        active_t2p,
+                                                    rc_restored = await self._pii_response_process(
+                                                        rc_combined, active_t2p
                                                     )
                                                     rc_restored = _PARTIAL_TOKEN_RE.sub(
                                                         '',
@@ -1100,9 +1344,8 @@ class LlmMixin:
                                                 if content:
                                                     combined = content_buf + content
                                                     content_buf = ''
-                                                    restored = self._restore(
-                                                        combined,
-                                                        active_t2p,
+                                                    restored = await self._pii_response_process(
+                                                        combined, active_t2p
                                                     )
                                                     restored = _PARTIAL_TOKEN_RE.sub(
                                                         '',
@@ -1123,9 +1366,8 @@ class LlmMixin:
                                                     await resp.write(
                                                         (
                                                             'data: '
-                                                            + self._restore(
-                                                                sanitized,
-                                                                active_t2p,
+                                                            + await self._pii_response_process(
+                                                                sanitized, active_t2p
                                                             )
                                                             + '\n'
                                                         ).encode('utf-8'),
@@ -1139,7 +1381,9 @@ class LlmMixin:
                                                 )
                                                 await resp.write(
                                                     (
-                                                        self._restore(line, active_t2p)
+                                                        await self._pii_response_process(
+                                                            line, active_t2p
+                                                        )
                                                         + '\n'
                                                     ).encode('utf-8'),
                                                 )
@@ -1150,7 +1394,9 @@ class LlmMixin:
                                             )
                                             await resp.write(
                                                 (
-                                                    self._restore(line, active_t2p)
+                                                    await self._pii_response_process(
+                                                        line, active_t2p
+                                                    )
                                                     + '\n'
                                                 ).encode('utf-8'),
                                             )
@@ -1228,18 +1474,16 @@ class LlmMixin:
                                 )
                             elif content_buf or reasoning_buf:
                                 if content_buf:
-                                    content_buf = self._restore(
-                                        content_buf,
-                                        active_t2p,
+                                    content_buf = await self._pii_response_process(
+                                        content_buf, active_t2p
                                     )
                                     content_buf = _PARTIAL_TOKEN_RE.sub(
                                         '',
                                         content_buf,
                                     )
                                 if reasoning_buf:
-                                    reasoning_buf = self._restore(
-                                        reasoning_buf,
-                                        active_t2p,
+                                    reasoning_buf = await self._pii_response_process(
+                                        reasoning_buf, active_t2p
                                     )
                                     reasoning_buf = _PARTIAL_TOKEN_RE.sub(
                                         '',
@@ -1265,9 +1509,8 @@ class LlmMixin:
                                         'utf-8',
                                         errors='replace',
                                     )
-                                    restored = self._restore(
-                                        residual,
-                                        active_t2p,
+                                    restored = await self._pii_response_process(
+                                        residual, active_t2p
                                     )
                                     await resp.write(
                                         restored.encode('utf-8'),
@@ -1360,9 +1603,10 @@ class LlmMixin:
                                                 except json.JSONDecodeError:
                                                     pass
 
-                                            restored = 'data: ' + self._restore(
-                                                payload,
-                                                active_t2p,
+                                            restored = 'data: ' + (
+                                                await self._pii_response_process(
+                                                    payload, active_t2p
+                                                )
                                             )
                                             await resp.write(
                                                 (restored + '\n').encode('utf-8'),
@@ -1395,9 +1639,8 @@ class LlmMixin:
                                         'utf-8',
                                         errors='replace',
                                     )
-                                    restored = self._restore(
-                                        residual,
-                                        active_t2p,
+                                    restored = await self._pii_response_process(
+                                        residual, active_t2p
                                     )
                                     await resp.write(
                                         restored.encode('utf-8'),
@@ -1474,7 +1717,9 @@ class LlmMixin:
                             'utf-8',
                             errors='replace',
                         )
-                        out_text = self._restore(resp_text, active_t2p)
+                        out_text = await self._pii_response_process(
+                            resp_text, active_t2p
+                        )
                         return web.Response(
                             body=out_text.encode('utf-8'),
                             status=upstream_resp.status,
@@ -1491,6 +1736,10 @@ class LlmMixin:
                     target_url,
                 )
                 raise
+            finally:
+                # 请求级 PII 映射清理（无论成功/异常/客户端断连）
+                if getattr(self, 'pii_enabled', False):
+                    self._pii_cleanup()
 
         app = web.Application()
         app.router.add_route('*', '/{tail:.*}', handler)
