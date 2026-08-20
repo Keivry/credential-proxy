@@ -326,6 +326,11 @@ def _normalize_dotdot(s: str) -> str:
     """
     import posixpath
 
+    # 无 `..` 候选直接短路——裸路径正则 (\S*/\.\./\S*) 在长无匹配
+    # 文本上逐位置贪吃+回退 O(n²)（100KB 实测 ~27s）。
+    if '..' not in s:
+        return s
+
     # 提取路径片段（/xxx/../xxx 或 引号内路径）
     def _norm(m):
         return posixpath.normpath(m.group(1))
@@ -560,6 +565,22 @@ class AuditMixin:
                 self.approval_whitelist = {
                     u.strip() for u in wl.split(',') if u.strip()
                 }
+            # 防御性校验（Round 17 R6）：approve 模式必须配置白名单。
+            # proxy.py 启动时已通过 parse_audit_env_config(require_whitelist=True)
+            # 强制；此处双保险——任何入口（轻量入口/未来新入口）走到
+            # _ensure_audit_init 都不能以「approve + 空白名单」运行
+            # （空白名单 = 分支 5 的 `if self.approval_whitelist and ...`
+            # 跳过校验 → 任何房间成员可审批）。
+            if (
+                self.audit_enabled_flag
+                and self.audit_mode == 'approve'
+                and not self.approval_whitelist
+            ):
+                logger.error(
+                    'AUDIT_MODE=approve 必须配置 APPROVAL_WHITELIST'
+                    '（审批人 Matrix user id），降级为 block 模式'
+                )
+                self.audit_mode = 'block'
             if self.audit_enabled_flag:
                 logger.info(
                     '输出审计启用: mode=%s policy=%s',
@@ -889,6 +910,10 @@ def redact_summary(text: str, max_len: int = 120) -> str:
         return ''
     redacted = text
     for label, pat in _SECRET_PATTERNS:
+        # email 正则无锚定且可变长：无 @ 时 sub() 逐位置重试 O(n²)
+        # （100KB 纯字母实测 ~20s）——先检测候选字符，无则整条跳过。
+        if label == 'email' and '@' not in redacted:
+            continue
         redacted = pat.sub(f'[REDACTED:{label}]', redacted)
     if len(redacted) <= max_len:
         return redacted

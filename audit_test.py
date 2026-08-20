@@ -144,6 +144,25 @@ class TestNormalizeArgs:
         norm = normalize_args('{"path":"/tmp/../etc/passwd"}')
         assert '/etc/passwd' in norm
 
+    def test_long_input_no_dotdot_fast(self):
+        """大输入无 `..` 时快速返回（R2 回归：二次方回溯已短路）。
+
+        旧实现 `_normalize_dotdot` 的裸路径正则（非空白字符 + /../ + 非空白字符）
+        在长无 `..` 文本上逐位置贪吃+回退 O(n²)——100KB 实测 ~27s。
+        `..` 预检查短路后应毫秒级返回。
+        """
+        import time
+
+        big = 'cat /etc/passwd ' + 'a' * 100_000
+        t0 = time.monotonic()
+        norm = normalize_args(big)
+        elapsed = time.monotonic() - t0
+        # 100KB 输入处理总预算：远小于旧实现 ~27s（宽松阈值防 CI 抖动）
+        assert elapsed < 1.0, (
+            f'normalize_args 100KB 无 .. 耗时 {elapsed:.2f}s（二次方回溯未修复）'
+        )
+        assert '/etc/passwd' in norm
+
     def test_alias_bin_rm(self):
         """/bin/rm -rf → rm -rf。"""
         norm = normalize_args('{"cmd":"/bin/rm -rf /"}')

@@ -117,6 +117,27 @@ class TestRedactSummary:
         s = redact_summary('hello world')
         assert s == 'hello world'
 
+    def test_long_input_no_at_fast(self):
+        """大输入无 `@` 时快速返回（R1 回归：email 二次方回溯已短路）。
+
+        旧实现 email 正则 `[A-Za-z0-9._%+-]+@...` 在无 `@` 长文本上
+        sub() 逐位置重试 O(n²)——100KB 纯字母实测 ~20s。
+        `@` 预检查短路后应毫秒级返回。
+        """
+        import time
+
+        big = 'k' * 100_000
+        t0 = time.monotonic()
+        s = redact_summary(big)
+        elapsed = time.monotonic() - t0
+        # 100KB 输入处理总预算：远小于旧实现 ~20s（宽松阈值防 CI 抖动）
+        assert elapsed < 1.0, (
+            f'redact_summary 100KB 无@ 耗时 {elapsed:.2f}s（二次方回溯未修复）'
+        )
+        # 默认 max_len=120 截断 → 结果 = 前 120 字符 + 省略号（无敏感形态）
+        assert s.startswith(big[:120])
+        assert s.endswith('…')
+
 
 # ═══════════════════════════════════════════════════════════
 # _request_audit_approval 四路径（6.1）
@@ -439,6 +460,43 @@ async def test_on_reaction_credential_branch_still_works():
     assert stub.pending_requests[req_id]['approved'] is True
     assert evt.is_set()
     assert any('已批准' in t for t in stub._say_texts)
+
+
+@pytest.mark.asyncio
+async def test_on_reaction_credential_whitelist_blocks_non_member():
+    """R5 回归：凭据审批分支拒绝非白名单发送者（design D4 硬性）。
+
+    旧实现分支 4 无发送者白名单校验——任何房间成员可批准凭据释放
+    （与审计审批白名单不一致）。Round 17 R5 修复：分支 4 与分支 5
+    同规则校验发送者 ∈ 审批人白名单。
+    """
+    stub = ReactionStub()
+    stub.approval_whitelist = {'@admin:example.com'}
+    req_id = 'cred-1'
+    evt = asyncio.Event()
+    stub.pending_requests[req_id] = {
+        'entry': 'db_password',
+        'approved': None,
+        'event': evt,
+        'field': 'password',
+        'use_token': True,
+    }
+    stub.approval_msgs['cred-msg-1'] = req_id
+    # 非白名单发送者点 ✅ → 不批准
+    room, revt = stub._mk_reaction_event(
+        'cred-msg-1', REACTION_APPROVE, '@mallory:example.com'
+    )
+    await stub.on_reaction(room, revt)
+    assert stub.pending_requests[req_id]['approved'] is None
+    assert not evt.is_set()
+    assert any('不在白名单' in t for t in stub._say_texts)
+    # 白名单发送者点 ✅ → 批准
+    room2, revt2 = stub._mk_reaction_event(
+        'cred-msg-1', REACTION_APPROVE, '@admin:example.com'
+    )
+    await stub.on_reaction(room2, revt2)
+    assert stub.pending_requests[req_id]['approved'] is True
+    assert evt.is_set()
 
 
 @pytest.mark.asyncio

@@ -659,19 +659,31 @@ class PiiMixin:
         try:
             category = ctx.get('category', 'malformed')
             token = ctx.get('token', '')
+            # 审计事件不记录原始 token——格式不符 token 可能含明文敏感值
+            # （如 __PII_999_myPassword__），原样落盘即泄漏（Round 17 R3）。
+            # 只记类别 + 长度特征，便于区分 malformed/unregistered 且零明文。
             record = {
                 'ts': _time.time(),
                 'tool': 'pii_restore',
                 'verdict': 'malformed',
                 'rule': category,
                 'summary': f'[REDACTED:{category}]',
-                'note': f'pii_restore_malformed token={token!r}',
+                'note': f'pii_restore_malformed category={category} token_len={len(token)}',
             }
             path = getattr(self, 'audit_log_path', '') or ''
             if path:
                 from _audit import _append_audit_log
 
-                _append_audit_log(path, record)
+                # 同步回调不能 await——用 run_in_executor 把文件 I/O 移出
+                # 事件循环线程（与 _audit_log_event 对齐，防 10MB 轮转
+                # shutil.move 阻塞还原热路径；Round 17 R8）。
+                # 无运行循环（纯同步测试）时回退同步写。
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    _append_audit_log(path, record)
+                else:
+                    loop.run_in_executor(None, _append_audit_log, path, record)
             ring = getattr(self, '_audit_log_ring', None)
             if ring is not None:
                 ring.append(record)

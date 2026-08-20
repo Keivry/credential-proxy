@@ -268,9 +268,13 @@ def _strip_token_forms(content: str) -> str:
     - PII token（PII_TOKEN_STR_RE）完整形态剥离——响应期注册的 token
       在还原时被保留（resp_t2p 形态匹配不还原），safe 输出前必须剥离
       防止把 token 字符串发给客户端
+    - 残缺形态（流分片边界切断的 __VG_/__PII_ 前缀）由 _strip_partials
+      兜底——任何 safe 输出出口都经此函数，统一获得残缺清理
+      （Round 17 R4：mid-stream safe flush / 流末残余字节全覆盖）
     """
     out = TOKEN_STR_RE.sub('', content)
-    return PII_TOKEN_STR_RE.sub('', out)
+    out = PII_TOKEN_STR_RE.sub('', out)
+    return _strip_partials(out)
 
 
 def _split_safe_hold(content: str, active_t2p: dict, pii_scope=None) -> tuple[str, str]:
@@ -2569,6 +2573,9 @@ class LlmMixin(AuditMixin):
                         out_text = await self._pii_response_process(
                             resp_text, active_t2p
                         )
+                        # 非流式整包：还原后统一清理残缺/完整幻觉 token 形态
+                        # （Round 17 R4：非流式出口缺 _strip_partials）
+                        out_text = _strip_partials(out_text)
                         return web.Response(
                             body=out_text.encode('utf-8'),
                             status=upstream_resp.status,

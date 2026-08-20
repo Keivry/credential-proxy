@@ -3,6 +3,7 @@
 覆盖 parse_audit_env_config / parse_pii_env_config 的合法/非法取值。
 """
 
+import asyncio
 import os
 
 import pytest
@@ -189,3 +190,49 @@ class TestParsePiiEnvConfig:
         os.environ['PII_HOLD_MAX'] = ''
         cfg = parse_pii_env_config()
         assert cfg['errors']
+
+
+class TestEnsureAuditInitDefensive:
+    """R6 回归：_ensure_audit_init 防御性校验（approve + 空白名单降级 block）。"""
+
+    def _make_host(self):
+        from _audit import AuditMixin
+
+        class Host(AuditMixin):
+            def __init__(self):
+                # 模拟真实组合宿主：不预调 _init_audit，
+                # 由 _ensure_audit_init lazy 初始化（与 proxy.py 一致）
+                pass
+
+        return Host()
+
+    def test_approve_without_whitelist_degrades_to_block(self):
+        """approve + 无 APPROVAL_WHITELIST → 降级 block（防任何入口绕过）。
+
+        proxy.py 启动时已强制（parse_audit_env_config(require_whitelist=True)）；
+        _ensure_audit_init 双保险——轻量入口/未来新入口走到这里也不能以
+        「approve + 空白名单」运行（空白名单 = 任何房间成员可审批）。
+        """
+        os.environ['AUDIT_MODE'] = 'approve'
+        h = self._make_host()
+        h._ensure_audit_init()
+        assert h.audit_mode == 'block'  # 已降级
+        assert h.audit_enabled_flag is True  # 审计仍启用（block 模式）
+
+    @pytest.mark.asyncio
+    async def test_approve_with_whitelist_stays_approve(self):
+        """approve + 有 APPROVAL_WHITELIST → 保持 approve。"""
+        os.environ['AUDIT_MODE'] = 'approve'
+        os.environ['APPROVAL_WHITELIST'] = '@admin:example.com'
+        h = self._make_host()
+        # approve 模式会启动审批孤儿清扫 task（asyncio.create_task）→ 需运行循环
+        h._ensure_audit_init()
+        assert h.audit_mode == 'approve'
+        assert h.approval_whitelist == {'@admin:example.com'}
+        # 清理清扫 task（防测试泄漏）
+        if hasattr(h, '_approval_sweep_task'):
+            h._approval_sweep_task.cancel()
+            try:
+                await h._approval_sweep_task
+            except (asyncio.CancelledError, RuntimeError):
+                pass

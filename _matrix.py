@@ -229,15 +229,24 @@ class MatrixMixin:
                 and (req := self.pending_requests.get(req_id))
                 and req['approved'] is None
             ):
-                ok = key == REACTION_APPROVE
-                req['approved'] = ok
-                req['event'].set()
-                extra = ''
-                if req.get('field'):
-                    extra += f' - {req["field"]}'
-                if not req.get('use_token', True):
-                    extra += ' (原始值)'
-                say_text = f'{key} 已{"批准" if ok else "拒绝"}: {req["entry"]}{extra}'
+                # 发送者白名单校验（design D4 硬性：reaction 处理器必须校验
+                # 发送者 ∈ 审批人白名单；凭据审批与审计审批同规则——
+                # Round 17 R5：分支 4 曾漏掉白名单，任何房间成员可批准凭据释放）
+                if self.approval_whitelist and sender not in self.approval_whitelist:
+                    logger.warning('凭据审批被忽略: 发送者 %s 不在白名单', sender)
+                    say_text = f'{key} 凭据审批被忽略: 发送者不在白名单'
+                else:
+                    ok = key == REACTION_APPROVE
+                    req['approved'] = ok
+                    req['event'].set()
+                    extra = ''
+                    if req.get('field'):
+                        extra += f' - {req["field"]}'
+                    if not req.get('use_token', True):
+                        extra += ' (原始值)'
+                    say_text = (
+                        f'{key} 已{"批准" if ok else "拒绝"}: {req["entry"]}{extra}'
+                    )
 
             # ── 5. 审计审批分支（design D4 白名单 + event id 精确匹配 + 幂等）──
             elif a_id := self._audit_approval_msgs.get(orig):

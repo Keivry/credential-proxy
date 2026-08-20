@@ -292,3 +292,76 @@ def test_pii_audit_cb_writes_ring_when_host_has_ring():
     assert rec['tool'] == 'pii_restore'
     assert rec['verdict'] == 'malformed'
     assert rec['rule'] == 'malformed'
+
+
+def test_pii_audit_cb_note_no_raw_token():
+    """R3 回归：审计 note 不得包含原始 token（防明文敏感值泄漏）。
+
+    格式不符 token 可含明文敏感值（如 `__PII_999_myPassword__`），
+    原样落盘即泄漏（Round 17 R3）。note 只记类别 + 长度特征。
+    """
+    from _pii import PiiDetector, PiiMixin
+
+    class Host(PiiMixin):
+        def __init__(self):
+            self._pii_detector = None
+            self.pii_enabled = True
+            self._pii_scope = None
+
+    h = Host()
+    h._pii_detector = PiiDetector()
+    h.audit_log_path = ''
+    h._audit_log_ring = []
+    h._audit_log_ring_max = 100
+    scope = h._pii_request_scope()
+    # 明文密码形态 token（宽松匹配，含敏感串）
+    scope.restore('__PII_999_myPassword__')
+    assert len(h._audit_log_ring) == 1
+    rec = h._audit_log_ring[0]
+    note = rec['note']
+    # 原始 token / 敏感串不得出现在审计记录任何字段
+    assert '__PII_999_myPassword__' not in note
+    assert 'myPassword' not in note
+    assert 'token_len=' in note
+    assert 'category=malformed' in note
+
+
+def test_pii_audit_cb_executor_offloads_io():
+    """R8 回归：有运行循环时文件写走 run_in_executor（不阻塞事件循环）。
+
+    Round 17 R8：同步回调不能 await，但必须把 _append_audit_log 移出
+    事件循环线程（与 _audit_log_event 对齐，防 10MB 轮转阻塞还原热路径）。
+    """
+    import asyncio
+    import tempfile
+    from pathlib import Path
+
+    from _pii import PiiDetector, PiiMixin
+
+    class Host(PiiMixin):
+        def __init__(self):
+            self._pii_detector = None
+            self.pii_enabled = True
+            self._pii_scope = None
+
+    async def _run():
+        h = Host()
+        h._pii_detector = PiiDetector()
+        with tempfile.TemporaryDirectory() as d:
+            log_path = str(Path(d) / 'audit.log')
+            h.audit_log_path = log_path
+            h._audit_log_ring = []
+            h._audit_log_ring_max = 100
+            scope = h._pii_request_scope()
+            scope.restore('__PII_3_zz__')
+            # 等 executor 完成写盘（fire-and-forget → 轮询文件出现）
+            for _ in range(100):
+                if Path(log_path).exists():
+                    break
+                await asyncio.sleep(0.01)
+            assert Path(log_path).exists(), 'run_in_executor 写盘未发生'
+            content = Path(log_path).read_text(encoding='utf-8')
+            assert 'pii_restore' in content
+            assert '__PII_3_zz__' not in content  # note 无原始 token
+
+    asyncio.run(_run())

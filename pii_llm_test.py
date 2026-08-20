@@ -194,6 +194,30 @@ class TestSplitSafeHoldPii:
         assert token not in safe
         assert 'hello' in safe
 
+    def test_safe_output_strips_partial_forms(self):
+        """R4 回归：safe 输出统一剥离残缺形态（mid-stream 出口全覆盖）。
+
+        旧实现 `_strip_token_forms` 只剥完整 token；不匹配任何已注册
+        前缀的残缺形态（幻觉 `__PII_9_ab` 等）随 safe 输出泄漏。
+        Round 17 R4 修复：`_strip_token_forms` 末尾追加 `_strip_partials`，
+        所有 safe 输出出口统一获得残缺清理。
+
+        注：`_PII_PARTIAL_TOKEN_RE` 行尾锚定（`$`）——残缺只在
+        流分片边界（行尾）出现，行中形态是正常文本不清除。
+        """
+        scope = RequestScopedTokens()
+        scope.register('13800138000', response_side=True)
+        # 不匹配任何已注册前缀的幻觉残缺形态（__PII_9_ 不在映射，
+        # rand8 段是 hex，且位于行尾=流分片边界）
+        safe, hold = _split_safe_hold('text __PII_9_ab', {}, scope)
+        # 残缺被剥离，hold 不残留（非前缀匹配）
+        assert '__PII_9_ab' not in safe
+        assert safe == 'text '
+        assert hold == ''
+        # 正常文本不受影响
+        safe2, _ = _split_safe_hold('hello world', {}, scope)
+        assert safe2 == 'hello world'
+
 
 # ═══════════════════════════════════════════════════════════
 # 请求级映射生命周期

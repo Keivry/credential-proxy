@@ -102,3 +102,19 @@
 - **F-06（🟡）`normalize_args` 未拆单管道**：`_audit.py:257` 拆链正则缺单 `|`（design D3/spec 声明拆 `;`/`&&`/`|`/`||` 命令链）。修复：正则补 `\|`（`||` 优先匹配）。回归测试：`audit_test.py` 新增 `test_single_pipe_split` / `test_double_pipe_priority`，旧正则下 FAIL 证明回归有效。
 
 全部修复后：`openspec validate --strict` 通过；369 pytest 全绿；ruff check/format 全绿。
+
+## 11. 修复记录（Round 17 审查，2026-08-21）
+
+第七轮审查（三子任务 + 主代理实证复验）发现 2 个前置 ReDoS 缺陷 + 1 个审计泄漏 + 5 个一致性/加固缺口，已全部修复：
+
+- **R1（🔴）`redact_summary` email 正则二次方回溯（DoS）**：`_audit.py` email 模式 `[A-Za-z0-9._%+-]+@...` 无锚定且可变长，在无 `@` 长文本上 sub() 逐位置重试 O(n²)——100KB 纯字母实测 ~20s。`redact_summary` 是每个 tool call 审计事件的必经路径（事件循环同步执行，无 ReDoS 守卫）→ 攻击者可控 tool args 可造成代理 DoS。修复：email 模式前加 `@` 预检查短路（无 `@` 整条跳过），实测 100KB 20s → 0.0075s。回归测试：`audit_approve_test.py::TestRedactSummary::test_long_input_no_at_fast`（耗时 <1s 断言）。
+- **R2（🔴）`normalize_args` 的 `_normalize_dotdot` 二次方回溯（DoS）**：`_audit.py` 裸路径正则 `(\S*/\.\./\S*)` 的 `\S*` 在长无 `/../` 文本上逐位置贪吃+回退 O(n²)——100KB 实测 ~27s。`audit_tool_call` 对每次 tool call 同步执行 → 事件循环 DoS。修复：`_normalize_dotdot` 加 `..` 预检查短路（无 `..` 直接返回），实测 100KB 27s → 0.012s。回归测试：`audit_test.py::TestNormalizeArgs::test_long_input_no_dotdot_fast`。
+- **R3（🔴）`_pii_audit_cb` note 记录原始 token（审计日志泄漏）**：`_pii.py:668` note 字段 `token={token!r}` 原样记录格式不符/未注册 token——`PII_TOKEN_LOOSE_RE` 宽松匹配可捕获含明文敏感值的形态（如 `__PII_999_myPassword__`），原样落盘审计日志 JSONL（0600/10MB×5 轮转）即泄漏。修复：note 只记 `category + token_len`（零明文）。回归测试：`pii_token_test.py::test_pii_audit_cb_note_no_raw_token`（断言敏感串不出现）。
+- **R4（🟡）F-02 接线不完整（7 处输出出口漏接）**：Round 15 的 `_strip_partials` 只接了主 flush 路径，mid-stream safe 写点（`_llm.py` 1044/1304/1838/1880）、流末残余字节（2274/2404）、非流式整包（2569）未接——幻觉残缺形态（`__PII_9_ab` 等）随 safe 输出泄漏。修复：`_strip_token_forms` 末尾追加 `_strip_partials`（所有 safe 输出出口统一兜底）+ 非流式整包路径单独补 `_strip_partials`。回归测试：`pii_llm_test.py::TestSplitSafeHoldPii::test_safe_output_strips_partial_forms`。
+- **R5（🟡）凭据审批分支无发送者白名单**：`_matrix.py` 分支 4（凭据审批）无白名单校验——任何房间成员可批准凭据释放（与审计审批分支 5 不一致；design D4 硬性「reaction 处理器必须校验发送者 ∈ 审批人白名单」）。修复：分支 4 与分支 5 同规则校验 `sender ∈ self.approval_whitelist`（空白名单不限制，兼容纯凭据部署）。回归测试：`audit_approve_test.py::test_on_reaction_credential_whitelist_blocks_non_member`。
+- **R6（🟡）轻量入口 approve 模式白名单不强制**：`require_whitelist=True` 只在 `proxy.py` 调用；`_ensure_audit_init` 从不校验 approve + 空白名单 → 任何入口绕过启动校验后以「approve + 空白名单」运行（任何房间成员可审批）。修复：`_ensure_audit_init` 加防御性校验——approve + 空白名单降级 block 并告警（双保险）。回归测试：`audit_env_test.py::TestEnsureAuditInitDefensive`（2 个）。
+- **R7（🟡）`_pii_audit_cb` note 未脱敏**：与 R3 合并处理（note 不再含原始 token，仅类别 + 长度特征）。
+- **R8（🟡）`_pii_audit_cb` 同步文件 I/O 在事件循环**：回调直接同步调 `_append_audit_log`（含 10MB 轮转 `shutil.move`）阻塞还原热路径；与 `_audit_log_event` 的 `run_in_executor` 模式不一致。修复：有运行循环时 `run_in_executor` 写文件，无运行循环（纯同步测试）回退同步写。回归测试：`pii_token_test.py::test_pii_audit_cb_executor_offloads_io`。
+- **R9（🟡）非流式整包缺 `_strip_partials`**：与 R4 合并处理（非流式整包路径单独补）。
+
+全部修复后：`openspec validate --strict` 通过；377 pytest 全绿（新增 8 个回归测试）；ruff check/format 全绿。
