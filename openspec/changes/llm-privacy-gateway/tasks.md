@@ -31,13 +31,13 @@
 
 ## 4. 输出审计钩子（tool call 检测）
 
-- [ ] 4.1 新增 OpenAI chat/completions `delta.tool_calls` 分片累积（按 index 分组 name + arguments），**全程缓冲至审计 verdict 前不 flush**，在 `finish_reason == 'tool_calls'` 或流末触发审计点；注意跨分片伪还原与 null 值防御
+- [x] 4.1 新增 OpenAI chat/completions `delta.tool_calls` 分片累积（按 index 分组 name + arguments），**全程缓冲至审计 verdict 前不 flush**，在 `finish_reason == 'tool_calls'` 或流末触发审计点；注意跨分片伪还原与 null 值防御
   - 验收：三种协议 tool call 累积测试通过、PII/凭据残缺不泄漏、未出 verdict 无 tool call 事件流出
-- [ ] 4.2 审计触发点对齐已有完成事件：Anthropic `block_stop`、Responses `item_done`（读取 arg_buf 完整参数）；**审计读掩码前原始 arg_buf，PII 掩码在 flush 阶段**（见 design D3 审计对抗性）
+- [x] 4.2 审计触发点对齐已有完成事件：Anthropic `block_stop`、Responses `item_done`（读取 arg_buf 完整参数）；**审计读掩码前原始 arg_buf，PII 掩码在 flush 阶段**（见 design D3 审计对抗性）
   - 验收：审计读取的 args 为掩码前原文（含 IP 等可触发网络外传规则的形态）；掩码后文本不参与规则匹配
-- [ ] 4.3 集成测试：三种协议流式 tool call 分片累积 + 审计触发（真实 aiohttp，参考 `sse_stream_loop_test.py` 模式）
+- [x] 4.3 集成测试：三种协议流式 tool call 分片累积 + 审计触发（真实 aiohttp，参考 `sse_stream_loop_test.py` 模式）
   - 验收：三协议 tool call 分片累积/审计触发用例全绿；跨分片伪还原与 null 值防御用例覆盖
-- [ ] 4.4 非流式整包响应审计：三协议提取 tool calls（OpenAI `choices[0].message.tool_calls` / Anthropic `content[].tool_use` / Responses `output[]`）+ 审计 + 阻断注入集成测试（不因缺 SSE 完成事件跳过）
+- [x] 4.4 非流式整包响应审计：三协议提取 tool calls（OpenAI `choices[0].message.tool_calls` / Anthropic `content[].tool_use` / Responses `output[]`）+ 审计（提取与审计调用已完成；阻断注入随 Batch 5 `audit_tool_call` verdict 接入）+ 阻断注入集成测试（不因缺 SSE 完成事件跳过）
   - 验收：三协议非流式危险 tool call 均被拦截；安全 tool call 原样转发
 
 ## 5. 策略引擎与阻断模式（`_audit.py`）

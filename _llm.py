@@ -184,14 +184,16 @@ def _anthropic_event(parsed: dict) -> tuple[str, str | None] | None:
     """识别 Anthropic Messages API SSE 事件（/v1/messages）。
 
     返回 (kind, delta_text)：
-      kind ∈ {'text', 'thinking', 'function_args', 'block_stop', 'other'}
+      kind ∈ {'text', 'thinking', 'function_args', 'block_stop', 'block_start', 'other'}
       - 'text': content_block_delta 的 text_delta → delta.text
       - 'thinking': content_block_delta 的 thinking_delta → delta.thinking
       - 'function_args': content_block_delta 的 input_json_delta → delta.partial_json
       - 'block_stop': content_block_stop（块结束，需清理跨块残留）→ delta_text=None
+      - 'block_start': content_block_start（tool_use 块开始，携带工具名）→
+        delta_text = tool name（非 tool_use 块为 None）
       - 'other': 其他 content_block_delta 类型（server_tool_use 等）→ delta_text=None
     非 Anthropic 事件（chat/completions、responses SSE 等）返回 None。
-    注：message_start / content_block_start / message_delta / message_stop 等
+    注：message_start / message_delta / message_stop 等
     不含文本 delta 的事件返回 None，走整行透传（原样保留，无需还原）。
     """
     evt_type = parsed.get('type') if isinstance(parsed, dict) else None
@@ -199,6 +201,15 @@ def _anthropic_event(parsed: dict) -> tuple[str, str | None] | None:
         # 块结束：arg_buf 中未完成的 token 前缀不可能再有后续分片，
         # 必须清理，否则下一个 input_json_delta 可能跨块拼接伪还原
         return 'block_stop', None
+    if evt_type == 'content_block_start':
+        # tool_use 块开始：捕获工具名供 block_stop 审计用。
+        # 无 tool name（text 块等）→ 返回 None（不拦截，走透传）
+        cb = parsed.get('content_block')
+        if isinstance(cb, dict) and cb.get('type') == 'tool_use':
+            name = cb.get('name')
+            if isinstance(name, str) and name:
+                return 'block_start', name
+        return None
     if evt_type != 'content_block_delta':
         return None
     delta = parsed.get('delta')
@@ -315,6 +326,104 @@ def _sanitize_json(text: str) -> str:
     return ''.join(result)
 
 
+def _accumulate_tool_calls(
+    buf: dict[int, dict[str, str]],
+    tool_calls,
+) -> None:
+    """累积 OpenAI chat/completions delta.tool_calls 分片（按 index 分组）。
+
+    - tool_calls: delta.tool_calls 值（list 或 None）；None 跳过
+    - 每项含 index / function.name / function.arguments 字段（缺失项跳过）
+    - name 通常首个分片出现；arguments 为字符串增量分片（跨分片拼接）
+    - null 值防御：function 为 None 或字段为 None 时跳过（不抛异常）
+    """
+    if not tool_calls or not isinstance(tool_calls, list):
+        return
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        idx = tc.get('index')
+        if idx is None or not isinstance(idx, int):
+            continue
+        fn = tc.get('function')
+        if not isinstance(fn, dict):
+            continue  # function 缺失/None → 不创建 entry（null 值防御）
+        entry = buf.setdefault(idx, {'name': '', 'arguments': ''})
+        name = fn.get('name')
+        if isinstance(name, str) and name:
+            entry['name'] += name
+        args = fn.get('arguments')
+        if isinstance(args, str) and args:
+            entry['arguments'] += args
+
+
+def _extract_tool_calls_non_stream(
+    parsed: dict,
+    tail: str,
+) -> list[tuple[str, str]]:
+    """从非流式整包响应提取 tool calls（三协议）。
+
+    返回 [(tool_name, args_json)]：
+      - OpenAI chat/completions: choices[0].message.tool_calls[]
+      - Anthropic Messages: content[].tool_use（name + input JSON 序列化）
+      - Responses: output[] 中 type == 'function_call'（name + arguments）
+    提取失败/结构异常返回 []（不抛异常，走透传）。
+    """
+    if not isinstance(parsed, dict):
+        return []
+    tail_norm = tail.rstrip('/')
+    calls: list[tuple[str, str]] = []
+
+    # OpenAI chat/completions
+    if tail_norm.endswith('chat/completions'):
+        choices = parsed.get('choices') or []
+        for ch in choices:
+            if not isinstance(ch, dict):
+                continue
+            msg = ch.get('message') or {}
+            tcs = msg.get('tool_calls') or []
+            for tc in tcs:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get('function') or {}
+                name = fn.get('name')
+                args = fn.get('arguments')
+                if isinstance(name, str) and name:
+                    calls.append((name, args if isinstance(args, str) else ''))
+        return calls
+
+    # Anthropic Messages
+    if tail_norm.endswith('v1/messages'):
+        content = parsed.get('content') or []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get('type') != 'tool_use':
+                continue
+            name = block.get('name')
+            inp = block.get('input')
+            if isinstance(name, str) and name:
+                args = json.dumps(inp, ensure_ascii=False) if inp is not None else ''
+                calls.append((name, args))
+        return calls
+
+    # Responses
+    if tail_norm.endswith('/v1/responses'):
+        output = parsed.get('output') or []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            if item.get('type') != 'function_call':
+                continue
+            name = item.get('name')
+            args = item.get('arguments')
+            if isinstance(name, str) and name:
+                calls.append((name, args if isinstance(args, str) else ''))
+        return calls
+
+    return []
+
+
 # 规范化分隔符集合（design D2 skip 判定）：[-. ] 连字符、点、空格
 _SEP_NORMALIZE_RE = _re.compile(r'[-. ]')
 
@@ -429,6 +538,43 @@ class LlmMixin:
         """返回当前请求 PII scope（无则 None）。"""
         return getattr(self, '_pii_scope', None)
 
+    # ── 输出审计钩子（Batch 4 占位，Batch 5 AuditMixin 实现）──
+
+    async def audit_tool_call(self, name: str, args_json: str) -> str:
+        """审计单个 tool call（name + 原始 args JSON）。
+
+        返回 'allow'（默认占位：Batch 5 接入 AuditMixin 后返回真实 verdict）。
+        审计读取的是**掩码前原始参数**（design D3 审计对抗性）——
+        PII 掩码在 flush 阶段，不参与规则匹配。
+        """
+        return 'allow'
+
+    def audit_enabled(self) -> bool:
+        """审计是否启用（Batch 5 AuditMixin 覆盖）。"""
+        return False
+
+    async def _audit_openai_tool_calls(
+        self,
+        tool_calls_buf: dict[int, dict[str, str]],
+        active_t2p: dict,
+    ) -> None:
+        """审计 OpenAI chat/completions 累积的 tool calls（finish_reason 触发）。
+
+        审计读取**掩码前原始 args**（design D3 审计对抗性）——即累积的
+        arguments 原文，不含 PII 占位符（PII 掩码在 flush 阶段）。
+        Batch 4：占位实现（audit_tool_call 默认 allow，不注入拒绝）。
+        Batch 5+：接入 AuditMixin，返回 verdict 后注入拒绝消息。
+        """
+        if not tool_calls_buf or not self.audit_enabled():
+            return
+        for idx in sorted(tool_calls_buf):
+            entry = tool_calls_buf[idx]
+            name = entry.get('name', '')
+            args = entry.get('arguments', '')
+            if not name:
+                continue
+            await self.audit_tool_call(name, args)
+
     async def _pii_response_process(
         self,
         text: str,
@@ -541,12 +687,30 @@ class LlmMixin:
             # 工具调用块结束：arg_buf 中未完成的 token 前缀不可能再有
             # 后续分片（token 不会跨两个 tool_use block），清空防伪还原
             # （content/reasoning 保留 pending，由流末统一清理）
+            # 审计触发点：读取掩码前原始完整参数累积器（design D3 审计对抗性）
+            if getattr(self, '_audit_arg_accum', '') and self.audit_enabled():
+                name = self._last_anthropic_tool_name or ''
+                await self.audit_tool_call(name, getattr(self, '_audit_arg_accum', ''))
+            if hasattr(self, '_audit_arg_accum'):
+                self._audit_arg_accum = ''
+            self._last_anthropic_tool_name = None
             await write(
                 (await self._pii_response_process(line, active_t2p) + '\n').encode(
                     'utf-8'
                 )
             )
             return content_buf, reasoning_buf, ''
+
+        if kind == 'block_start':
+            # tool_use 块开始：记录工具名（block_stop 审计用）
+            if delta_text:
+                self._last_anthropic_tool_name = delta_text
+            await write(
+                (await self._pii_response_process(line, active_t2p) + '\n').encode(
+                    'utf-8'
+                )
+            )
+            return content_buf, reasoning_buf, arg_buf
 
         if kind in ('text', 'thinking', 'function_args'):
             if delta_text is None:  # pragma: no cover — 识别器保证 delta 事件携带 str
@@ -558,6 +722,10 @@ class LlmMixin:
                 reasoning_buf += delta_text
             else:
                 arg_buf += delta_text
+                # 审计参数累积（掩码前原始完整参数，design D3）
+                self._audit_arg_accum = (
+                    getattr(self, '_audit_arg_accum', '') + delta_text
+                )
             buf = (
                 content_buf
                 if kind == 'text'
@@ -684,6 +852,13 @@ class LlmMixin:
             # item 结束：arg_buf 中未完成的 token 前缀不可能再有后续分片
             # （function call 参数不会跨 item 续写），清空防跨 item 伪还原
             # （content/reasoning 保留 pending，由流末统一清理）
+            # 审计触发点：读取掩码前原始完整参数累积器（design D3 审计对抗性）
+            if getattr(self, '_audit_arg_accum', '') and self.audit_enabled():
+                name = self._last_responses_tool_name or ''
+                await self.audit_tool_call(name, getattr(self, '_audit_arg_accum', ''))
+            if hasattr(self, '_audit_arg_accum'):
+                self._audit_arg_accum = ''
+            self._last_responses_tool_name = None
             await write(
                 (await self._pii_response_process(line, active_t2p) + '\n').encode(
                     'utf-8'
@@ -700,6 +875,10 @@ class LlmMixin:
                 reasoning_buf += delta_text
             else:
                 arg_buf += delta_text
+                # 审计参数累积（掩码前原始完整参数，design D3）
+                self._audit_arg_accum = (
+                    getattr(self, '_audit_arg_accum', '') + delta_text
+                )
             buf = (
                 content_buf
                 if kind == 'output_text'
@@ -732,6 +911,13 @@ class LlmMixin:
             arg_buf,
             active_t2p,
         )
+        # 捕获 function call 工具名（response.function_call 事件，item_done 审计用）
+        if isinstance(parsed, dict):
+            item = parsed.get('item')
+            if isinstance(item, dict) and item.get('type') == 'function_call':
+                name = item.get('name')
+                if isinstance(name, str) and name:
+                    self._last_responses_tool_name = name
         await write(
             (await self._pii_response_process(line, active_t2p) + '\n').encode('utf-8')
         )
@@ -761,6 +947,13 @@ class LlmMixin:
                 request.headers.get('x-request-id', '')
                 or str(_uuid.uuid4()).replace('-', '')[:16]
             )
+            # 请求级工具名追踪（Anthropic block_start → block_stop 审计用）
+            self._last_anthropic_tool_name = None
+            # 请求级工具名追踪（Responses function_call → item_done 审计用）
+            self._last_responses_tool_name = None
+            # 请求级审计参数累积器（design D3：审计读掩码前原始完整参数，
+            # 独立于流式 arg_buf——后者被 safe/hold 分割消费）
+            self._audit_arg_accum = ''
             tail = request.match_info['tail']
             target_url = f'{upstream.rstrip("/")}/{tail}'
             if request.query_string:
@@ -878,7 +1071,7 @@ class LlmMixin:
                         )
                         await resp.prepare(request)
 
-                        if active_t2p or self._pii_active():
+                        if active_t2p or self._pii_active() or self.audit_enabled():
                             # ── JSON-aware 流式 token 还原（广义 Plan C） ──
                             content_buf = ''  # 累积 delta.content 片段（每事件经 safe/pending 分割重置为小字符串，摊还 O(1)）
                             reasoning_buf = ''  # 累积 delta.reasoning_content 片段
@@ -890,6 +1083,12 @@ class LlmMixin:
                             byte_buf = bytearray()
                             resp_log_path = None
                             sse_event_count = 0  # 空流检测：统计 data 事件数
+                            # OpenAI chat/completions tool_calls 分片累积：
+                            # index → {'name': str, 'arguments': str}
+                            tool_calls_buf: dict[int, dict[str, str]] = {}
+                            tool_calls_audited = (
+                                False  # 防止重复审计（finish_reason + 流末双触发）
+                            )
 
                             async def _flush(
                                 c: str = '',
@@ -957,6 +1156,16 @@ class LlmMixin:
 
                                         # [DONE] 标记：先 flush 累积内容
                                         if payload.strip() == '[DONE]':
+                                            # 流末兜底审计（finish_reason 未触发时）
+                                            if (
+                                                tool_calls_buf
+                                                and not tool_calls_audited
+                                            ):
+                                                tool_calls_audited = True
+                                                await self._audit_openai_tool_calls(
+                                                    tool_calls_buf,
+                                                    active_t2p,
+                                                )
                                             if is_responses_stream:
                                                 # 兼容网关可能在 responses 流中发 [DONE]：
                                                 # 用 responses 格式 flush，避免 chat 格式污染
@@ -1113,6 +1322,27 @@ class LlmMixin:
                                                 'finish_reason',
                                             )
 
+                                            # ── OpenAI tool_calls 分片累积 ──
+                                            # 全程缓冲至审计 verdict 前不 flush
+                                            # （design D4：未出 verdict 无 tool call 事件流出）
+                                            if delta.get('tool_calls') is not None:
+                                                _accumulate_tool_calls(
+                                                    tool_calls_buf,
+                                                    delta['tool_calls'],
+                                                )
+
+                                            # ── finish_reason == tool_calls：审计触发点 ──
+                                            if (
+                                                finish_reason == 'tool_calls'
+                                                and tool_calls_buf
+                                                and not tool_calls_audited
+                                            ):
+                                                tool_calls_audited = True
+                                                await self._audit_openai_tool_calls(
+                                                    tool_calls_buf,
+                                                    active_t2p,
+                                                )
+
                                             # ── Reasoning content（独立处理，不受 content 影响）──
                                             rc_val = delta.get('reasoning_content')
                                             if rc_val is not None:
@@ -1125,11 +1355,7 @@ class LlmMixin:
                                                 safe, pending = _split_safe_hold(
                                                     restored,
                                                     active_t2p,
-                                                    (
-                                                        self._pii_scope
-                                                        if self._pii_active()
-                                                        else None
-                                                    ),
+                                                    self._pii_scope_or_none(),
                                                 )
                                                 if safe:
                                                     await resp.write(
@@ -1172,11 +1398,7 @@ class LlmMixin:
                                                 safe, pending = _split_safe_hold(
                                                     restored,
                                                     active_t2p,
-                                                    (
-                                                        self._pii_scope
-                                                        if self._pii_active()
-                                                        else None
-                                                    ),
+                                                    self._pii_scope_or_none(),
                                                 )
 
                                                 # flush 安全部分
@@ -1717,6 +1939,18 @@ class LlmMixin:
                             'utf-8',
                             errors='replace',
                         )
+                        # 非流式整包审计（design D4：不因缺 SSE 完成事件跳过）
+                        if self.audit_enabled() and resp_text:
+                            try:
+                                _resp_json = json.loads(resp_text)
+                                _calls = _extract_tool_calls_non_stream(
+                                    _resp_json,
+                                    tail,
+                                )
+                                for _name, _args in _calls:
+                                    await self.audit_tool_call(_name, _args)
+                            except json.JSONDecodeError:
+                                pass
                         out_text = await self._pii_response_process(
                             resp_text, active_t2p
                         )
