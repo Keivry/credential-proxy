@@ -104,6 +104,30 @@ async def make_upstream():
             await resp.write(b'data: [DONE]\n\n')
             await resp.write_eof()
             return resp
+        # 流式 OpenAI tool_calls + 阻断后 content（真实流量发现的回归：
+        # tool_calls_blocked 曾永久跳过后续行，后续 content 丢失）
+        if case == 'stream_tool_calls_then_content':
+            resp = web.StreamResponse(headers={'Content-Type': 'text/event-stream'})
+            await resp.prepare(request)
+            await resp.write(
+                b'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":null}}]}\n\n'
+            )
+            await resp.write(
+                b'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\\"cmd\\":\\"rm -rf /important\\"}"}}]},"finish_reason":null}]}\n\n'
+            )
+            await resp.write(
+                b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n'
+            )
+            # 阻断后模型继续输出说明文字
+            await resp.write(
+                'data: {"choices":[{"index":0,"delta":{"content":"我已执行该命令，输出如下。"},"finish_reason":null}]}\n\n'.encode()
+            )
+            await resp.write(
+                b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+            )
+            await resp.write(b'data: [DONE]\n\n')
+            await resp.write_eof()
+            return resp
         # Anthropic tool_use 流
         if case == 'anthropic_tool_use':
             resp = web.StreamResponse(headers={'Content-Type': 'text/event-stream'})
@@ -249,3 +273,58 @@ async def test_non_stream_danger_audit():
         name, args = proxy.audited_calls[0]
         assert name == 'bash'
         assert 'rm -rf' in args
+
+
+@asynccontextmanager
+async def deny_env():
+    """与 env() 同构，但 audit_tool_call 返回 'deny'（阻断路径）。"""
+    up_runner = await make_upstream()
+    proxy = await make_proxy()
+    # 与 AuditProxy 同构：同步方法（_llm.py 调用点有 await 也有真值判断，
+    # async 函数会留 coroutine 不 await → 警告）；deny 路径还会读 audit_mode
+    proxy.audit_mode = 'block'
+
+    async def deny_tool_call(name, args_json):
+        proxy.audited_calls.append((name, args_json))
+        return 'deny'
+
+    def deny_enabled():
+        return True
+
+    proxy.audit_enabled = deny_enabled
+    proxy.audit_tool_call = deny_tool_call
+    try:
+        yield proxy
+    finally:
+        for r in proxy._runners:
+            await r.cleanup()
+        if proxy._shared_session:
+            await proxy._shared_session.close()
+        await up_runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_stream_deny_then_content_forwarded():
+    """回归：阻断（tool_calls_blocked）后模型继续发的 content 必须转发。
+
+    曾在真实流量中发现：`if tool_calls_blocked: continue` 永久跳过后续行，
+    阻断后 content 全部丢失。修复后仅跳过 finish_reason: tool_calls 行本身。
+    """
+    async with deny_env() as proxy, ClientSession() as s:
+        body = json.dumps({'case': 'stream_tool_calls_then_content'})
+        async with s.post(CHAT_BASE, headers=HEADERS, data=body) as r:
+            assert r.status == 200
+            text = await r.text()
+        # 审计被触发且判 deny
+        assert len(proxy.audited_calls) == 1
+        assert 'rm -rf' in proxy.audited_calls[0][1]
+        # 阻断响应：拒绝消息 + 后续 content 都在，tool_calls 不透传
+        assert '审计拒绝' in text
+        # content 是 JSON \u 转义形式（_mk_sse_event ensure_ascii），需解码后断言
+        import re as _re
+
+        contents = _re.findall(r'"content":\s*"((?:[^"\\]|\\.)*)"', text)
+        joined = ''.join(json.loads('"' + c + '"') if c else '' for c in contents)
+        assert '我已执行该命令' in joined
+        assert '"tool_calls"' not in text
+        assert '[DONE]' in text

@@ -210,11 +210,11 @@ class CredentialProxy(
         from _pii import parse_pii_env_config
 
         pii_cfg = parse_pii_env_config()
+        # 先 _init_pii（会无条件重置 pii_enabled=False），再应用配置
+        self._init_pii()
         self.pii_enabled = pii_cfg['enabled']
         self.pii_response_side = pii_cfg['response_side']
         self.pii_hold_max = pii_cfg['hold_max']
-        # PiiMixin 的 _pii_scope_or_none 依赖 _init_pii 初始化 detector
-        self._init_pii()
 
         audit_cfg = parse_audit_env_config(require_whitelist=True)
         self._audit_startup_errors = audit_cfg['errors']
@@ -222,17 +222,9 @@ class CredentialProxy(
             for e in audit_cfg['errors']:
                 logger.error('审计配置错误: %s', e)
             raise SystemExit(f'审计配置错误: {audit_cfg["errors"][0]}')
-        # 应用校验后的配置（_ensure_audit_init 会再读 env，这里保持一致）
-        self.audit_enabled_flag = audit_cfg['mode'] in ('block', 'approve')
-        self.audit_mode = audit_cfg['mode'] if self.audit_enabled_flag else 'block'
-        self.audit_timeout = audit_cfg['timeout']
-        self.audit_hold_max_bytes = audit_cfg['hold_max']
-        self.approval_whitelist = audit_cfg['whitelist']
-        self._audit_approval_pending = {}
-        self._audit_approval_msgs = {}
-        self._audit_pending_seq = 0
-        self._audit_log_ring = []
-        self._audit_log_fail_count = 0
+        # 统一走 _ensure_audit_init lazy 初始化（policy + 审批状态 + 日志）
+        # 不手动设 audit 属性，避免遗漏字段（如 policy）导致 AttributeError
+        self._ensure_audit_init()
         if self.audit_enabled_flag:
             logger.info(
                 '审计已启用: mode=%s timeout=%ds hold_max=%dB',

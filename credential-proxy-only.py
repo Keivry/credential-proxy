@@ -82,10 +82,11 @@ class CredentialProxyOnly(TokenMixin, PiiMixin, CredentialMixin, LlmMixin):
         from _pii import parse_pii_env_config
 
         pii_cfg = parse_pii_env_config()
+        # 先 _init_pii（会无条件重置 pii_enabled=False），再应用配置
+        self._init_pii()
         self.pii_enabled = pii_cfg['enabled']
         self.pii_response_side = pii_cfg['response_side']
         self.pii_hold_max = pii_cfg['hold_max']
-        self._init_pii()
         if pii_cfg['errors']:
             for e in pii_cfg['errors']:
                 logger.error('PII 配置错误: %s', e)
@@ -110,17 +111,11 @@ class CredentialProxyOnly(TokenMixin, PiiMixin, CredentialMixin, LlmMixin):
             logger.warning(
                 '轻量入口不支持 AUDIT_MODE=approve（无 Matrix 审批），降级为 block 模式'
             )
-            audit_cfg['mode'] = 'block'
-        self.audit_enabled_flag = audit_cfg['mode'] in ('block', 'approve')
-        self.audit_mode = audit_cfg['mode'] if self.audit_enabled_flag else 'block'
-        self.audit_timeout = audit_cfg['timeout']
-        self.audit_hold_max_bytes = audit_cfg['hold_max']
-        self.approval_whitelist = audit_cfg['whitelist']
-        self._audit_approval_pending = {}
-        self._audit_approval_msgs = {}
-        self._audit_pending_seq = 0
-        self._audit_log_ring = []
-        self._audit_log_fail_count = 0
+            # 降级必须作用于 env（_ensure_audit_init 读 env 决定 mode）
+            os.environ['AUDIT_MODE'] = 'block'
+        # 统一走 _ensure_audit_init lazy 初始化（policy + 审批状态 + 日志）
+        # 不手动设 audit 属性，避免遗漏字段（如 policy）导致 AttributeError
+        self._ensure_audit_init()
         if self.audit_enabled_flag:
             logger.info(
                 '审计已启用: mode=%s timeout=%ds hold_max=%dB',

@@ -1801,7 +1801,11 @@ class LlmMixin(AuditMixin):
                                             # deny：finish_reason: tool_calls 行不透传
                                             # （客户端不应看到 tool_calls 语义——拒绝后
                                             # 只有拒绝消息 + finish_reason: stop）
-                                            if tool_calls_blocked:
+                                            # 只跳过当前终止行，不得永久跳过后续行
+                                            # （阻断后模型可能继续发 content 说明）
+                                            if tool_calls_blocked and (
+                                                finish_reason == 'tool_calls'
+                                            ):
                                                 continue
 
                                             # ── Reasoning content（独立处理，不受 content 影响）──

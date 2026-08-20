@@ -187,3 +187,15 @@
 
 - OpenAI 格式下 `finish_reason == 'tool_calls'` 是否在所有上游（opencode-go 网关透传 DeepSeek）都可靠出现——若不可靠，改用流末 `[DONE]` 前统一审计（实现时用真实流量验证）
 - 阻断注入的「拒绝消息」是否需要特殊前缀让 Hermes 明确识别为策略拒绝（而非普通助手回复）——实现时观察 Hermes 行为决定
+
+### 验证结论（Batch 9.2 真实流量，2026-08-21）
+
+**Q1（finish_reason 可靠性）：已解决。** 假上游（aiohttp 直连 llm-proxy-only 真实进程）实测：标准 OpenAI 流式 tool_calls（分片累积 → `finish_reason: tool_calls`）稳定触发审计；`[DONE]` 兜底覆盖无 finish_reason 的流（`tool_calls_buf` 非空且未审计 → 流末统一审计）。两条路径均验证通过。注意：独立 `finish_reason: tool_calls` 行（delta={}）与 tool_calls 行分离时，审计由 finish_reason 行触发（`tool_calls_buf` 非空即触发），tool_calls 行本身 `finish_reason: null` 不会误触发。
+
+**Q2（拒绝消息识别）：无需特殊前缀。** 拒绝消息为完整 assistant content（`该工具调用已被安全策略拦截（审计拒绝）。如需执行请联系管理员审批。`），带 `finish_reason: stop`、无 tool_calls、无 `finish_reason: tool_calls` 透传——客户端按普通助手回复处理。真实流量验证阻断后：拒绝消息 + 后续 content（模型补充说明）可共存，后续 content 正常转发。
+
+**补充发现并修复的真实 bug（Batch 9.2）：**
+1. **阻断后后续 content 丢失**：`if tool_calls_blocked: continue` 永久跳过阻断后的所有后续行（含 content）。修复：仅跳过 `finish_reason: tool_calls` 行本身（`tool_calls_blocked and finish_reason == 'tool_calls'`）。回归测试 `test_stream_deny_then_content_forwarded`。
+2. **轻量入口 `policy` 属性缺失**：三个入口手动设 audit 属性跳过 `_ensure_audit_init` → `audit_tool_call` 读 `self.policy` AttributeError。修复：统一走 `_ensure_audit_init()`。
+3. **`_init_pii` 覆盖配置**：入口先设属性再 `_init_pii()`（后者无条件重置 `pii_enabled=False`）→ PII 脱敏静默失效。修复：先 `_init_pii()` 再应用配置。
+
