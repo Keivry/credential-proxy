@@ -54,7 +54,7 @@
 
 ### Requirement: 审批模式
 
-系统 SHALL 支持审批处置模式（可选）：危险工具调用被检测到时，系统 SHALL 挂起该调用的转发，通过 Matrix 消息向用户请求 ✅/❎ 审批；审批消息 SHALL 包含工具名与参数摘要（参数摘要 SHALL **先对已注册凭据/PII 脱敏、后截断**，截断边界不得切断脱敏替换结果；密钥形态（`sk-`、`ghp_` 等）一律替换为 `[REDACTED:<type>]`），并说明审批超时时间；**仅 ✅/❎ 两种 reaction 参与判定，其他 reaction 一律忽略且不影响 pending 状态**；审批判定 SHALL 校验 (a) 发送者属于配置的审批人白名单，(b) reaction 所附 event id 精确匹配该 pending 请求的审批消息 event id，(c) 同一 pending 请求只接受首次判定（幂等）；用户批准后 SHALL 将原始工具调用转发给客户端（OpenAI 为补发完整 tool call 事件；Anthropic/Responses 为续传剩余参数 delta + 正常终止事件，不得重复拼接已 flush 部分），拒绝后 SHALL 注入拒绝结果；审批超时 SHALL 按配置处置（默认拒绝）；审批消息发送失败 SHALL 立即按拒绝处置并清理 pending 条目，不得空挂至超时；超时与上游断连并发触发时 SHALL 幂等处置（先到者处置并删除条目，后到者发现条目已删则跳过）。**挂起缓冲上限**：挂起期间缓冲超过 `AUDIT_HOLD_MAX_BYTES` SHALL 按拒绝处置（fail-closed）。**流生命周期绑定**：流结束/异常/客户端断连 SHALL 取消审批并清理 pending 条目；孤儿 pending（对应流已结束但条目未清理）SHALL 被后台周期清扫（60s）按拒绝处置。挂起期间缓冲中出现新的危险工具调用 SHALL 按 fail-closed 拒绝，不得未经审批放行。**预检误判恢复**：首个可疑 delta 暂停 flush 后，若完整参数审计通过，SHALL 恢复 flush（续传剩余 delta + 正常终止，预检暂停期间已缓冲的 delta 不得重复 flush）。
+系统 SHALL 支持审批处置模式（可选）：危险工具调用被检测到时，系统 SHALL 挂起该调用的转发，通过 Matrix 消息向用户请求 ✅/❎ 审批；审批消息 SHALL 包含工具名与参数摘要（参数摘要 SHALL **先对已注册凭据/PII 脱敏、后截断**，截断边界不得切断脱敏替换结果；密钥形态（`sk-`、`ghp_` 等）一律替换为 `[REDACTED:<type>]`），并说明审批超时时间；**仅 ✅/❎ 两种 reaction 参与判定，其他 reaction 一律忽略且不影响 pending 状态**；审批判定 SHALL 校验 (a) 发送者属于配置的审批人白名单，(b) reaction 所附 event id 精确匹配该 pending 请求的审批消息 event id，(c) 同一 pending 请求只接受首次判定（幂等）；用户批准后 SHALL 将原始工具调用转发给客户端（OpenAI 为补发完整 tool call 事件；Anthropic/Responses 为续传剩余参数 delta + 正常终止事件，不得重复拼接已 flush 部分），拒绝后 SHALL 注入拒绝结果；审批超时 SHALL 按配置处置（默认拒绝，超时默认 `AUDIT_TIMEOUT`=90s，取值校验 ≥1s 且拒绝 110-130s 区间）；审批消息发送失败 SHALL 立即按拒绝处置并清理 pending 条目，不得空挂至超时；超时与上游断连并发触发时 SHALL 幂等处置（先到者处置并删除条目，后到者发现条目已删则跳过）。**挂起缓冲上限**：挂起期间缓冲超过 `AUDIT_HOLD_MAX_BYTES`（默认 1MB）SHALL 按拒绝处置（fail-closed）。**流生命周期绑定**：流结束/异常/客户端断连 SHALL 取消审批并清理 pending 条目；孤儿 pending（对应流已结束但条目未清理）SHALL 被后台周期清扫（60s）按拒绝处置。挂起期间缓冲中出现新的危险工具调用 SHALL 按 fail-closed 拒绝，不得未经审批放行。**预检误判恢复**：首个可疑 delta 暂停 flush 后，若完整参数审计通过，SHALL 恢复 flush（续传剩余 delta + 正常终止，预检暂停期间已缓冲的 delta 不得重复 flush）。
 
 #### Scenario: 审批通过放行
 - **WHEN** 危险工具调用触发审批且白名单用户点击 ✅
@@ -75,6 +75,22 @@
 #### Scenario: 审批消息参数摘要脱敏
 - **WHEN** 触发审批的工具调用参数包含已注册凭据或 PII（如 `Authorization: Bearer sk-xxx...` 或手机号）
 - **THEN** 审批消息中的参数摘要以 `[REDACTED:<type>]` 呈现，明文不进入 Matrix 房间
+
+#### Scenario: 审批消息发送失败立即拒绝
+- **WHEN** 危险工具调用触发审批但 Matrix 审批消息发送失败（`_ask` 返回 None）
+- **THEN** 该 pending 条目立即按拒绝处置并清理，客户端收到拒绝结果，不空挂至超时
+
+#### Scenario: 并发处置幂等
+- **WHEN** 同一 pending 审批同时被多个处置路径触发（如超时与上游断连并发、重复 reaction）
+- **THEN** 先到者处置并删除条目，后到者发现条目已删则跳过，无双注入/无重复终止事件
+
+#### Scenario: 挂起缓冲超限 fail-closed
+- **WHEN** 审批挂起期间缓冲累计超过 `AUDIT_HOLD_MAX_BYTES`
+- **THEN** 该 pending 按拒绝处置（fail-closed），客户端收到拒绝结果且 pending 清理
+
+#### Scenario: 预检误判恢复续传
+- **WHEN** 首个可疑 delta 触发预检暂停 flush，但完整参数审计通过（前半含 `rm` 字样实际安全）
+- **THEN** 恢复 flush（续传剩余 delta + 正常终止事件），预检暂停期间已缓冲的 delta 不重复 flush
 
 ### Requirement: 危险模式策略
 
