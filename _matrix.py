@@ -225,7 +225,11 @@ class MatrixMixin:
                 or req['approved'] is not None
             ):
                 pass
-            else:
+            elif (
+                (req_id := self.approval_msgs.get(orig))
+                and (req := self.pending_requests.get(req_id))
+                and req['approved'] is None
+            ):
                 ok = key == REACTION_APPROVE
                 req['approved'] = ok
                 req['event'].set()
@@ -235,6 +239,20 @@ class MatrixMixin:
                 if not req.get('use_token', True):
                     extra += ' (原始值)'
                 say_text = f'{key} 已{"批准" if ok else "拒绝"}: {req["entry"]}{extra}'
+
+            # ── 5. 审计审批分支（design D4 白名单 + event id 精确匹配 + 幂等）──
+            elif a_id := self._audit_approval_msgs.get(orig):
+                # (a) 发送者 ∈ 审批人白名单
+                if self.approval_whitelist and sender not in self.approval_whitelist:
+                    logger.warning('审计审批被忽略: 发送者 %s 不在白名单', sender)
+                else:
+                    ap = self._audit_approval_pending.get(a_id)
+                    # (c) 幂等：只接受首次判定（approved 已定则忽略）
+                    if ap and ap.get('approved') is None:
+                        ok = key == REACTION_APPROVE
+                        ap['approved'] = ok
+                        ap['event'].set()
+                        say_text = f'{key} 审计审批: {ap.get("name", "?")} → {"批准" if ok else "拒绝"}'
         if say_text:
             await self._say(say_text)
 

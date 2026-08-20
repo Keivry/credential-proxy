@@ -10,7 +10,7 @@ import uuid as _uuid
 from aiohttp import ClientSession, ClientTimeout, web
 from aiohttp.client_exceptions import ClientConnectionError, ServerDisconnectedError
 
-from _audit import BLOCK_MESSAGE, AuditMixin
+from _audit import BLOCK_MESSAGE, AuditMixin, redact_summary
 from _sse import SSE_CLIENT_GONE, filter_hop_headers
 from _token import (
     FULL_PII_TOKEN_RE,
@@ -565,8 +565,59 @@ class LlmMixin(AuditMixin):
                 continue
             verdict = await self.audit_tool_call(name, args)
             if verdict == 'deny':
+                if self.audit_mode == 'approve':
+                    # 审批模式：发起 Matrix 审批；approved → 放行（不注入拒绝）
+                    result = await self._request_audit_approval(name, args)
+                    if result == 'approved':
+                        continue
+                    # rejected/expired/failed → 注入拒绝
                 injections.append(self._build_block_event())
         return injections
+
+    async def _request_audit_approval(self, name: str, args_json: str) -> str:
+        """审批模式：发起 Matrix ✅/❎ 审批，返回 'approved'/'rejected'/'expired'/'failed'。
+
+        design D4：
+        - 审批消息含工具名 + 先脱敏后截断的参数摘要（redact_summary）+ 超时提示
+        - 超时默认拒绝（AUDIT_TIMEOUT）
+        - _ask 返回 None（发送失败）→ 'failed'（调用方按 rejected 处置 + 清理）
+        """
+        summary = redact_summary(args_json)
+        timeout = getattr(self, 'audit_timeout', 90)
+        if not hasattr(self, '_ask'):
+            logger.error('审批模式需要 MatrixMixin（_ask 不可用）')
+            return 'failed'
+        req_id = f'audit-{getattr(self, "_audit_pending_seq", 0)}'
+        self._audit_pending_seq = getattr(self, '_audit_pending_seq', 0) + 1
+        evt = asyncio.Event()
+        entry = {
+            'name': name,
+            'args': args_json,
+            'approved': None,
+            'event': evt,
+        }
+        self._audit_approval_pending[req_id] = entry
+        msg_id = await self._ask(
+            f'⚠️ 工具调用待审批: {name}\n参数摘要: {summary}\n'
+            f'点 ✅ 批准 或 ❎ 拒绝（{timeout}s 超时默认拒绝）',
+        )
+        if msg_id is None:
+            # 发送失败 → 立即按 rejected 处置 + 清理 pending
+            self._audit_approval_pending.pop(req_id, None)
+            return 'failed'
+        self._audit_approval_msgs[msg_id] = req_id
+        try:
+            await asyncio.wait_for(evt.wait(), timeout=timeout)
+        except TimeoutError:
+            self._audit_approval_pending.pop(req_id, None)
+            self._audit_approval_msgs.pop(msg_id, None)
+            return 'expired'
+        # reaction 已到达
+        ap = self._audit_approval_pending.pop(req_id, None)
+        self._audit_approval_msgs.pop(msg_id, None)
+        if ap and ap.get('approved') is True:
+            return 'approved'
+        return 'rejected'
 
     def _build_block_event(self) -> str:
         """构造 OpenAI chat/completions 阻断拒绝消息 SSE 行。
@@ -737,6 +788,100 @@ class LlmMixin(AuditMixin):
                 logger.debug('SSE 残余写入失败')
         return pending
 
+    async def _resolve_anthropic_hold(
+        self,
+        write,
+        active_t2p: dict,
+        line: str,
+        content_buf: str,
+        reasoning_buf: str,
+        arg_buf: str,
+    ) -> None:
+        """挂起结束（block_stop 到达）：完整审计 + 审批处置。
+
+        design D4 终态表：
+        - 预检误判（完整审计 allow）→ 恢复续传：缓冲行 + block_stop 原样放行
+        - deny + approve 模式 → Matrix 审批；approved → 放行；其余 → 拒绝
+        - deny + block 模式 → 注入拒绝 + 终止事件，缓冲丢弃
+        """
+        name = self._last_anthropic_tool_name or ''
+        args = getattr(self, '_audit_arg_accum', '')
+        verdict = await self.audit_tool_call(name, args)
+        if verdict == 'allow':
+            # 预检误判：完整审计通过 → 恢复续传（缓冲行 + block_stop 放行）
+            await self._release_hold(write, active_t2p, extra_line=line)
+        else:
+            result = 'rejected'
+            if self.audit_mode == 'approve':
+                result = await self._request_audit_approval(name, args)
+            if result == 'approved':
+                await self._release_hold(write, active_t2p, extra_line=line)
+            else:
+                await self._reject_anthropic_hold(write, active_t2p)
+        # 清理挂起状态
+        self._audit_hold_active = False
+        self._audit_hold_buf = []
+        self._audit_hold_bytes = 0
+        self._audit_arg_accum = ''
+        self._last_anthropic_tool_name = None
+
+    async def _release_hold(
+        self, write, active_t2p: dict, extra_line: str | None = None
+    ) -> None:
+        """放行挂起缓冲（approved / 预检误判）。
+
+        design D4：已 flush 部分不可撤回、不得重复拼接；缓冲行按原序放行，
+        均经 _pii_response_process（响应侧 PII 掩码在 flush 阶段）。
+        """
+        buf = getattr(self, '_audit_hold_buf', [])
+        for line in buf:
+            try:
+                await write(
+                    (await self._pii_response_process(line, active_t2p) + '\n').encode(
+                        'utf-8'
+                    )
+                )
+            except (
+                ConnectionResetError,
+                ConnectionAbortedError,
+                BrokenPipeError,
+            ):
+                logger.debug('SSE 挂起放行写入失败')
+                break
+        if extra_line:
+            try:
+                await write(
+                    (
+                        await self._pii_response_process(extra_line, active_t2p) + '\n'
+                    ).encode('utf-8')
+                )
+            except (
+                ConnectionResetError,
+                ConnectionAbortedError,
+                BrokenPipeError,
+            ):
+                logger.debug('SSE 挂起终止写入失败')
+
+    async def _reject_anthropic_hold(self, write, active_t2p: dict) -> None:
+        """拒绝挂起（rejected/expired/failed/超限）：注入拒绝 + 终止事件，缓冲丢弃。
+
+        design D4：挂起期间缓冲的 content 一律丢弃（拒绝后不再放行）。
+        """
+        # 丢弃缓冲（含未 flush 的参数残余）+ 解除挂起（后续事件正常转发）
+        self._audit_hold_buf = []
+        self._audit_hold_bytes = 0
+        self._audit_hold_active = False
+        self._audit_arg_accum = ''
+        self._last_anthropic_tool_name = None
+        try:
+            await write(self._build_block_event_anthropic().encode('utf-8'))
+        except (
+            ConnectionResetError,
+            ConnectionAbortedError,
+            BrokenPipeError,
+        ):
+            logger.debug('SSE 挂起拒绝注入失败')
+
     async def _handle_anthropic_event(
         self,
         write,
@@ -764,6 +909,39 @@ class LlmMixin(AuditMixin):
             return content_buf, reasoning_buf, arg_buf
         kind, delta_text = event
 
+        # ── 审计挂起状态（design D4：verdict 前暂停 flush）──
+        # 预检命中后：所有事件行缓冲（不 write），block_stop 到达时统一处置
+        if getattr(self, '_audit_hold_active', False):
+            if kind == 'block_stop':
+                # 挂起结束：完整审计 + 审批处置
+                await self._resolve_anthropic_hold(
+                    write,
+                    active_t2p,
+                    line,
+                    content_buf,
+                    reasoning_buf,
+                    arg_buf,
+                )
+                return content_buf, reasoning_buf, ''
+            # 挂起期间参数 delta 仍须累积（block_stop 审计读完整参数）
+            if kind == 'function_args' and delta_text is not None:
+                arg_buf += delta_text
+                self._audit_arg_accum = (
+                    getattr(self, '_audit_arg_accum', '') + delta_text
+                )
+            # 缓冲超限 → fail-closed（design D4：超限按 rejected 处置）
+            if (
+                len(line.encode('utf-8')) + getattr(self, '_audit_hold_bytes', 0)
+                > self.audit_hold_max_bytes
+            ):
+                await self._reject_anthropic_hold(write, active_t2p)
+                return content_buf, reasoning_buf, arg_buf
+            self._audit_hold_buf.append(line)
+            self._audit_hold_bytes = getattr(self, '_audit_hold_bytes', 0) + len(
+                line.encode('utf-8')
+            )
+            return content_buf, reasoning_buf, arg_buf
+
         if kind == 'block_stop':
             # 工具调用块结束：arg_buf 中未完成的 token 前缀不可能再有
             # 后续分片（token 不会跨两个 tool_use block），清空防伪还原
@@ -775,8 +953,16 @@ class LlmMixin(AuditMixin):
                     name, getattr(self, '_audit_arg_accum', '')
                 )
                 if verdict == 'deny':
-                    # 阻断：注入拒绝消息 + block_stop 终止事件（design D4 防 dangling）
-                    await write(self._build_block_event_anthropic().encode('utf-8'))
+                    if self.audit_mode == 'approve':
+                        # 审批模式：发起 Matrix 审批；approved → 放行（不注入拒绝）
+                        result = await self._request_audit_approval(
+                            name, getattr(self, '_audit_arg_accum', '')
+                        )
+                        if result == 'approved':
+                            verdict = 'allow'
+                    if verdict == 'deny':
+                        # 阻断：注入拒绝消息 + block_stop 终止事件（design D4 防 dangling）
+                        await write(self._build_block_event_anthropic().encode('utf-8'))
             if hasattr(self, '_audit_arg_accum'):
                 self._audit_arg_accum = ''
             self._last_anthropic_tool_name = None
@@ -812,6 +998,24 @@ class LlmMixin(AuditMixin):
                 self._audit_arg_accum = (
                     getattr(self, '_audit_arg_accum', '') + delta_text
                 )
+                # ── 预检暂停（design D4：暂停先于判定）──
+                # 同步廉价前缀匹配，命中即暂停 flush——不 await 异步判定
+                # （await 期间后续 delta 会继续走 flush 循环流出）
+                if (
+                    self.audit_enabled()
+                    and not getattr(self, '_audit_hold_active', False)
+                    and self.audit_precheck(
+                        self._last_anthropic_tool_name or '',
+                        self._audit_arg_accum,
+                    )
+                ):
+                    self._audit_hold_active = True
+                    self._audit_hold_buf = []
+                    self._audit_hold_bytes = 0
+                    # 本次 delta 行缓冲（不 flush）
+                    self._audit_hold_buf.append(line)
+                    self._audit_hold_bytes = len(line.encode('utf-8'))
+                    return content_buf, reasoning_buf, arg_buf
             buf = (
                 content_buf
                 if kind == 'text'
@@ -908,6 +1112,52 @@ class LlmMixin(AuditMixin):
                 logger.debug('SSE 残余写入失败')
         return pending
 
+    async def _resolve_responses_hold(
+        self,
+        write,
+        active_t2p: dict,
+        line: str,
+        content_buf: str,
+        reasoning_buf: str,
+        arg_buf: str,
+    ) -> None:
+        """挂起结束（item_done 到达）：完整审计 + 审批处置（同 Anthropic）。"""
+        name = self._last_responses_tool_name or ''
+        args = getattr(self, '_audit_arg_accum', '')
+        verdict = await self.audit_tool_call(name, args)
+        if verdict == 'allow':
+            await self._release_hold(write, active_t2p, extra_line=line)
+        else:
+            result = 'rejected'
+            if self.audit_mode == 'approve':
+                result = await self._request_audit_approval(name, args)
+            if result == 'approved':
+                await self._release_hold(write, active_t2p, extra_line=line)
+            else:
+                await self._reject_responses_hold(write, active_t2p)
+        # 清理挂起状态
+        self._audit_hold_active = False
+        self._audit_hold_buf = []
+        self._audit_hold_bytes = 0
+        self._audit_arg_accum = ''
+        self._last_responses_tool_name = None
+
+    async def _reject_responses_hold(self, write, active_t2p: dict) -> None:
+        """拒绝挂起（rejected/expired/failed/超限）：注入拒绝 + 终止事件，缓冲丢弃。"""
+        self._audit_hold_buf = []
+        self._audit_hold_bytes = 0
+        self._audit_hold_active = False
+        self._audit_arg_accum = ''
+        self._last_responses_tool_name = None
+        try:
+            await write(self._build_block_event_responses().encode('utf-8'))
+        except (
+            ConnectionResetError,
+            ConnectionAbortedError,
+            BrokenPipeError,
+        ):
+            logger.debug('SSE 挂起拒绝注入失败')
+
     async def _handle_responses_event(
         self,
         write,
@@ -934,6 +1184,38 @@ class LlmMixin(AuditMixin):
             )
             return content_buf, reasoning_buf, arg_buf
 
+        # ── 审计挂起状态（design D4：verdict 前暂停 flush）──
+        if getattr(self, '_audit_hold_active', False):
+            if kind == 'item_done':
+                # 挂起结束：完整审计 + 审批处置
+                await self._resolve_responses_hold(
+                    write,
+                    active_t2p,
+                    line,
+                    content_buf,
+                    reasoning_buf,
+                    arg_buf,
+                )
+                return content_buf, reasoning_buf, ''
+            # 挂起期间参数 delta 仍须累积（item_done 审计读完整参数）
+            if kind == 'function_call_arguments' and delta_text is not None:
+                arg_buf += delta_text
+                self._audit_arg_accum = (
+                    getattr(self, '_audit_arg_accum', '') + delta_text
+                )
+            # 缓冲超限 → fail-closed
+            if (
+                len(line.encode('utf-8')) + getattr(self, '_audit_hold_bytes', 0)
+                > self.audit_hold_max_bytes
+            ):
+                await self._reject_responses_hold(write, active_t2p)
+                return content_buf, reasoning_buf, arg_buf
+            self._audit_hold_buf.append(line)
+            self._audit_hold_bytes = getattr(self, '_audit_hold_bytes', 0) + len(
+                line.encode('utf-8')
+            )
+            return content_buf, reasoning_buf, arg_buf
+
         if kind == 'item_done':
             # item 结束：arg_buf 中未完成的 token 前缀不可能再有后续分片
             # （function call 参数不会跨 item 续写），清空防跨 item 伪还原
@@ -945,8 +1227,16 @@ class LlmMixin(AuditMixin):
                     name, getattr(self, '_audit_arg_accum', '')
                 )
                 if verdict == 'deny':
-                    # 阻断：注入拒绝消息 + item_done 终止事件（design D4 防 dangling）
-                    await write(self._build_block_event_responses().encode('utf-8'))
+                    if self.audit_mode == 'approve':
+                        # 审批模式：发起 Matrix 审批；approved → 放行（不注入拒绝）
+                        result = await self._request_audit_approval(
+                            name, getattr(self, '_audit_arg_accum', '')
+                        )
+                        if result == 'approved':
+                            verdict = 'allow'
+                    if verdict == 'deny':
+                        # 阻断：注入拒绝消息 + item_done 终止事件（design D4 防 dangling）
+                        await write(self._build_block_event_responses().encode('utf-8'))
             if hasattr(self, '_audit_arg_accum'):
                 self._audit_arg_accum = ''
             self._last_responses_tool_name = None
@@ -970,6 +1260,22 @@ class LlmMixin(AuditMixin):
                 self._audit_arg_accum = (
                     getattr(self, '_audit_arg_accum', '') + delta_text
                 )
+                # ── 预检暂停（design D4：暂停先于判定）──
+                if (
+                    self.audit_enabled()
+                    and not getattr(self, '_audit_hold_active', False)
+                    and self.audit_precheck(
+                        self._last_responses_tool_name or '',
+                        self._audit_arg_accum,
+                    )
+                ):
+                    self._audit_hold_active = True
+                    self._audit_hold_buf = []
+                    self._audit_hold_bytes = 0
+                    # 本次 delta 行缓冲（不 flush）
+                    self._audit_hold_buf.append(line)
+                    self._audit_hold_bytes = len(line.encode('utf-8'))
+                    return content_buf, reasoning_buf, arg_buf
             buf = (
                 content_buf
                 if kind == 'output_text'
@@ -1489,6 +1795,12 @@ class LlmMixin(AuditMixin):
                                                         )
                                                     tool_calls_pending_events.clear()
 
+                                            # deny：finish_reason: tool_calls 行不透传
+                                            # （客户端不应看到 tool_calls 语义——拒绝后
+                                            # 只有拒绝消息 + finish_reason: stop）
+                                            if tool_calls_blocked:
+                                                continue
+
                                             # ── Reasoning content（独立处理，不受 content 影响）──
                                             rc_val = delta.get('reasoning_content')
                                             if rc_val is not None:
@@ -1796,6 +2108,80 @@ class LlmMixin(AuditMixin):
                                             byte_buf = bytearray()
                             except SSE_CLIENT_GONE as e:
                                 logger.debug('SSE 客户端断连: %s', e)
+
+                            # 流结束：未审计 tool call 兜底（design D4 硬性）
+                            # EOF/[DONE] 前上游正常结束但无终止事件（不完整
+                            # tool call）→ 一律 fail-closed 丢弃 + 注入拒绝；
+                            # 连接中断（无 [DONE]）同理——已累积未审计的
+                            # tool call 不得静默 flush
+                            if (
+                                tool_calls_buf
+                                and not tool_calls_audited
+                                and self.audit_enabled()
+                            ):
+                                tool_calls_audited = True
+                                _inj = await self._audit_openai_tool_calls(
+                                    tool_calls_buf,
+                                    active_t2p,
+                                )
+                                if _inj:
+                                    tool_calls_blocked = True
+                                    tool_calls_pending_events.clear()
+                                    for _ev in _inj:
+                                        try:
+                                            await resp.write(_ev.encode('utf-8'))
+                                        except SSE_CLIENT_GONE:
+                                            break
+                                else:
+                                    for _ev in tool_calls_pending_events:
+                                        try:
+                                            await resp.write(
+                                                (
+                                                    await self._pii_response_process(
+                                                        _ev, active_t2p
+                                                    )
+                                                    + '\n'
+                                                ).encode('utf-8')
+                                            )
+                                        except SSE_CLIENT_GONE:
+                                            break
+                                    tool_calls_pending_events.clear()
+
+                            # 流末：Anthropic/Responses 未完成 tool call 兜底
+                            # （design D4 硬性：正常结束但无 block_stop/item_done
+                            # 终止事件 → 不完整参数不得 flush，fail-closed 丢弃）
+                            if (
+                                getattr(self, '_audit_arg_accum', '')
+                                and self.audit_enabled()
+                                and (is_anthropic_stream or is_responses_stream)
+                            ):
+                                _name = (
+                                    self._last_anthropic_tool_name
+                                    if is_anthropic_stream
+                                    else self._last_responses_tool_name
+                                ) or ''
+                                _args = getattr(self, '_audit_arg_accum', '')
+                                _verdict = await self.audit_tool_call(_name, _args)
+                                if _verdict == 'deny' and self.audit_mode == 'approve':
+                                    _result = await self._request_audit_approval(
+                                        _name, _args
+                                    )
+                                    if _result != 'approved':
+                                        _verdict = 'deny'
+                                if _verdict == 'deny':
+                                    # 不完整 tool call：丢弃 arg_buf + 注入拒绝
+                                    arg_buf = ''
+                                    if is_anthropic_stream:
+                                        _block = self._build_block_event_anthropic()
+                                    else:
+                                        _block = self._build_block_event_responses()
+                                    try:
+                                        await resp.write(_block.encode('utf-8'))
+                                    except SSE_CLIENT_GONE:
+                                        pass
+                                self._audit_arg_accum = ''
+                                self._last_anthropic_tool_name = None
+                                self._last_responses_tool_name = None
 
                             # 流结束：flush 残留（含 partial token 前缀清理）
                             if is_responses_stream:
@@ -2197,6 +2583,21 @@ class LlmMixin(AuditMixin):
                 # 请求级 PII 映射清理（无论成功/异常/客户端断连）
                 if getattr(self, 'pii_enabled', False):
                     self._pii_cleanup()
+                # 请求级审计状态清理（design D4 6.4：审批/挂起与流生命周期绑定）
+                # 未决审批 → 取消（置 rejected 语义）；挂起缓冲 → 丢弃
+                if getattr(self, 'audit_enabled_flag', False):
+                    for _req_id, _ap in list(
+                        getattr(self, '_audit_approval_pending', {}).items()
+                    ):
+                        if _ap.get('approved') is None:
+                            _ap['approved'] = False
+                            _ap['event'].set()
+                    self._audit_approval_pending.clear()
+                    self._audit_approval_msgs.clear()
+                    self._audit_hold_active = False
+                    self._audit_hold_buf = []
+                    self._audit_hold_bytes = 0
+                    self._audit_arg_accum = ''
 
         app = web.Application()
         app.router.add_route('*', '/{tail:.*}', handler)

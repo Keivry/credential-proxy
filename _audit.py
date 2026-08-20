@@ -12,6 +12,7 @@ AuditMixin 提供：
   相邻字符串字面量拼接、动态生成命令——这些属对抗级混淆，不在承诺内。
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -439,7 +440,14 @@ class AuditMixin:
     def _init_audit(self, policy_file: str | None = None):
         self.audit_enabled_flag = False
         self.audit_mode = 'block'  # 'block' | 'approve'（approve 在 Batch 6）
+        self.audit_timeout = 90  # 审批超时（秒），默认 90s，与上游 ~120s 断连窗口错开
+        self.audit_hold_max_bytes = 1048576  # 审批挂起期间缓冲上限（默认 1MB）
         self.policy = self._load_policy(policy_file)
+        # ── 审批状态（AUDIT_MODE=approve 时使用）──
+        self.approval_whitelist: set[str] = set()  # 审批人 Matrix user id 白名单
+        self._audit_approval_pending: dict[str, dict] = {}  # req_id → pending 条目
+        self._audit_approval_msgs: dict[str, str] = {}  # msg_id → req_id
+        self._audit_pending_seq = 0
 
     def _ensure_audit_init(self):
         """lazy 初始化（首次访问时读取环境变量）。"""
@@ -451,12 +459,60 @@ class AuditMixin:
             mode = os.environ.get('AUDIT_MODE', 'block')
             if mode in ('block', 'approve'):
                 self.audit_mode = mode
+            # 审批超时（AUDIT_TIMEOUT，默认 90s）；非法值回落默认
+            try:
+                t = int(os.environ.get('AUDIT_TIMEOUT', '90'))
+                if t >= 1:
+                    self.audit_timeout = t
+            except (ValueError, TypeError):
+                pass
+            # 审批挂起缓冲上限（AUDIT_HOLD_MAX_BYTES，默认 1MB）
+            try:
+                h = int(os.environ.get('AUDIT_HOLD_MAX_BYTES', '1048576'))
+                if h >= 1:
+                    self.audit_hold_max_bytes = h
+            except (ValueError, TypeError):
+                pass
+            # 审批人白名单（逗号分隔 Matrix user id）
+            wl = os.environ.get('APPROVAL_WHITELIST', '')
+            if wl:
+                self.approval_whitelist = {
+                    u.strip() for u in wl.split(',') if u.strip()
+                }
             if self.audit_enabled_flag:
                 logger.info(
                     '输出审计启用: mode=%s policy=%s',
                     self.audit_mode,
                     policy_file or '(default)',
                 )
+            # 审批模式：启动周期清扫兜底（孤儿 pending 置 rejected）
+            if self.audit_enabled_flag and self.audit_mode == 'approve':
+                self._start_approval_sweeper()
+
+    def _start_approval_sweeper(self):
+        """启动审批孤儿清扫定时任务（design D4 6.4：周期 60s）。
+
+        流结束/异常但 pending 未清理（如 handler 崩溃路径）时，
+        孤儿审批条目置 rejected（event.set() 唤醒等待者）+ 清理。
+        """
+        if getattr(self, '_approval_sweeper_started', False):
+            return
+        self._approval_sweeper_started = True
+
+        async def _sweep_loop():
+            while True:
+                await asyncio.sleep(60)
+                try:
+                    for _req_id, _ap in list(self._audit_approval_pending.items()):
+                        if _ap.get('approved') is None:
+                            logger.warning('审批孤儿清扫: %s 置 rejected', _req_id)
+                            _ap['approved'] = False
+                            _ap['event'].set()
+                            self._audit_approval_pending.pop(_req_id, None)
+                except Exception:  # pragma: no cover — 清扫异常不崩溃
+                    logger.exception('审批孤儿清扫异常')
+
+        self._approval_sweep_task = asyncio.create_task(_sweep_loop())
 
     def audit_enabled(self) -> bool:
         """审计是否启用。"""
@@ -560,17 +616,33 @@ class AuditMixin:
         """预检（design D4）：同步廉价前缀匹配，判定前暂停 flush。
 
         返回 True = 可疑（需暂停）。
+
+        匹配范围：
+        1. tool 名命中危险前缀（bash/sh/terminal/curl 等）
+        2. 参数前缀串**任意位置**出现危险命令起始——含 JSON 包装
+           （`{"cmd":"rm` 的 `rm` 前是引号/冒号，也是命令起始）——
+           design D4「参数增量 LCP 前缀命中」：`rm` 是 `rm -rf` 的前缀，
+           必须在此阶段可见即暂停（await 完整判定前不可让 `rm` 流出）。
         """
         if not self.audit_enabled():
             return False
         # tool 名命中危险前缀
         if name in _DANGEROUS_PREFIXES or name in ('curl', 'wget', 'nc'):
             return True
-        # 参数前缀含危险命令（如 'rm' 是 'rm -rf' 的前缀）
+        # 参数中出现危险命令起始（命令名前是 JSON 边界/分隔符/空白）
+        # 注意：只做廉价正则扫描（无回溯爆炸风险——模式固定）
+        stripped = args_prefix.lstrip()
         for prefix in _DANGEROUS_PREFIXES:
-            if args_prefix.lstrip().startswith(prefix):
+            if stripped.startswith(prefix):
                 return True
-        return False
+        # JSON 包装：危险命令出现在值起始处（`"cmd":"rm` / `cmd=rm` / `:rm`）
+        return (
+            _re.search(
+                r'["\'=:;|&({]\s*(' + '|'.join(_DANGEROUS_PREFIXES) + r')',
+                args_prefix,
+            )
+            is not None
+        )
 
 
 def _extract_host(args_json: str) -> str | None:
@@ -593,3 +665,51 @@ def _extract_host(args_json: str) -> str | None:
 
 # 阻断消息模板（design D4：无 tool_calls 的 assistant content）
 BLOCK_MESSAGE = '该工具调用已被安全策略拦截（审计拒绝）。如需执行请联系管理员审批。'
+
+
+# ═══════════════════════════════════════════════════════════
+# 审批摘要脱敏（design D4：先脱敏后截断）
+# ═══════════════════════════════════════════════════════════
+
+# 密钥/敏感值形态（摘要中替换为 [REDACTED:<type>]）
+_SECRET_PATTERNS = (
+    ('api_key', _re.compile(r'sk-[A-Za-z0-9_-]{16,}')),
+    ('token', _re.compile(r'(?:gh[pous]_|glpat-|xox[baprs]-)[A-Za-z0-9_-]{10,}')),
+    ('password', _re.compile(r'(?i)passw(?:or)?d\s*[:=]\s*\S+')),
+    ('secret', _re.compile(r'(?i)secret\s*[:=]\s*\S+')),
+    ('token', _re.compile(r'(?i)token\s*[:=]\s*\S+')),
+    (
+        'private_key',
+        _re.compile(
+            r'-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----',
+            _re.DOTALL,
+        ),
+    ),
+    ('id_card', _re.compile(r'\d{17}[\dXx]')),
+    ('phone', _re.compile(r'(?<!\d)1[3-9]\d{9}(?!\d)')),
+    ('email', _re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')),
+)
+
+
+def redact_summary(text: str, max_len: int = 120) -> str:
+    """先脱敏后截断的参数摘要（审批消息/审计日志共用）。
+
+    - 密钥形态替换为 [REDACTED:<type>]
+    - 截断边界半字符保护（不切断 UTF-8 多字节字符）
+    """
+    if not text:
+        return ''
+    redacted = text
+    for label, pat in _SECRET_PATTERNS:
+        redacted = pat.sub(f'[REDACTED:{label}]', redacted)
+    if len(redacted) <= max_len:
+        return redacted
+    # 截断边界半字符保护：回退到最后一个完整字符
+    cut = redacted[:max_len]
+    while cut:
+        try:
+            cut[-1].encode('utf-8')
+            break
+        except UnicodeEncodeError:
+            cut = cut[:-1]
+    return cut + '…'

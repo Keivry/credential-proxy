@@ -53,15 +53,15 @@
 
 ## 6. 审批模式
 
-- [ ] 6.1 复用 `_matrix.py` `_ask`/pending/超时机制：危险 tool call 挂起 → Matrix ✅/❎ 审批消息（含工具名与**先脱敏后截断的参数摘要**、`[REDACTED:<type>]` 密钥形态、超时提示）→ 批准后补发原格式事件 / 拒绝后注入拒绝消息 / 超时默认拒绝；**审批白名单校验**（发送者 ∈ 白名单 + reaction event id 精确匹配 + 幂等，见 design D4）；**审批消息发送失败（`_ask` 返回 None）立即按 rejected 处置 + 清理 pending**（见 design Risks，参照 `_credential.py:413-419` 先例）
+- [x] 6.1 复用 `_matrix.py` `_ask`/pending/超时机制：危险 tool call 挂起 → Matrix ✅/❎ 审批消息（含工具名与**先脱敏后截断的参数摘要**、`[REDACTED:<type>]` 密钥形态、超时提示）→ 批准后补发原格式事件 / 拒绝后注入拒绝消息 / 超时默认拒绝；**审批白名单校验**（发送者 ∈ 白名单 + reaction event id 精确匹配 + 幂等，见 design D4）；**审批消息发送失败（`_ask` 返回 None）立即按 rejected 处置 + 清理 pending**（见 design Risks，参照 `_credential.py:413-419` 先例）
   - 验收：非白名单 reaction 被忽略；同请求重复 reaction 只生效首次；摘要不含明文密钥/PII；`_ask` 返回 None 时 pending 立即清理且客户端收到拒绝结果
-- [ ] 6.2 流式挂起细节：挂起期间**继续读上游并缓冲**（上限 `AUDIT_HOLD_MAX_BYTES`，超限按 rejected fail-closed），审批完成统一放行/替换，不破坏 SSE 流结构；挂起期间按事件序缓冲后续 content；**缓冲中出现新的危险 tool call 一律 fail-closed 拒绝，不得未经审批放行**（见 design Risks）
+- [x] 6.2 流式挂起细节：挂起期间**继续读上游并缓冲**（上限 `AUDIT_HOLD_MAX_BYTES`，超限按 rejected fail-closed），审批完成统一放行/替换，不破坏 SSE 流结构；挂起期间按事件序缓冲后续 content；**缓冲中出现新的危险 tool call 一律 fail-closed 拒绝，不得未经审批放行**（见 design Risks）
   - 验收：缓冲超限按 rejected 注入拒绝且 pending 清理；挂起期间新危险调用被拒绝；缓冲 content 按事件序放行/替换
-- [ ] 6.3 集成测试：审批通过/拒绝/超时三种路径 + 流式完整性 + 白名单/幂等 + **发送失败**（`_ask`→None）+ **预检误判恢复**（首个可疑 delta 暂停 flush → 完整审计通过 → 恢复续传剩余 delta，无重复 flush）+ **预检同步暂停**（delta 到达同步置 pause，前缀匹配（`rm`→`rm -rf`）触发，await 判定不先于暂停）+ **正常结束不完整 tool call**（`finish_reason`/`[DONE]` 前正常结束但无终止事件 → fail-closed 丢弃 + 注入终止事件，不 flush 残缺参数）+ **拒绝后缓冲 content 丢弃**（rejected/expired/upstream_down 终态缓冲 content 不转发）
+- [x] 6.3 集成测试：审批通过/拒绝/超时三种路径 + 流式完整性 + 白名单/幂等 + **发送失败**（`_ask`→None）+ **预检误判恢复**（首个可疑 delta 暂停 flush → 完整审计通过 → 恢复续传剩余 delta，无重复 flush）+ **预检同步暂停**（delta 到达同步置 pause，前缀匹配（`rm`→`rm -rf`）触发，await 判定不先于暂停）+ **正常结束不完整 tool call**（`finish_reason`/`[DONE]` 前正常结束但无终止事件 → fail-closed 丢弃 + 注入终止事件，不 flush 残缺参数）+ **拒绝后缓冲 content 丢弃**（rejected/expired/upstream_down 终态缓冲 content 不转发）
   - 验收：七条路径（含发送失败、预检恢复、预检同步暂停、正常结束不完整、拒绝缓冲丢弃）全绿；流式完整性断言（无重复拼接/无 dangling tool_use）
-- [ ] 6.4 审批取消/收尾：流结束/异常/客户端断连 → 取消审批（`event.set()` + `_cleanup_request`）+ handler `try/finally` 清理请求级映射 + 周期清扫兜底（**后台定时任务 60s 扫描孤儿 pending 置 rejected 并清理**——`_matrix.py` CMD_LOCK 为 lock 触发的一次性清空，语义不同，仅作启发参考，见 design D4）
+- [x] 6.4 审批取消/收尾：流结束/异常/客户端断连 → 取消审批（`event.set()` + `_cleanup_request`）+ handler `try/finally` 清理请求级映射 + 周期清扫兜底（**后台定时任务 60s 扫描孤儿 pending 置 rejected 并清理**——`_matrix.py` CMD_LOCK 为 lock 触发的一次性清空，语义不同，仅作启发参考，见 design D4）
   - 验收：客户端断连后 pending_requests 无僵尸条目；僵尸审批消息再点 ✅ 无效；周期清扫能回收模拟泄漏的孤儿条目
-- [ ] 6.5 **异常路径测试组**（注入失败场景，复用 `sse_stream_loop_test.py` 模式）：上游断连（ServerDisconnectedError）、SSE 流中断、坏 JSON、客户端提前断连（SSE_CLIENT_GONE）、超时、空流、**缓冲超限（hold overflow）**、**超时与上游断连同时触发（竞态，验证处置幂等——后到者发现 pending 已删则跳过）**
+- [x] 6.5 **异常路径测试组**（注入失败场景，复用 `sse_stream_loop_test.py` 模式）：上游断连（ServerDisconnectedError）、SSE 流中断、坏 JSON、客户端提前断连（SSE_CLIENT_GONE）、超时、空流、**缓冲超限（hold overflow）**、**超时与上游断连同时触发（竞态，验证处置幂等——后到者发现 pending 已删则跳过）**
   - 验收：每条路径下 PII 映射清理、审批收尾、未审计 tool call fail-closed（不静默放行）；竞态路径无双注入/无重复终止事件
 
 ## 7. 审计日志
