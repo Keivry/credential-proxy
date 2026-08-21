@@ -426,7 +426,7 @@ def _extract_tool_calls_non_stream(
         return calls
 
     # Responses
-    if tail_norm.endswith('/v1/responses'):
+    if tail_norm.endswith('v1/responses'):
         output = parsed.get('output') or []
         for item in output:
             if not isinstance(item, dict):
@@ -1382,7 +1382,7 @@ class LlmMixin(AuditMixin):
             _debug_save_eligible = bool(_DEBUG_DIR) and (
                 tail.rstrip('/').endswith('chat/completions')
                 or tail.rstrip('/').endswith('v1/messages')
-                or tail.rstrip('/').endswith('/v1/responses')
+                or tail.rstrip('/').endswith('v1/responses')
             )
             _debug_saved = False  # 标记是否已在 SSE 响应中保存过
 
@@ -1467,9 +1467,12 @@ class LlmMixin(AuditMixin):
                     content_type = upstream_resp.content_type or ''
 
                     # Log non-2xx upstream responses, only for chat completion endpoints
+                    # 覆盖三种 LLM 对话协议：chat/completions、v1/messages、v1/responses
+                    # 0.9.2 漏了 v1/responses，导致 Responses API 的上游错误被沉默
                     if upstream_resp.status >= 400 and (
                         tail.rstrip('/').endswith('chat/completions')
                         or tail.rstrip('/').endswith('v1/messages')
+                        or tail.rstrip('/').endswith('v1/responses')
                     ):
                         logger.warning(
                             'LLM 上游返回 %d: %s %s',
@@ -2463,6 +2466,7 @@ class LlmMixin(AuditMixin):
                             and (
                                 tail.rstrip('/').endswith('chat/completions')
                                 or tail.rstrip('/').endswith('v1/messages')
+                                or tail.rstrip('/').endswith('v1/responses')
                             )
                         ):
                             logger.warning(
@@ -2497,6 +2501,33 @@ class LlmMixin(AuditMixin):
                             'utf-8',
                             errors='replace',
                         )
+                        # 空体转 502：上游 200 却返回空体时，原逻辑会透传 200 空 JSON
+                        # 导致 Hermes OpenAI SDK 执行 response.json() → JSONDecodeError
+                        # 重试 5 次仍 empty；改为 502 显式错误，便于观测与 failover
+                        # 仅对话接口转 502，非对话（如 /v1/models）空体按原样透传
+                        if not resp_text.strip() and tail.rstrip('/').endswith(
+                            ('chat/completions', 'v1/messages', 'v1/responses')
+                        ):
+                            logger.error(
+                                'LLM 上游空体转 502: %s %s status=%d '
+                                '(client would see JSONDecodeError)',
+                                request.method,
+                                target_url,
+                                upstream_resp.status,
+                            )
+                            return web.Response(
+                                body=json.dumps(
+                                    {
+                                        'error': {
+                                            'message': 'upstream empty response',
+                                            'type': 'empty_response',
+                                        }
+                                    },
+                                    ensure_ascii=False,
+                                ).encode('utf-8'),
+                                status=502,
+                                headers={'content-type': 'application/json'},
+                            )
                         # 非流式整包审计（design D4：不因缺 SSE 完成事件跳过）
                         blocked = False
                         if self.audit_enabled() and resp_text:

@@ -614,10 +614,14 @@ class AuditMixin:
             except (ValueError, TypeError):
                 pass
             # 审批人白名单（逗号分隔 Matrix user id）
+            # 兼容 compose 中常见的引号包裹：APPROVAL_WHITELIST="@a:example" 或 '"@a:example"'
+            # 需剥除外层引号，否则 '"@a:example"' 永远匹配不上真实的 '@a:example'
             wl = os.environ.get('APPROVAL_WHITELIST', '')
             if wl:
                 self.approval_whitelist = {
-                    u.strip() for u in wl.split(',') if u.strip()
+                    u.strip().strip('\'"').strip()
+                    for u in wl.split(',')
+                    if u.strip().strip('\'"').strip()
                 }
             # 防御性校验（Round 17 R6）：approve 模式必须配置白名单。
             # proxy.py 启动时已通过 parse_audit_env_config(require_whitelist=True)
@@ -1096,7 +1100,12 @@ def parse_audit_env_config(require_whitelist: bool = False) -> dict:
     whitelist: set[str] = set()
     wl = os.environ.get('APPROVAL_WHITELIST', '')
     if wl:
-        whitelist = {u.strip() for u in wl.split(',') if u.strip()}
+        # 剥除外层引号：兼容 compose 中 APPROVAL_WHITELIST="@a:example"
+        whitelist = {
+            u.strip().strip('\'"').strip()
+            for u in wl.split(',')
+            if u.strip().strip('\'"').strip()
+        }
     if require_whitelist and mode == 'approve' and not whitelist:
         errors.append(
             'AUDIT_MODE=approve 必须配置 APPROVAL_WHITELIST（审批人 Matrix user id）'
