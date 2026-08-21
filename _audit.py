@@ -623,6 +623,17 @@ class AuditMixin:
                     for u in wl.split(',')
                     if u.strip().strip('\'"').strip()
                 }
+                # MXID 格式校验：0.9.2/0.9.3 静默坑——"@a@b" 被当非空合法，无日志
+                _invalid = [u for u in self.approval_whitelist if not _is_valid_mxid(u)]
+                if _invalid:
+                    logger.error(
+                        'APPROVAL_WHITELIST 成员格式非法: %r'
+                        '（应为 @user:domain，如 @keivry:matrix.example）',
+                        _invalid,
+                    )
+                    self.approval_whitelist = {
+                        u for u in self.approval_whitelist if _is_valid_mxid(u)
+                    }
             # 防御性校验（Round 17 R6）：approve 模式必须配置白名单。
             # proxy.py 启动时已通过 parse_audit_env_config(require_whitelist=True)
             # 强制；此处双保险——任何入口（轻量入口/未来新入口）走到
@@ -1045,6 +1056,19 @@ def redact_summary(text: str, max_len: int = 120) -> str:
 AUDIT_TIMEOUT_RACE_MIN = 110
 AUDIT_TIMEOUT_RACE_MAX = 130
 
+# Matrix MXID 格式校验（失效静默是 0.9.2/0.9.3 的静默坑：非空但非法集合被视为合法）
+_MXID_RE = _re.compile(r'^@[^\s:]+:[^\s:]+$')
+
+
+def _is_valid_mxid(s: str) -> bool:
+    """校验 Matrix user id 格式 @localpart:domain（极简校验，防 `@a@b` 静默失效）。"""
+    if not s or ' ' in s or '\n' in s or '\t' in s:
+        return False
+    if not _MXID_RE.match(s):
+        return False
+    # 额外排斥局部含 @（如 `@__PII_22_30865349__` 把 : 写成 @）
+    return s[1:].count('@') == 0
+
 
 def parse_audit_env_config(require_whitelist: bool = False) -> dict:
     """解析并校验审计相关环境变量，返回配置字典 + 错误列表。
@@ -1106,6 +1130,13 @@ def parse_audit_env_config(require_whitelist: bool = False) -> dict:
             for u in wl.split(',')
             if u.strip().strip('\'"').strip()
         }
+        # MXID 格式校验：0.9.2/0.9.3 把 "@a@b" 这类非法值当成非空合法，导致无日志静默失效
+        invalid = [u for u in whitelist if not _is_valid_mxid(u)]
+        if invalid:
+            errors.append(
+                f'APPROVAL_WHITELIST 成员格式非法: {invalid!r}'
+                '（应为 @user:domain，如 @keivry:matrix.example）'
+            )
     if require_whitelist and mode == 'approve' and not whitelist:
         errors.append(
             'AUDIT_MODE=approve 必须配置 APPROVAL_WHITELIST（审批人 Matrix user id）'

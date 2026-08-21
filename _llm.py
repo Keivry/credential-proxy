@@ -621,14 +621,27 @@ class LlmMixin(AuditMixin):
             f'⚠️ 工具调用待审批: {name}\n参数摘要: {summary}\n'
             f'点 ✅ 批准 或 ❎ 拒绝（{timeout}s 超时默认拒绝）',
         )
+        logger.info(
+            '审计审批已发送: %s req_id=%s msg_id=%s timeout=%ds 摘要=%.80s',
+            name,
+            req_id,
+            str(msg_id)[:12] if msg_id else 'None',
+            timeout,
+            summary,
+        )
         if msg_id is None:
             # 发送失败 → 立即按 rejected 处置 + 清理 pending
+            logger.error('审计审批发送失败: %s req_id=%s → failed', name, req_id)
             self._audit_approval_pending.pop(req_id, None)
             return 'failed'
         self._audit_approval_msgs[msg_id] = req_id
+        logger.info('审计审批等待中: %s req_id=%s msg_id=%s', name, req_id, msg_id)
         try:
             await asyncio.wait_for(evt.wait(), timeout=timeout)
         except TimeoutError:
+            logger.warning(
+                '审计审批超时: %s req_id=%s %ds → expired', name, req_id, timeout
+            )
             self._audit_approval_pending.pop(req_id, None)
             self._audit_approval_msgs.pop(msg_id, None)
             return 'expired'
@@ -636,7 +649,9 @@ class LlmMixin(AuditMixin):
         ap = self._audit_approval_pending.pop(req_id, None)
         self._audit_approval_msgs.pop(msg_id, None)
         if ap and ap.get('approved') is True:
+            logger.info('审计审批结果: %s req_id=%s → approved', name, req_id)
             return 'approved'
+        logger.warning('审计审批结果: %s req_id=%s → rejected', name, req_id)
         return 'rejected'
 
     def _build_block_event(self) -> str:
@@ -2301,7 +2316,7 @@ class LlmMixin(AuditMixin):
                                 ):
                                     logger.debug('SSE 残余写入失败')
                             if sse_event_count == 0 and upstream_resp.status == 200:
-                                logger.warning(
+                                logger.error(
                                     'LLM 上游返回空流(0 data events, %d bytes): %s %s '
                                     '(client may see EmptyStreamError)',
                                     len(byte_buf),
@@ -2438,7 +2453,7 @@ class LlmMixin(AuditMixin):
                                 fast_sse_event_count == 0
                                 and upstream_resp.status == 200
                             ):
-                                logger.warning(
+                                logger.error(
                                     'LLM 上游返回空流(0 data events, %d bytes): %s %s '
                                     '(client may see EmptyStreamError)',
                                     len(byte_buf),
@@ -2469,7 +2484,7 @@ class LlmMixin(AuditMixin):
                                 or tail.rstrip('/').endswith('v1/responses')
                             )
                         ):
-                            logger.warning(
+                            logger.error(
                                 'LLM 上游返回空响应体(%d bytes): %s %s '
                                 '(client may see EmptyStreamError)',
                                 len(resp_body),
