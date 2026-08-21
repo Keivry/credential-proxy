@@ -1,6 +1,7 @@
 """LlmMixin — LLM API 反向代理：脱敏请求 → 上游 → 还原响应。"""
 
 import asyncio
+import contextlib
 import contextvars
 import json
 import logging
@@ -16,6 +17,7 @@ from _sse import SSE_CLIENT_GONE, filter_hop_headers
 from _token import (
     _PII_PARTIAL_TOKEN_RE,
     FULL_PII_TOKEN_RE,
+    PII_TOKEN_LOOSE_RE,
     PII_TOKEN_RE,
     PII_TOKEN_STR_RE,
     TOKEN_RE,
@@ -497,7 +499,10 @@ class LlmMixin(AuditMixin):
     @property
     def _audit_hold_buf(self):
         v = _audit_hold_buf_var.get()
-        return v if v is not None else []
+        if v is None:
+            v = []  # type: ignore[assignment]
+            _audit_hold_buf_var.set(v)  # type: ignore[arg-type]
+        return v
 
     @_audit_hold_buf.setter
     def _audit_hold_buf(self, value):
@@ -567,12 +572,32 @@ class LlmMixin(AuditMixin):
                 if tok in scope.resp_t2p:
                     try:
                         scope.resp_t2p.move_to_end(tok)
+                        # 同步提升 resp_p2t（通过 tok 查 plain）
+                        plain_resp = scope.resp_t2p.get(tok)
+                        if plain_resp is not None and plain_resp in scope.resp_p2t:
+                            scope.resp_p2t.move_to_end(plain_resp)
                     except (KeyError, RuntimeError):
                         pass
                     return tok  # 响应期 token 原样保留
+                # 未注册/格式不符：记审计（与 GlobalPiiTokens.restore 对齐）
+                with contextlib.suppress(Exception):
+                    scope._audit_malformed(tok)
                 return tok
 
             restored = PII_TOKEN_STR_RE.sub(_repl_pii, restored)
+            # 宽松形态二次审计（幻觉 token）：未命中 pii/resp 的 loose tok
+            if getattr(scope, '_audit_cb', None) is not None:
+                try:
+                    cur_pii = set(scope.pii_t2p)
+                    cur_resp = set(scope.resp_t2p)
+                except RuntimeError:
+                    cur_pii = set(list(scope.pii_t2p))  # noqa: C414
+                    cur_resp = set(list(scope.resp_t2p))  # noqa: C414
+                for m in PII_TOKEN_LOOSE_RE.finditer(restored):
+                    tok = m.group(0)
+                    if tok not in cur_pii and tok not in cur_resp:
+                        with contextlib.suppress(Exception):
+                            scope._audit_malformed(tok)
         return restored, restored_spans
 
     async def _pii_response_scan(
@@ -1440,10 +1465,11 @@ class LlmMixin(AuditMixin):
                 or str(_uuid.uuid4()).replace('-', '')[:16]
             )
             # 请求级 ContextVar 隔离（D2）：捕获 Token 以便 finally reset
+            # _pii_scope 全局持久化：set(get()) 仅捕获 Token 供 reset，值保持全局单例（D1）
             _cv_pii_scope_tok = _pii_scope_var.set(_pii_scope_var.get())
             _cv_audit_arg_accum_tok = _audit_arg_accum_var.set('')
             _cv_audit_hold_active_tok = _audit_hold_active_var.set(False)
-            _cv_audit_hold_buf_tok = _audit_hold_buf_var.set(None)
+            _cv_audit_hold_buf_tok = _audit_hold_buf_var.set([])  # type: ignore[arg-type]
             _cv_audit_hold_bytes_tok = _audit_hold_bytes_var.set(0)
             _cv_last_anthropic_tok = _last_anthropic_tool_name_var.set(None)
             _cv_last_responses_tok = _last_responses_tool_name_var.set(None)
@@ -2689,7 +2715,7 @@ class LlmMixin(AuditMixin):
                                     ensure_ascii=False,
                                 ).encode('utf-8'),
                                 status=502,
-                                headers={'content-type': 'application/json'},
+                                headers={'Content-Type': 'application/json'},
                             )
                         # 非流式整包审计（design D4：不因缺 SSE 完成事件跳过）
                         blocked = False
@@ -2800,7 +2826,7 @@ class LlmMixin(AuditMixin):
                                     ensure_ascii=False,
                                 ).encode('utf-8'),
                                 status=502,
-                                headers={'content-type': 'application/json'},
+                                headers={'Content-Type': 'application/json'},
                             )
                         return web.Response(
                             body=out_text.encode('utf-8'),
@@ -2851,38 +2877,22 @@ class LlmMixin(AuditMixin):
                                 pass
                         # 不全局 clear，仅由上面的 _created_ids 分支清理
                 # D2 reset：按 token 恢复，避免跨请求/子任务泄露
-                try:
+                with contextlib.suppress(LookupError, ValueError):
                     _pii_scope_var.reset(_cv_pii_scope_tok)
-                except Exception:
-                    pass
-                try:
+                with contextlib.suppress(LookupError, ValueError):
                     _audit_arg_accum_var.reset(_cv_audit_arg_accum_tok)
-                except Exception:
-                    pass
-                try:
+                with contextlib.suppress(LookupError, ValueError):
                     _audit_hold_active_var.reset(_cv_audit_hold_active_tok)
-                except Exception:
-                    pass
-                try:
+                with contextlib.suppress(LookupError, ValueError):
                     _audit_hold_buf_var.reset(_cv_audit_hold_buf_tok)
-                except Exception:
-                    pass
-                try:
+                with contextlib.suppress(LookupError, ValueError):
                     _audit_hold_bytes_var.reset(_cv_audit_hold_bytes_tok)
-                except Exception:
-                    pass
-                try:
+                with contextlib.suppress(LookupError, ValueError):
                     _last_anthropic_tool_name_var.reset(_cv_last_anthropic_tok)
-                except Exception:
-                    pass
-                try:
+                with contextlib.suppress(LookupError, ValueError):
                     _last_responses_tool_name_var.reset(_cv_last_responses_tok)
-                except Exception:
-                    pass
-                try:
+                with contextlib.suppress(LookupError, ValueError):
                     _audit_created_ids_var.reset(_cv_audit_created_ids_tok)
-                except Exception:
-                    pass
 
         app = web.Application()
         app.router.add_route('*', '/{tail:.*}', handler)

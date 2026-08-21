@@ -62,8 +62,8 @@ async def test_concurrency_pii_register_duplicate_reuse():
 @pytest.mark.asyncio
 async def test_concurrency_contextvar_audit_hold_isolation():
     """两请求并发进入 audit_hold，ContextVar 隔离互不覆盖。"""
-    from _llm import LlmMixin
     from _audit import AuditMixin
+    from _llm import LlmMixin
 
     class HoldProxy(PiiMixin, LlmMixin, AuditMixin):
         def __init__(self):
@@ -89,7 +89,7 @@ async def test_concurrency_contextvar_audit_hold_isolation():
 
     # 模拟两并发 handler 任务，各自设置 ContextVar
 
-    from _llm import _audit_hold_active_var, _audit_hold_buf_var, _audit_arg_accum_var
+    from _llm import _audit_arg_accum_var, _audit_hold_active_var, _audit_hold_buf_var
 
     async def task_a():
         # 模拟 handler A 进入 hold

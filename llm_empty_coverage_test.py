@@ -50,7 +50,7 @@ async def test_stream_bytes_written_zero_still_injects_even_if_event_count_posit
     assert should_inject, 'hold缓冲导致 bytes_written==0 应仍注入，即使 event_count>0'
     # 非 200 不注入
     for status in [401, 502]:
-        assert not (0 == 0 and status == 200)
+        assert status != 200
 
 
 @pytest.mark.asyncio
@@ -87,7 +87,7 @@ async def test_restore_move_to_end_on_read():
     # val0 最旧
     first_val = 'val0'
     first_tok = g.pii_p2t[first_val]
-    assert list(g.pii_p2t.keys())[0] == first_val
+    assert next(iter(g.pii_p2t.keys())) == first_val
     # restore 命中应提升
     g.restore(f'prefix {first_tok} suffix')
     assert list(g.pii_t2p.keys())[-1] == first_tok, 'restore 应将热 token 提至末尾'

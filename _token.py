@@ -105,7 +105,7 @@ class GlobalPiiTokens:
             table_t2p[token] = value
             # LRU 淘汰：仅对当前表（pii/resp 各限 1000，总量≤2000）
             while len(table_p2t) > PII_MAX_ENTRIES:
-                oldest_val, oldest_tok = table_p2t.popitem(last=False)
+                _oldest_val, oldest_tok = table_p2t.popitem(last=False)
                 table_t2p.pop(oldest_tok, None)
             return token
 
@@ -128,10 +128,10 @@ class GlobalPiiTokens:
         except RuntimeError:
             pii_t2p_snapshot = dict(list(self.pii_t2p.items()))
             resp_t2p_snapshot = dict(list(self.resp_t2p.items()))
-        if not pii_t2p_snapshot and self._audit_cb is not None:
-            for m in PII_TOKEN_LOOSE_RE.finditer(text):
-                tok = m.group(0)
-                if tok not in resp_t2p_snapshot:
+        if not pii_t2p_snapshot and not resp_t2p_snapshot:
+            if self._audit_cb is not None:
+                for m in PII_TOKEN_LOOSE_RE.finditer(text):
+                    tok = m.group(0)
                     self._audit_malformed(tok)
             return text
 
@@ -150,10 +150,14 @@ class GlobalPiiTokens:
                 return plain
             if tok in resp_t2p_snapshot:
                 # 响应期注册 token：形态匹配但原样保留（不还原为明文）
-                # 同样提升 LRU
+                # 同样提升 LRU — 双表同步（resp_p2t 以 resp_t2p 查 plain 再提升）
                 try:
                     if tok in self.resp_t2p:
                         self.resp_t2p.move_to_end(tok)
+                    # 同步提升 resp_p2t：通过快照查 plain
+                    plain_resp = resp_t2p_snapshot.get(tok)
+                    if plain_resp is not None and plain_resp in self.resp_p2t:
+                        self.resp_p2t.move_to_end(plain_resp)
                 except (KeyError, RuntimeError):
                     pass
                 return tok
@@ -166,11 +170,11 @@ class GlobalPiiTokens:
         if self._audit_cb is not None:
             # 用快照二次审计，避免并发期漏判
             try:
-                cur_pii = set(self.pii_t2p.keys())
-                cur_resp = set(self.resp_t2p.keys())
+                cur_pii = set(self.pii_t2p)
+                cur_resp = set(self.resp_t2p)
             except RuntimeError:
-                cur_pii = set(list(self.pii_t2p.keys()))
-                cur_resp = set(list(self.resp_t2p.keys()))
+                cur_pii = set(self.pii_t2p)
+                cur_resp = set(self.resp_t2p)
             for m in PII_TOKEN_LOOSE_RE.finditer(restored):
                 tok = m.group(0)
                 if tok not in cur_pii and tok not in cur_resp:
@@ -211,7 +215,7 @@ class GlobalPiiTokens:
         self._malformed_counts.clear()
 
 
-# 兼容别名：旧 RequestScopedTokens → 新 GlobalPiiTokens
+# 兼容别名：旧 RequestScopedTokens → 新 GlobalPiiTokens（已全局持久化，旧名保留仅供测试/外部兼容）
 RequestScopedTokens = GlobalPiiTokens
 
 

@@ -380,7 +380,7 @@ def test_pii_audit_cb_executor_offloads_io():
 @pytest.mark.asyncio
 async def test_global_lru_eviction_true_lru():
     """PII_MAX_ENTRIES=1000 真 LRU：超限淘汰最久未用，命中 move_to_end 提升。"""
-    from _token import GlobalPiiTokens, PII_MAX_ENTRIES
+    from _token import PII_MAX_ENTRIES, GlobalPiiTokens
 
     g = GlobalPiiTokens()
     # 填满 1000
@@ -409,8 +409,7 @@ async def test_global_lru_eviction_true_lru():
 @pytest.mark.asyncio
 async def test_global_lru_1000_distinct_from_credential_5000():
     """PII 1000 与凭据 5000 上限区分。"""
-    from _token import PII_MAX_ENTRIES
-    from _token import MAX_TOKEN_ENTRIES
+    from _token import MAX_TOKEN_ENTRIES, PII_MAX_ENTRIES
 
     assert PII_MAX_ENTRIES == 1000
     assert MAX_TOKEN_ENTRIES == 5000

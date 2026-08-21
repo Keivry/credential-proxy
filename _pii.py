@@ -12,14 +12,18 @@
 """
 
 import asyncio
+import contextlib
+import ipaddress as _ipaddress
 import logging
 import os
 import re as _re
-import ipaddress as _ipaddress
 import time as _time
 from concurrent.futures import ThreadPoolExecutor
 
-from _token import GlobalPiiTokens, RequestScopedTokens  # noqa: F401  RequestScopedTokens为兼容别名
+from _token import (  # noqa: F401  RequestScopedTokens为兼容别名
+    GlobalPiiTokens,
+    RequestScopedTokens,
+)
 
 logger = logging.getLogger('credential-proxy')
 
@@ -741,6 +745,9 @@ class PiiMixin:
         scope = getattr(self, '_global_pii_scope', None)
         if scope is not None:
             self._pii_detector.request_tokens = scope
+            # 每请求重置 malformed 限流计数（原设计同请求同类只记一次，持久化后需按请求清零）
+            with contextlib.suppress(Exception):
+                scope._malformed_counts.clear()
 
     async def pii_scan(self, text: str) -> list[tuple[str, str]]:
         """检测 PII（供 _llm.py 调用）。"""
