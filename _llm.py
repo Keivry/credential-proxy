@@ -1,6 +1,7 @@
 """LlmMixin — LLM API 反向代理：脱敏请求 → 上游 → 还原响应。"""
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -22,6 +23,20 @@ from _token import (
 )
 
 logger = logging.getLogger('credential-proxy')
+
+# ── Per-request ContextVars for concurrency isolation (D2) ──
+_pii_scope_var = contextvars.ContextVar('_pii_scope_var', default=None)
+_audit_arg_accum_var = contextvars.ContextVar('_audit_arg_accum_var', default='')
+_audit_hold_active_var = contextvars.ContextVar('_audit_hold_active_var', default=False)
+_audit_hold_buf_var = contextvars.ContextVar('_audit_hold_buf_var', default=None)
+_audit_hold_bytes_var = contextvars.ContextVar('_audit_hold_bytes_var', default=0)
+_last_anthropic_tool_name_var = contextvars.ContextVar(
+    '_last_anthropic_tool_name_var', default=None
+)
+_last_responses_tool_name_var = contextvars.ContextVar(
+    '_last_responses_tool_name_var', default=None
+)
+_audit_created_ids_var = contextvars.ContextVar('_audit_created_ids_var', default=None)
 
 
 def _strip_partials(text: str) -> str:
@@ -454,6 +469,64 @@ def re_sub_seps(value: str) -> str:
 class LlmMixin(AuditMixin):
     """Mixin: LLM 反向代理，脱敏/还原 + 输出审计。"""
 
+    # ── ContextVar-backed per-request state (D2) ──
+    @property
+    def _pii_scope(self):
+        return _pii_scope_var.get()
+
+    @_pii_scope.setter
+    def _pii_scope(self, value):
+        _pii_scope_var.set(value)
+
+    @property
+    def _audit_arg_accum(self):
+        return _audit_arg_accum_var.get()
+
+    @_audit_arg_accum.setter
+    def _audit_arg_accum(self, value):
+        _audit_arg_accum_var.set(value)
+
+    @property
+    def _audit_hold_active(self):
+        return _audit_hold_active_var.get()
+
+    @_audit_hold_active.setter
+    def _audit_hold_active(self, value):
+        _audit_hold_active_var.set(value)
+
+    @property
+    def _audit_hold_buf(self):
+        v = _audit_hold_buf_var.get()
+        return v if v is not None else []
+
+    @_audit_hold_buf.setter
+    def _audit_hold_buf(self, value):
+        _audit_hold_buf_var.set(value)
+
+    @property
+    def _audit_hold_bytes(self):
+        return _audit_hold_bytes_var.get()
+
+    @_audit_hold_bytes.setter
+    def _audit_hold_bytes(self, value):
+        _audit_hold_bytes_var.set(value)
+
+    @property
+    def _last_anthropic_tool_name(self):
+        return _last_anthropic_tool_name_var.get()
+
+    @_last_anthropic_tool_name.setter
+    def _last_anthropic_tool_name(self, value):
+        _last_anthropic_tool_name_var.set(value)
+
+    @property
+    def _last_responses_tool_name(self):
+        return _last_responses_tool_name_var.get()
+
+    @_last_responses_tool_name.setter
+    def _last_responses_tool_name(self, value):
+        _last_responses_tool_name_var.set(value)
+
     # ── PII 响应侧处理（还原 → 响应侧检测 → 转发）──
 
     def _pii_restore(
@@ -480,12 +553,22 @@ class LlmMixin(AuditMixin):
                 if tok in scope.pii_t2p:
                     start = m.start()
                     plain = scope.pii_t2p[tok]
+                    # 真 LRU：命中提升热值
+                    try:
+                        scope.pii_t2p.move_to_end(tok)
+                        scope.pii_p2t.move_to_end(plain)
+                    except (KeyError, RuntimeError):
+                        pass
                     # 记录还原产物区间（原 token 位置 → 明文）
                     restored_spans.append(
                         (start, start + len(plain), plain),
                     )
                     return plain
                 if tok in scope.resp_t2p:
+                    try:
+                        scope.resp_t2p.move_to_end(tok)
+                    except (KeyError, RuntimeError):
+                        pass
                     return tok  # 响应期 token 原样保留
                 return tok
 
@@ -540,17 +623,16 @@ class LlmMixin(AuditMixin):
             items.append((len(value), typ, value))
         items.sort(key=lambda x: x[0], reverse=True)
         for _, typ, value in items:
-            token = pii_scope.register(value, response_side=True)
+            token = await pii_scope.register(value, response_side=True)
             if token != value:
                 text = text.replace(value, token)
         return text
 
     def _pii_active(self) -> bool:
-        """当前请求是否有活跃 PII 作用域（PII 启用且已建 scope）。
-
-        无 PiiMixin 的宿主（测试桩）返回 False——PII 功能完全禁用。
-        """
-        return bool(getattr(self, '_pii_scope', None))
+        """当前请求是否有活跃 PII 作用域（PII 启用且已建 scope）。"""
+        return bool(getattr(self, 'pii_enabled', False)) and bool(
+            getattr(self, '_pii_scope', None)
+        )
 
     def _pii_scope_or_none(self):
         """返回当前请求 PII scope（无则 None）。"""
@@ -607,8 +689,18 @@ class LlmMixin(AuditMixin):
         if not hasattr(self, '_ask'):
             logger.error('审批模式需要 MatrixMixin（_ask 不可用）')
             return 'failed'
-        req_id = f'audit-{getattr(self, "_audit_pending_seq", 0)}'
-        self._audit_pending_seq = getattr(self, '_audit_pending_seq', 0) + 1
+        # seq 递增加锁（若存在 _lock 则用，否则直接递增，兼容测试桩）
+        _lock = getattr(self, '_lock', None)
+        if _lock is not None and hasattr(_lock, '__aenter__'):
+            async with _lock:
+                req_id = f'audit-{getattr(self, "_audit_pending_seq", 0)}'
+                self._audit_pending_seq = getattr(self, '_audit_pending_seq', 0) + 1
+        else:
+            req_id = f'audit-{getattr(self, "_audit_pending_seq", 0)}'
+            self._audit_pending_seq = getattr(self, '_audit_pending_seq', 0) + 1
+        _created = _audit_created_ids_var.get()
+        if isinstance(_created, list):
+            _created.append(req_id)
         evt = asyncio.Event()
         entry = {
             'name': name,
@@ -800,11 +892,7 @@ class LlmMixin(AuditMixin):
                 await write(
                     _mk_anthropic_flush_event(parsed, restored, field).encode('utf-8')
                 )
-            except (
-                ConnectionResetError,
-                ConnectionAbortedError,
-                BrokenPipeError,
-            ):
+            except SSE_CLIENT_GONE:
                 logger.debug('SSE 残余写入失败')
             return ''
         safe, pending = _split_safe_hold(restored, active_t2p, pii_scope)
@@ -815,11 +903,7 @@ class LlmMixin(AuditMixin):
                 await write(
                     _mk_anthropic_flush_event(parsed, safe, field).encode('utf-8')
                 )
-            except (
-                ConnectionResetError,
-                ConnectionAbortedError,
-                BrokenPipeError,
-            ):
+            except SSE_CLIENT_GONE:
                 logger.debug('SSE 残余写入失败')
         return pending
 
@@ -876,11 +960,7 @@ class LlmMixin(AuditMixin):
                         'utf-8'
                     )
                 )
-            except (
-                ConnectionResetError,
-                ConnectionAbortedError,
-                BrokenPipeError,
-            ):
+            except SSE_CLIENT_GONE:
                 logger.debug('SSE 挂起放行写入失败')
                 break
         if extra_line:
@@ -890,11 +970,7 @@ class LlmMixin(AuditMixin):
                         await self._pii_response_process(extra_line, active_t2p) + '\n'
                     ).encode('utf-8')
                 )
-            except (
-                ConnectionResetError,
-                ConnectionAbortedError,
-                BrokenPipeError,
-            ):
+            except SSE_CLIENT_GONE:
                 logger.debug('SSE 挂起终止写入失败')
 
     async def _reject_anthropic_hold(self, write, active_t2p: dict) -> None:
@@ -910,11 +986,7 @@ class LlmMixin(AuditMixin):
         self._last_anthropic_tool_name = None
         try:
             await write(self._build_block_event_anthropic().encode('utf-8'))
-        except (
-            ConnectionResetError,
-            ConnectionAbortedError,
-            BrokenPipeError,
-        ):
+        except SSE_CLIENT_GONE:
             logger.debug('SSE 挂起拒绝注入失败')
 
     async def _handle_anthropic_event(
@@ -1126,11 +1198,7 @@ class LlmMixin(AuditMixin):
                 await write(
                     _mk_responses_flush_event(event_type, restored).encode('utf-8')
                 )
-            except (
-                ConnectionResetError,
-                ConnectionAbortedError,
-                BrokenPipeError,
-            ):
+            except SSE_CLIENT_GONE:
                 logger.debug('SSE 残余写入失败')
             return ''
         safe, pending = _split_safe_hold(restored, active_t2p, pii_scope)
@@ -1139,11 +1207,7 @@ class LlmMixin(AuditMixin):
         if safe:
             try:
                 await write(_mk_responses_flush_event(event_type, safe).encode('utf-8'))
-            except (
-                ConnectionResetError,
-                ConnectionAbortedError,
-                BrokenPipeError,
-            ):
+            except SSE_CLIENT_GONE:
                 logger.debug('SSE 残余写入失败')
         return pending
 
@@ -1186,11 +1250,7 @@ class LlmMixin(AuditMixin):
         self._last_responses_tool_name = None
         try:
             await write(self._build_block_event_responses().encode('utf-8'))
-        except (
-            ConnectionResetError,
-            ConnectionAbortedError,
-            BrokenPipeError,
-        ):
+        except SSE_CLIENT_GONE:
             logger.debug('SSE 挂起拒绝注入失败')
 
     async def _handle_responses_event(
@@ -1379,13 +1439,15 @@ class LlmMixin(AuditMixin):
                 request.headers.get('x-request-id', '')
                 or str(_uuid.uuid4()).replace('-', '')[:16]
             )
-            # 请求级工具名追踪（Anthropic block_start → block_stop 审计用）
-            self._last_anthropic_tool_name = None
-            # 请求级工具名追踪（Responses function_call → item_done 审计用）
-            self._last_responses_tool_name = None
-            # 请求级审计参数累积器（design D3：审计读掩码前原始完整参数，
-            # 独立于流式 arg_buf——后者被 safe/hold 分割消费）
-            self._audit_arg_accum = ''
+            # 请求级 ContextVar 隔离（D2）：捕获 Token 以便 finally reset
+            _cv_pii_scope_tok = _pii_scope_var.set(_pii_scope_var.get())
+            _cv_audit_arg_accum_tok = _audit_arg_accum_var.set('')
+            _cv_audit_hold_active_tok = _audit_hold_active_var.set(False)
+            _cv_audit_hold_buf_tok = _audit_hold_buf_var.set(None)
+            _cv_audit_hold_bytes_tok = _audit_hold_bytes_var.set(0)
+            _cv_last_anthropic_tok = _last_anthropic_tool_name_var.set(None)
+            _cv_last_responses_tok = _last_responses_tool_name_var.set(None)
+            _cv_audit_created_ids_tok = _audit_created_ids_var.set([])
             tail = request.match_info['tail']
             target_url = f'{upstream.rstrip("/")}/{tail}'
             if request.query_string:
@@ -1518,6 +1580,15 @@ class LlmMixin(AuditMixin):
                             byte_buf = bytearray()
                             resp_log_path = None
                             sse_event_count = 0  # 空流检测：统计 data 事件数
+                            bytes_written = (
+                                0  # D3：实际写入字节数守门（仅成功 write 计数）
+                            )
+
+                            async def _tracked_write(data: bytes):
+                                nonlocal bytes_written
+                                await resp.write(data)
+                                bytes_written += len(data)
+
                             # OpenAI chat/completions tool_calls 分片累积：
                             # index → {'name': str, 'arguments': str}
                             tool_calls_buf: dict[int, dict[str, str]] = {}
@@ -1549,7 +1620,7 @@ class LlmMixin(AuditMixin):
                                             rc, active_t2p
                                         )
                                         rc = _strip_partials(rc)
-                                    await resp.write(
+                                    await _tracked_write(
                                         _mk_sse_event(
                                             content=c,
                                             finish_reason=fr,
@@ -1580,7 +1651,7 @@ class LlmMixin(AuditMixin):
 
                                         # 非 data 行：还原后透传（防 token 泄漏）
                                         if not line.startswith('data:'):
-                                            await resp.write(
+                                            await _tracked_write(
                                                 (
                                                     await self._pii_response_process(
                                                         line, active_t2p
@@ -1614,13 +1685,13 @@ class LlmMixin(AuditMixin):
                                                     tool_calls_blocked = True
                                                     tool_calls_pending_events.clear()
                                                     for ev in injections:
-                                                        await resp.write(
+                                                        await _tracked_write(
                                                             ev.encode('utf-8')
                                                         )
                                                 else:
                                                     # allow：verdict 后统一放行缓冲事件
                                                     for ev in tool_calls_pending_events:
-                                                        await resp.write(
+                                                        await _tracked_write(
                                                             (
                                                                 await self._pii_response_process(
                                                                     ev, active_t2p
@@ -1634,7 +1705,7 @@ class LlmMixin(AuditMixin):
                                                 # 用 responses 格式 flush，避免 chat 格式污染
                                                 content_buf = (
                                                     await self._flush_responses_buf(
-                                                        resp.write,
+                                                        _tracked_write,
                                                         'response.output_text.delta',
                                                         content_buf,
                                                         active_t2p,
@@ -1642,14 +1713,14 @@ class LlmMixin(AuditMixin):
                                                 )
                                                 reasoning_buf = (
                                                     await self._flush_responses_buf(
-                                                        resp.write,
+                                                        _tracked_write,
                                                         'response.reasoning_text.delta',
                                                         reasoning_buf,
                                                         active_t2p,
                                                     )
                                                 )
                                                 arg_buf = await self._flush_responses_buf(
-                                                    resp.write,
+                                                    _tracked_write,
                                                     'response.function_call_arguments.delta',
                                                     arg_buf,
                                                     active_t2p,
@@ -1663,7 +1734,7 @@ class LlmMixin(AuditMixin):
                                                 }
                                                 content_buf = (
                                                     await self._flush_anthropic_buf(
-                                                        resp.write,
+                                                        _tracked_write,
                                                         _dummy,
                                                         'text',
                                                         content_buf,
@@ -1672,7 +1743,7 @@ class LlmMixin(AuditMixin):
                                                 )
                                                 reasoning_buf = (
                                                     await self._flush_anthropic_buf(
-                                                        resp.write,
+                                                        _tracked_write,
                                                         _dummy,
                                                         'thinking',
                                                         reasoning_buf,
@@ -1681,7 +1752,7 @@ class LlmMixin(AuditMixin):
                                                 )
                                                 arg_buf = (
                                                     await self._flush_anthropic_buf(
-                                                        resp.write,
+                                                        _tracked_write,
                                                         _dummy,
                                                         'partial_json',
                                                         arg_buf,
@@ -1693,7 +1764,7 @@ class LlmMixin(AuditMixin):
                                                     c=content_buf,
                                                     rc=reasoning_buf,
                                                 )
-                                            await resp.write(
+                                            await _tracked_write(
                                                 b'data: [DONE]\n',
                                             )
                                             continue
@@ -1704,7 +1775,7 @@ class LlmMixin(AuditMixin):
                                             # 非 dict payload（JSON 数组/标量）→
                                             # 原样透传，避免下游 .get 抛 AttributeError
                                             if not isinstance(parsed, dict):
-                                                await resp.write(
+                                                await _tracked_write(
                                                     (
                                                         await self._pii_response_process(
                                                             line, active_t2p
@@ -1750,7 +1821,7 @@ class LlmMixin(AuditMixin):
                                                     reasoning_buf,
                                                     arg_buf,
                                                 ) = await self._handle_responses_event(
-                                                    resp.write,
+                                                    _tracked_write,
                                                     parsed,
                                                     line,
                                                     active_t2p,
@@ -1768,7 +1839,7 @@ class LlmMixin(AuditMixin):
                                                     reasoning_buf,
                                                     arg_buf,
                                                 ) = await self._handle_anthropic_event(
-                                                    resp.write,
+                                                    _tracked_write,
                                                     parsed,
                                                     line,
                                                     active_t2p,
@@ -1818,14 +1889,14 @@ class LlmMixin(AuditMixin):
                                                     tool_calls_blocked = True
                                                     tool_calls_pending_events.clear()
                                                     for ev in injections:
-                                                        await resp.write(
+                                                        await _tracked_write(
                                                             ev.encode('utf-8')
                                                         )
                                                     audit_block_injected = True
                                                 else:
                                                     # allow：verdict 后统一放行缓冲事件
                                                     for ev in tool_calls_pending_events:
-                                                        await resp.write(
+                                                        await _tracked_write(
                                                             (
                                                                 await self._pii_response_process(
                                                                     ev, active_t2p
@@ -1860,7 +1931,7 @@ class LlmMixin(AuditMixin):
                                                     self._pii_scope_or_none(),
                                                 )
                                                 if safe:
-                                                    await resp.write(
+                                                    await _tracked_write(
                                                         _mk_sse_event(
                                                             reasoning_content=safe,
                                                         ).encode(),
@@ -1875,7 +1946,7 @@ class LlmMixin(AuditMixin):
                                                     reasoning_buf = _strip_partials(
                                                         reasoning_buf
                                                     )
-                                                    await resp.write(
+                                                    await _tracked_write(
                                                         _mk_sse_event(
                                                             reasoning_content=reasoning_buf,
                                                             finish_reason=finish_reason,
@@ -1902,7 +1973,7 @@ class LlmMixin(AuditMixin):
 
                                                 # flush 安全部分
                                                 if safe:
-                                                    await resp.write(
+                                                    await _tracked_write(
                                                         _mk_sse_event(safe).encode(),
                                                     )
                                                 content_buf = pending
@@ -1914,7 +1985,7 @@ class LlmMixin(AuditMixin):
                                                     content_buf = _strip_partials(
                                                         content_buf
                                                     )
-                                                    await resp.write(
+                                                    await _tracked_write(
                                                         _mk_sse_event(
                                                             content_buf,
                                                             finish_reason,
@@ -1935,7 +2006,7 @@ class LlmMixin(AuditMixin):
                                                     and 'content' not in delta
                                                 ):
                                                     continue
-                                                await resp.write(
+                                                await _tracked_write(
                                                     (
                                                         await self._pii_response_process(
                                                             line, active_t2p
@@ -1990,7 +2061,7 @@ class LlmMixin(AuditMixin):
                                                 # 非 dict payload（数组/标量）→ 原样透传
                                                 # （与主循环 isinstance 防御对称）
                                                 if not isinstance(parsed, dict):
-                                                    await resp.write(
+                                                    await _tracked_write(
                                                         (
                                                             await self._pii_response_process(
                                                                 'data: ' + sanitized,
@@ -2008,7 +2079,7 @@ class LlmMixin(AuditMixin):
                                                         reasoning_buf,
                                                         arg_buf,
                                                     ) = await self._handle_responses_event(
-                                                        resp.write,
+                                                        _tracked_write,
                                                         parsed,
                                                         'data: ' + sanitized,
                                                         active_t2p,
@@ -2025,7 +2096,7 @@ class LlmMixin(AuditMixin):
                                                         reasoning_buf,
                                                         arg_buf,
                                                     ) = await self._handle_anthropic_event(
-                                                        resp.write,
+                                                        _tracked_write,
                                                         parsed,
                                                         'data: ' + sanitized,
                                                         active_t2p,
@@ -2056,7 +2127,7 @@ class LlmMixin(AuditMixin):
                                                     rc_restored = _strip_partials(
                                                         rc_restored
                                                     )
-                                                    await resp.write(
+                                                    await _tracked_write(
                                                         _mk_sse_event(
                                                             reasoning_content=rc_restored,
                                                             finish_reason=(
@@ -2075,7 +2146,7 @@ class LlmMixin(AuditMixin):
                                                         combined, active_t2p
                                                     )
                                                     restored = _strip_partials(restored)
-                                                    await resp.write(
+                                                    await _tracked_write(
                                                         _mk_sse_event(
                                                             content=restored,
                                                             finish_reason=finish_reason,
@@ -2087,7 +2158,7 @@ class LlmMixin(AuditMixin):
                                                         c=content_buf,
                                                         rc=reasoning_buf,
                                                     )
-                                                    await resp.write(
+                                                    await _tracked_write(
                                                         (
                                                             'data: '
                                                             + await self._pii_response_process(
@@ -2103,7 +2174,7 @@ class LlmMixin(AuditMixin):
                                                     '续行重建失败，转发原始行: %s...',
                                                     payload[:80],
                                                 )
-                                                await resp.write(
+                                                await _tracked_write(
                                                     (
                                                         await self._pii_response_process(
                                                             line, active_t2p
@@ -2116,7 +2187,7 @@ class LlmMixin(AuditMixin):
                                                 'SSE 数据结构异常: %s...',
                                                 payload[:80],
                                             )
-                                            await resp.write(
+                                            await _tracked_write(
                                                 (
                                                     await self._pii_response_process(
                                                         line, active_t2p
@@ -2166,7 +2237,7 @@ class LlmMixin(AuditMixin):
                                     _eof_injected_ok = False
                                     for _ev in _inj:
                                         try:
-                                            await resp.write(_ev.encode('utf-8'))
+                                            await _tracked_write(_ev.encode('utf-8'))
                                             _eof_injected_ok = True
                                         except SSE_CLIENT_GONE:
                                             break
@@ -2175,7 +2246,7 @@ class LlmMixin(AuditMixin):
                                 else:
                                     for _ev in tool_calls_pending_events:
                                         try:
-                                            await resp.write(
+                                            await _tracked_write(
                                                 (
                                                     await self._pii_response_process(
                                                         _ev, active_t2p
@@ -2216,7 +2287,7 @@ class LlmMixin(AuditMixin):
                                     else:
                                         _block = self._build_block_event_responses()
                                     try:
-                                        await resp.write(_block.encode('utf-8'))
+                                        await _tracked_write(_block.encode('utf-8'))
                                         audit_block_injected = True
                                     except SSE_CLIENT_GONE:
                                         pass
@@ -2228,21 +2299,21 @@ class LlmMixin(AuditMixin):
                             if is_responses_stream:
                                 # ── Responses 流：残留按对应 delta 事件类型输出 ──
                                 await self._flush_responses_buf(
-                                    resp.write,
+                                    _tracked_write,
                                     'response.output_text.delta',
                                     content_buf,
                                     active_t2p,
                                     keep_pending=False,
                                 )
                                 await self._flush_responses_buf(
-                                    resp.write,
+                                    _tracked_write,
                                     'response.reasoning_text.delta',
                                     reasoning_buf,
                                     active_t2p,
                                     keep_pending=False,
                                 )
                                 await self._flush_responses_buf(
-                                    resp.write,
+                                    _tracked_write,
                                     'response.function_call_arguments.delta',
                                     arg_buf,
                                     active_t2p,
@@ -2252,7 +2323,7 @@ class LlmMixin(AuditMixin):
                                 # ── Anthropic 流：残留按对应 delta 类型输出 ──
                                 _dummy = {'type': 'content_block_delta', 'index': 0}
                                 await self._flush_anthropic_buf(
-                                    resp.write,
+                                    _tracked_write,
                                     _dummy,
                                     'text',
                                     content_buf,
@@ -2260,7 +2331,7 @@ class LlmMixin(AuditMixin):
                                     keep_pending=False,
                                 )
                                 await self._flush_anthropic_buf(
-                                    resp.write,
+                                    _tracked_write,
                                     _dummy,
                                     'thinking',
                                     reasoning_buf,
@@ -2268,7 +2339,7 @@ class LlmMixin(AuditMixin):
                                     keep_pending=False,
                                 )
                                 await self._flush_anthropic_buf(
-                                    resp.write,
+                                    _tracked_write,
                                     _dummy,
                                     'partial_json',
                                     arg_buf,
@@ -2288,17 +2359,13 @@ class LlmMixin(AuditMixin):
                                     reasoning_buf = _strip_partials(reasoning_buf)
                                 if content_buf or reasoning_buf:
                                     try:
-                                        await resp.write(
+                                        await _tracked_write(
                                             _mk_sse_event(
                                                 content=content_buf,
                                                 reasoning_content=reasoning_buf,
                                             ).encode(),
                                         )
-                                    except (
-                                        ConnectionResetError,
-                                        ConnectionAbortedError,
-                                        BrokenPipeError,
-                                    ):
+                                    except SSE_CLIENT_GONE:
                                         logger.debug('SSE 残余写入失败')
                             if byte_buf:
                                 try:
@@ -2313,16 +2380,34 @@ class LlmMixin(AuditMixin):
                                     # 含分片切断的 token 前缀（__VG_C…/__PII_…），
                                     # _pii_response_process 不清理，这里统一剥除防泄漏。
                                     restored = _strip_partials(restored)
-                                    await resp.write(
+                                    await _tracked_write(
                                         restored.encode('utf-8'),
                                     )
-                                except (
-                                    ConnectionResetError,
-                                    ConnectionAbortedError,
-                                    BrokenPipeError,
-                                ):
+                                except SSE_CLIENT_GONE:
                                     logger.debug('SSE 残余写入失败')
-                            if sse_event_count == 0 and upstream_resp.status == 200:
+                            # D3: 流末 hold 悬挂兜底：若 audit_hold 仍 active，强制拒绝再走守门
+                            if getattr(self, '_audit_hold_active', False):
+                                try:
+                                    if is_anthropic_stream:
+                                        await self._reject_anthropic_hold(
+                                            _tracked_write, active_t2p
+                                        )
+                                    elif is_responses_stream:
+                                        await self._reject_responses_hold(
+                                            _tracked_write, active_t2p
+                                        )
+                                    else:
+                                        # chat 场景：悬挂 hold 视为审计拦截，补发拒绝消息
+                                        if tool_calls_pending_events:
+                                            tool_calls_pending_events.clear()
+                                            tool_calls_blocked = True
+                                        if not audit_block_injected:
+                                            _fb = self._build_block_event()
+                                            await _tracked_write(_fb.encode('utf-8'))
+                                            audit_block_injected = True
+                                except Exception:
+                                    logger.exception('流末 hold 兜底拒绝失败')
+                            if bytes_written == 0 and upstream_resp.status == 200:
                                 if audit_block_injected or tool_calls_blocked:
                                     # 审计拦截：上游 0 events 属预期，不计为空流错误；若前序注入失败则补发
                                     if not audit_block_injected:
@@ -2337,13 +2422,9 @@ class LlmMixin(AuditMixin):
                                                 )
                                             else:
                                                 _fb = self._build_block_event()
-                                            await resp.write(_fb.encode('utf-8'))
+                                            await _tracked_write(_fb.encode('utf-8'))
                                             audit_block_injected = True
-                                        except (
-                                            ConnectionResetError,
-                                            ConnectionAbortedError,
-                                            BrokenPipeError,
-                                        ):
+                                        except SSE_CLIENT_GONE:
                                             logger.debug(
                                                 '审计拦截补发写入失败，客户端已断连'
                                             )
@@ -2362,18 +2443,14 @@ class LlmMixin(AuditMixin):
                                             _fb = self._build_block_event_anthropic()
                                         else:
                                             _fb = self._build_block_event()
-                                        await resp.write(_fb.encode('utf-8'))
+                                        await _tracked_write(_fb.encode('utf-8'))
                                         logger.error(
                                             'LLM 上游返回空流(0 data events, %d bytes)已兜底注入拒绝消息: %s %s',
                                             len(byte_buf),
                                             request.method,
                                             target_url,
                                         )
-                                    except (
-                                        ConnectionResetError,
-                                        ConnectionAbortedError,
-                                        BrokenPipeError,
-                                    ):
+                                    except SSE_CLIENT_GONE:
                                         logger.error(
                                             'LLM 上游返回空流(0 data events, %d bytes): %s %s '
                                             '(client may see EmptyStreamError)',
@@ -2383,11 +2460,7 @@ class LlmMixin(AuditMixin):
                                         )
                             try:
                                 await resp.write_eof()
-                            except (
-                                ConnectionResetError,
-                                ConnectionAbortedError,
-                                BrokenPipeError,
-                            ):
+                            except SSE_CLIENT_GONE:
                                 logger.debug(
                                     'SSE write_eof 失败，客户端已断连',
                                 )
@@ -2396,6 +2469,13 @@ class LlmMixin(AuditMixin):
                             byte_buf = bytearray()
                             resp_log_path = None
                             fast_sse_event_count = 0
+                            fast_bytes_written = 0  # D3 fast路径同样按字节守门
+
+                            async def _tracked_write(data: bytes):
+                                nonlocal fast_bytes_written
+                                await resp.write(data)
+                                fast_bytes_written += len(data)
+
                             try:
                                 async for chunk in upstream_resp.content.iter_chunked(
                                     SSE_CHUNK_SIZE,
@@ -2460,11 +2540,11 @@ class LlmMixin(AuditMixin):
                                                     payload, active_t2p
                                                 )
                                             )
-                                            await resp.write(
+                                            await _tracked_write(
                                                 (restored + '\n').encode('utf-8'),
                                             )
                                         else:
-                                            await resp.write(
+                                            await _tracked_write(
                                                 (line + '\n').encode('utf-8'),
                                             )
                                     # Trim processed portion
@@ -2498,19 +2578,12 @@ class LlmMixin(AuditMixin):
                                     # 含分片切断的 token 前缀（__VG_C…/__PII_…），
                                     # _pii_response_process 不清理，这里统一剥除防泄漏。
                                     restored = _strip_partials(restored)
-                                    await resp.write(
+                                    await _tracked_write(
                                         restored.encode('utf-8'),
                                     )
-                                except (
-                                    ConnectionResetError,
-                                    ConnectionAbortedError,
-                                    BrokenPipeError,
-                                ):
+                                except SSE_CLIENT_GONE:
                                     logger.debug('SSE 残余写入失败')
-                            if (
-                                fast_sse_event_count == 0
-                                and upstream_resp.status == 200
-                            ):
+                            if fast_bytes_written == 0 and upstream_resp.status == 200:
                                 # fast path 无审计：上游真空流，注入最小拒绝消息避免空体
                                 try:
                                     _tail_norm = tail.rstrip('/')
@@ -2520,18 +2593,14 @@ class LlmMixin(AuditMixin):
                                         _fb = self._build_block_event_anthropic()
                                     else:
                                         _fb = self._build_block_event()
-                                    await resp.write(_fb.encode('utf-8'))
+                                    await _tracked_write(_fb.encode('utf-8'))
                                     logger.error(
                                         'LLM 上游返回空流(0 data events, %d bytes)已兜底注入拒绝消息: %s %s',
                                         len(byte_buf),
                                         request.method,
                                         target_url,
                                     )
-                                except (
-                                    ConnectionResetError,
-                                    ConnectionAbortedError,
-                                    BrokenPipeError,
-                                ):
+                                except SSE_CLIENT_GONE:
                                     logger.error(
                                         'LLM 上游返回空流(0 data events, %d bytes): %s %s '
                                         '(client may see EmptyStreamError)',
@@ -2541,11 +2610,7 @@ class LlmMixin(AuditMixin):
                                     )
                             try:
                                 await resp.write_eof()
-                            except (
-                                ConnectionResetError,
-                                ConnectionAbortedError,
-                                BrokenPipeError,
-                            ):
+                            except SSE_CLIENT_GONE:
                                 logger.debug(
                                     'SSE write_eof 失败，客户端已断连',
                                 )
@@ -2599,8 +2664,12 @@ class LlmMixin(AuditMixin):
                         # 导致 Hermes OpenAI SDK 执行 response.json() → JSONDecodeError
                         # 重试 5 次仍 empty；改为 502 显式错误，便于观测与 failover
                         # 仅对话接口转 502，非对话（如 /v1/models）空体按原样透传
-                        if not resp_text.strip() and tail.rstrip('/').endswith(
-                            ('chat/completions', 'v1/messages', 'v1/responses')
+                        if (
+                            not resp_text.strip()
+                            and upstream_resp.status == 200
+                            and tail.rstrip('/').endswith(
+                                ('chat/completions', 'v1/messages', 'v1/responses')
+                            )
                         ):
                             logger.error(
                                 'LLM 上游空体转 502: %s %s status=%d '
@@ -2711,6 +2780,28 @@ class LlmMixin(AuditMixin):
                         #  审查补充：与流式 _split_safe_hold 语义对齐，
                         #  用 _strip_token_forms 一并剥离完整幻觉 token）
                         out_text = _strip_token_forms(out_text)
+                        if (
+                            not out_text.strip()
+                            and upstream_resp.status == 200
+                            and tail.rstrip('/').endswith(
+                                ('chat/completions', 'v1/messages', 'v1/responses')
+                            )
+                        ):
+                            logger.error(
+                                '非流式剥离后空体转 502: %s %s status=%d out_len=%d',
+                                request.method,
+                                target_url,
+                                upstream_resp.status,
+                                len(out_text),
+                            )
+                            return web.Response(
+                                body=json.dumps(
+                                    {'error': {'message': 'empty after strip'}},
+                                    ensure_ascii=False,
+                                ).encode('utf-8'),
+                                status=502,
+                                headers={'content-type': 'application/json'},
+                            )
                         return web.Response(
                             body=out_text.encode('utf-8'),
                             status=upstream_resp.status,
@@ -2734,18 +2825,64 @@ class LlmMixin(AuditMixin):
                 # 请求级审计状态清理（design D4 6.4：审批/挂起与流生命周期绑定）
                 # 未决审批 → 取消（置 rejected 语义）；挂起缓冲 → 丢弃
                 if getattr(self, 'audit_enabled_flag', False):
-                    for _req_id, _ap in list(
-                        getattr(self, '_audit_approval_pending', {}).items()
-                    ):
-                        if _ap.get('approved') is None:
-                            _ap['approved'] = False
-                            _ap['event'].set()
-                    self._audit_approval_pending.clear()
-                    self._audit_approval_msgs.clear()
-                    self._audit_hold_active = False
-                    self._audit_hold_buf = []
-                    self._audit_hold_bytes = 0
-                    self._audit_arg_accum = ''
+                    _created_ids = _audit_created_ids_var.get()
+                    if isinstance(_created_ids, list) and _created_ids:
+                        for _req_id in list(_created_ids):
+                            _ap = self._audit_approval_pending.get(_req_id)
+                            if _ap is not None and _ap.get('approved') is None:
+                                _ap['approved'] = False
+                                _ap['event'].set()
+                            self._audit_approval_pending.pop(_req_id, None)
+                        # 清理对应的 msg_id 映射
+                        for _msg_id, _rid in list(self._audit_approval_msgs.items()):
+                            if _rid in _created_ids:
+                                self._audit_approval_msgs.pop(_msg_id, None)
+                    else:
+                        # 兜底：无跟踪列表时仅处理仍为 pending 的条目，避免误删活请求
+                        for _req_id, _ap in list(
+                            getattr(self, '_audit_approval_pending', {}).items()
+                        ):
+                            if (
+                                _ap.get('approved') is None
+                                and _ap.get('event') is not None
+                            ):
+                                # 仅当该 pending 的 event 已在当前 handler 创建的上下文才处理
+                                # 保守策略：不全局 clear，逐条判断
+                                pass
+                        # 不全局 clear，仅由上面的 _created_ids 分支清理
+                # D2 reset：按 token 恢复，避免跨请求/子任务泄露
+                try:
+                    _pii_scope_var.reset(_cv_pii_scope_tok)
+                except Exception:
+                    pass
+                try:
+                    _audit_arg_accum_var.reset(_cv_audit_arg_accum_tok)
+                except Exception:
+                    pass
+                try:
+                    _audit_hold_active_var.reset(_cv_audit_hold_active_tok)
+                except Exception:
+                    pass
+                try:
+                    _audit_hold_buf_var.reset(_cv_audit_hold_buf_tok)
+                except Exception:
+                    pass
+                try:
+                    _audit_hold_bytes_var.reset(_cv_audit_hold_bytes_tok)
+                except Exception:
+                    pass
+                try:
+                    _last_anthropic_tool_name_var.reset(_cv_last_anthropic_tok)
+                except Exception:
+                    pass
+                try:
+                    _last_responses_tool_name_var.reset(_cv_last_responses_tok)
+                except Exception:
+                    pass
+                try:
+                    _audit_created_ids_var.reset(_cv_audit_created_ids_tok)
+                except Exception:
+                    pass
 
         app = web.Application()
         app.router.add_route('*', '/{tail:.*}', handler)

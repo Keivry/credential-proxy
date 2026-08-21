@@ -3,14 +3,17 @@
 每个密码映射为一个 __VG_CRED_NNNNNN__ token。
 使用 re.sub 单次替换，按长度降序防子串碰撞。
 
-PII 请求级映射（RequestScopedTokens）与本文件同处：请求级 PII token
+PII 全局持久映射（GlobalPiiTokens）与本文件同处：进程级全局 LRU PII token
 （__PII_<seq>_<rand8>__）与全局凭据映射完全隔离，不进入 pwd_to_token。
+RequestScopedTokens 保留为兼容别名（指向 GlobalPiiTokens）。
 
 """
 
+import asyncio
 import logging
 import re as _re
 import secrets
+from collections import OrderedDict
 
 logger = logging.getLogger('credential-proxy')
 
@@ -36,16 +39,22 @@ FULL_PII_TOKEN_RE = _re.compile(r'__PII_\d+_[0-9a-f]{8}__$')
 _PII_PARTIAL_TOKEN_RE = _re.compile(r'__PI(?:I(?:_(?:\d+_)?[0-9a-fA-F]*)?)?_*$')
 
 
+PII_MAX_ENTRIES = (
+    1000  # 单表上限（pii/resp 各 1000，总量≤2000，真 LRU），与凭据 5000 区分
+)
+
+
 def _make_pii_token(seq: int, rand8: str) -> str:
     """构造 __PII_<seq>_<rand8>__ token。"""
     return f'{PII_TOKEN_PREFIX}{seq}_{rand8}__'
 
 
-class RequestScopedTokens:
-    """请求级 PII token 映射容器（与全局凭据映射完全隔离）。
+class GlobalPiiTokens:
+    """进程级全局持久 PII token 映射容器（与全局凭据映射完全隔离）。
 
-    - 独立 pii_p2t / pii_t2p（请求期注册，可还原）
-    - 响应期新注册值存 resp_p2t / resp_t2p：形态匹配但不还原（design D2）
+    - 进程单例，常驻 `pii_p2t/pii_t2p/resp_*`，命中复用同一 token
+    - 真 LRU：`OrderedDict` + `move_to_end` + 超限 `popitem(last=False)`
+    - `register` 为 `async def`，`asyncio.Lock` 保护并发注册
     - token 格式 __PII_<seq>_<rand8>__，rand8 用 CSPRNG（secrets.token_hex(4)）
     - 同值去重复用 token
     - restore 仅还原请求期注册 token；格式不符/未注册 token 原样保留并
@@ -54,15 +63,20 @@ class RequestScopedTokens:
     """
 
     def __init__(self, audit_cb=None):
-        self.pii_p2t: dict[str, str] = {}  # 明文 -> token（请求期）
-        self.pii_t2p: dict[str, str] = {}  # token -> 明文（请求期，可还原）
-        self.resp_p2t: dict[str, str] = {}  # 明文 -> token（响应期）
-        self.resp_t2p: dict[str, str] = {}  # token -> 明文（响应期，不可还原）
+        self.pii_p2t: OrderedDict[str, str] = OrderedDict()  # 明文 -> token（请求期）
+        self.pii_t2p: OrderedDict[str, str] = (
+            OrderedDict()
+        )  # token -> 明文（请求期，可还原）
+        self.resp_p2t: OrderedDict[str, str] = OrderedDict()  # 明文 -> token（响应期）
+        self.resp_t2p: OrderedDict[str, str] = (
+            OrderedDict()
+        )  # token -> 明文（响应期，不可还原）
         self._seq = 0
         self._audit_cb = audit_cb
         self._malformed_counts: dict[str, int] = {}
+        self._lock = asyncio.Lock()
 
-    def register(self, value: str, response_side: bool = False) -> str:
+    async def register(self, value: str, response_side: bool = False) -> str:
         """注册 PII 值，返回 token。同值去重复用。响应期值注册到 resp 映射。"""
         if not value:
             return value
@@ -75,38 +89,73 @@ class RequestScopedTokens:
             or TOKEN_PREFIX in value
         ):
             raise ValueError('PII 值不能匹配内部 token 格式或以 token 前缀开头')
-        table_p2t = self.resp_p2t if response_side else self.pii_p2t
-        table_t2p = self.resp_t2p if response_side else self.pii_t2p
-        if value in table_p2t:
-            return table_p2t[value]
-        self._seq += 1
-        token = _make_pii_token(self._seq, secrets.token_hex(4))
-        table_p2t[value] = token
-        table_t2p[token] = value
-        return token
+        async with self._lock:
+            table_p2t = self.resp_p2t if response_side else self.pii_p2t
+            table_t2p = self.resp_t2p if response_side else self.pii_t2p
+            if value in table_p2t:
+                table_p2t.move_to_end(value)
+                tok = table_p2t[value]
+                # 同步 move 对侧
+                if tok in table_t2p:
+                    table_t2p.move_to_end(tok)
+                return tok
+            self._seq += 1
+            token = _make_pii_token(self._seq, secrets.token_hex(4))
+            table_p2t[value] = token
+            table_t2p[token] = value
+            # LRU 淘汰：仅对当前表（pii/resp 各限 1000，总量≤2000）
+            while len(table_p2t) > PII_MAX_ENTRIES:
+                oldest_val, oldest_tok = table_p2t.popitem(last=False)
+                table_t2p.pop(oldest_tok, None)
+            return token
 
     def restore(self, text: str) -> str:
         """还原请求期注册 token；响应期/未注册/格式不符原样保留 + 审计。
 
         仅查 pii_t2p（请求期映射），绝不触达全局凭据映射。
+        真 LRU：命中后 move_to_end 提升为最新（与 register 语义一致）。
+        并发安全：asyncio 单线程中同步读不 yield，但 register 持 _lock 时
+        可能并发读；用快照 + try/move_to_end 避免 OrderedDict mutated 异常。
         """
         if not text:
             return text
         # 无映射时仍审计格式不符 token（防恶意批量注入无还原路径刷日志，
         # 但限流保证只记一次）
-        if not self.pii_t2p and self._audit_cb is not None:
+        # 快照避免并发 mutated
+        try:
+            pii_t2p_snapshot = dict(self.pii_t2p)
+            resp_t2p_snapshot = dict(self.resp_t2p)
+        except RuntimeError:
+            pii_t2p_snapshot = dict(list(self.pii_t2p.items()))
+            resp_t2p_snapshot = dict(list(self.resp_t2p.items()))
+        if not pii_t2p_snapshot and self._audit_cb is not None:
             for m in PII_TOKEN_LOOSE_RE.finditer(text):
                 tok = m.group(0)
-                if tok not in self.resp_t2p:
+                if tok not in resp_t2p_snapshot:
                     self._audit_malformed(tok)
             return text
 
         def _repl(m: _re.Match) -> str:
             tok = m.group(0)
-            if tok in self.pii_t2p:
-                return self.pii_t2p[tok]
-            if tok in self.resp_t2p:
+            if tok in pii_t2p_snapshot:
+                plain = pii_t2p_snapshot[tok]
+                # 真 LRU：提升热值（try 保护并发 register 期间的 mutated）
+                try:
+                    if tok in self.pii_t2p:
+                        self.pii_t2p.move_to_end(tok)
+                    if plain in self.pii_p2t:
+                        self.pii_p2t.move_to_end(plain)
+                except (KeyError, RuntimeError):
+                    pass
+                return plain
+            if tok in resp_t2p_snapshot:
                 # 响应期注册 token：形态匹配但原样保留（不还原为明文）
+                # 同样提升 LRU
+                try:
+                    if tok in self.resp_t2p:
+                        self.resp_t2p.move_to_end(tok)
+                except (KeyError, RuntimeError):
+                    pass
                 return tok
             self._audit_malformed(tok)
             return tok
@@ -115,9 +164,16 @@ class RequestScopedTokens:
         # PII_TOKEN_STR_RE 只覆盖合法形态；格式不符用宽松正则补扫。
         restored = PII_TOKEN_STR_RE.sub(_repl, text)
         if self._audit_cb is not None:
+            # 用快照二次审计，避免并发期漏判
+            try:
+                cur_pii = set(self.pii_t2p.keys())
+                cur_resp = set(self.resp_t2p.keys())
+            except RuntimeError:
+                cur_pii = set(list(self.pii_t2p.keys()))
+                cur_resp = set(list(self.resp_t2p.keys()))
             for m in PII_TOKEN_LOOSE_RE.finditer(restored):
                 tok = m.group(0)
-                if tok not in self.pii_t2p and tok not in self.resp_t2p:
+                if tok not in cur_pii and tok not in cur_resp:
                     self._audit_malformed(tok)
         return restored
 
@@ -143,12 +199,20 @@ class RequestScopedTokens:
             )
 
     def clear(self) -> None:
-        """请求结束清理全部映射与计数。"""
+        """请求结束清理全部映射与计数。
+
+        注意：全局持久化后此方法不再在每请求清理中调用（_pii_cleanup 不再 clear），
+        仅保留供测试/手动重置使用。
+        """
         self.pii_p2t.clear()
         self.pii_t2p.clear()
         self.resp_p2t.clear()
         self.resp_t2p.clear()
         self._malformed_counts.clear()
+
+
+# 兼容别名：旧 RequestScopedTokens → 新 GlobalPiiTokens
+RequestScopedTokens = GlobalPiiTokens
 
 
 def _make_token(n: int) -> str:

@@ -1,0 +1,157 @@
+## MODIFIED Requirements
+
+### Requirement: PII 检测与可逆脱敏
+
+系统 SHALL 在 LLM 请求转发前检测正文中的 PII（至少包含：中国大陆身份证号、手机号、电子邮箱、银行卡号、IPv4 地址、常见 API key/密钥格式），并将检测到的值替换为占位符；**API key 格式定义（可测判定标准）**：`sk-`/`sk-ant-`/`ghp_`/`gho_`/`AKIA` 前缀 + 最小长度 16 的 `[A-Za-z0-9_-]` 字符集（如 `sk-[A-Za-z0-9_-]{16,}`、`ghp_[A-Za-z0-9]{36}`；占位符形态本身排除，见 Requirement 3）；**检测字段范围**：请求侧为 `messages[].content`（字符串与数组 parts）、system prompt、历史 tool_calls 参数与 tool 结果；响应侧为 content、reasoning_content 与 tool 参数 delta（完整范围见 design D1 检测字段范围，以 design 为准）；系统 SHALL 在 LLM 响应中**还原**请求阶段产生的占位符（**还原后再执行响应侧检测**，禁止「先检测后还原」，见 design D2），还原后的文本与原文一致（**作用域：请求期注册值的还原保证**；响应期新检测 PII 以占位符呈现，不承诺还原，见 Requirement 4）。流式响应中跨分片切断的 PII（占位符残缺或明文被分片）SHALL 由分片累积机制处理，不得泄漏残缺片段。**IPv4/IPv6 保留地址段（RFC1918 私网、环回、链路本地、组播、文档前缀等）SHALL 不做替换**（完整保留段清单见 design D1 保留地址豁免，以 design 为准）。**系统 SHALL 支持可配置的自定义正则**（如工号、项目代号、内部域名格式）参与检测与替换，自定义正则 SHALL 带 ReDoS 防护（线程超时守卫，**单规则超时预算 100ms**，超时即跳过该规则并告警，**连续超时 3 次临时停用该规则**）。**系统 SHALL 支持可配置的敏感名称名单（字典型 recognizer）**（人名、工号、内部主机名、内部域名等）做精确匹配替换，名单匹配 SHALL 独立扫描、不并入内置联合正则（防 alternation 分支爆炸，见 design D1）——**可测判定**：启用 5000 名单时单 chunk 扫描 ≤1ms（独立扫描性能锚点）；名单名称精确匹配不误伤同形词（`张三` 不误伤 `张三丰`，CJK 边界见 design D1）。内置与自定义正则 SHALL 使用 lookaround 边界而非 `\\b`（中文环境 `\\b` 失效，见 design D1）。
+
+#### Scenario: 请求中的手机号被脱敏
+
+- **WHEN** 客户端发送包含 11 位中国大陆手机号的 LLM 请求
+- **THEN** 转发给上游的请求正文中该手机号被替换为占位符，原文不出现在请求中
+
+#### Scenario: 请求中的身份证号被脱敏
+
+- **WHEN** 客户端发送包含 18 位**校验位有效**的中国大陆身份证号的 LLM 请求
+- **THEN** 转发给上游的请求正文中该身份证号被替换为占位符
+
+#### Scenario: 校验位无效的 18 位数字不被脱敏
+
+- **WHEN** 请求正文包含 18 位数字但校验位无效（不符合 GB 11643-1999 校验规则，如随机数字串）
+- **THEN** 该数字串不被替换为占位符（低置信不脱敏；纯数字订单号等不误伤）
+
+#### Scenario: 内网 IP 不被脱敏
+
+- **WHEN** 请求正文包含 RFC1918 私网地址（如 `10/8`、`172.16/12`、`192.168/16` 段内地址）或环回/链路本地/文档前缀地址（如 `127/8`、`169.254/16`、`192.0.2/24`）
+- **THEN** 该地址原样保留，不替换为占位符（私网 IP 属环境参数而非隐私）
+
+#### Scenario: 公网 IP 被脱敏
+
+- **WHEN** 请求正文包含公网 IPv4/IPv6 地址（非保留段）
+- **THEN** 该地址被替换为占位符
+
+#### Scenario: 自定义正则参与检测
+
+- **WHEN** 配置了自定义正则（如 `工号\\d{6}`）且请求正文包含匹配值
+- **THEN** 该值被替换为占位符；若自定义正则在预算内超时（ReDoS），该规则被跳过并记录告警
+
+#### Scenario: 敏感名称名单精确匹配
+
+- **WHEN** 配置了敏感名称名单（如公司员工姓名）且请求正文包含名单中的名称
+- **THEN** 该名称被替换为占位符（精确匹配，不误伤同形词）
+
+#### Scenario: 响应中的占位符被还原
+
+- **WHEN** 上游 LLM 响应正文包含请求阶段生成的占位符
+- **THEN** 转发给客户端的响应中该占位符被还原为原始 PII 值
+
+#### Scenario: 未检测到 PII 的请求原样转发
+
+- **WHEN** 客户端发送不含 PII 的 LLM 请求
+- **THEN** 请求正文不做任何替换，原样转发给上游
+
+#### Scenario: 流式响应按标点边界切分缓冲
+
+- **WHEN** 流式响应中 11 位手机号被 SSE 分片在任意位置切断（如分片 1 含 `1381234`，分片 2 含 `5678`，无标点分隔）
+- **THEN** 分片累积后完整识别并掩码/还原，中间状态不向客户端输出半截明文；已到标点边界的完整内容被 flush，未完成句子/候选值持有等待后续分片（尾部持有 ≤ `PII_HOLD_MAX`=64 字符）；切断的候选值（IP/邮箱等含标点形态）由候选值感知切分回退到候选起始前，不泄漏明文片段
+
+#### Scenario: 图片 base64 data URL 不参与检测
+
+- **WHEN** 请求/响应包含图片 base64 data URL（`data:image/...;base64,...`）
+- **THEN** 该字段不参与 PII 检测与替换（对 base64 跑正则误报后掩码会损坏图像数据）
+
+#### Scenario: URL 查询参数长数字不判银行卡
+
+- **WHEN** 文本包含 URL 查询参数位置的长数字（参数名清单：`id`、`order`、`sn`、`amount` 等常见标识/金额参数；**数值型查询参数值一律跳过银行卡判定**，参数名清单可配置扩展）
+- **THEN** 该长数字不被判定为银行卡号（防误报优先：宁可漏报不可误报）
+
+### Requirement: PII 脱敏开关与作用域
+
+系统 SHALL 支持通过配置启用/禁用 PII 脱敏（默认禁用）；**PII 占位符映射 SHALL 为进程级全局持久 LRU**（单表上限 `1000` 真 LRU（`pii/resp` 各 1000，总量≤2000）、`OrderedDict.move_to_end + popitem(last=False)` 最久未用者先出，与凭据 `5000` 区分；命中复用同一 `__PII_<seq>_<rand8>__`（读命中亦 `move_to_end` 提升热值），未命中一次性 `secrets.token_hex(4)` 后持久化），不再每请求新建与清理；`register` SHALL 为 `async def` 并以 `asyncio.Lock` 保护并发注册（全量调用点 `await`，无 `coroutine never awaited`）；`restore` 读路径 SHALL 同步 `move_to_end` 提升且以快照防 `OrderedDict mutated`；请求并发间 SHALL 隔离可变状态，避免实例变量覆盖。占位符 SHALL 含随机段防枚举（`__PII_<seq>_<rand8>__`，rand8 为 8 位十六进制随机段，首次生成后持久复用），`_restore` 仅还原映射中存在的 token，序号越界/格式不符原样保留并记审计事件；**`_restore` 仅还原请求期注册的 token，响应期注册 token 形态匹配也原样保留**。全局映射 SHALL 带容量上限与 `asyncio.Lock` 保护并发 `register`。
+
+#### Scenario: 功能默认关闭
+
+- **WHEN** 未配置启用 PII 脱敏
+- **THEN** 即使请求包含 PII，请求正文也原样转发，不做检测与替换
+
+#### Scenario: 同值跨请求稳定复用
+
+- **WHEN** 连续两次发送包含相同手机号 `13812345678` 的请求（内容完全相同）
+- **THEN** 两次转发给上游的脱敏后正文完全一致（同一 `__PII_…__`），`LLM` prompt cache 可命中
+
+#### Scenario: 全局持久 LRU 不在请求结束时清理
+
+- **WHEN** 一次 LLM 请求完成（响应结束或连接关闭）
+- **THEN** 该请求产生的 PII 值→token 映射保留在全局 `LRU` 中，后续含同值的请求复用同一 token（不再每请求 `clear()`）
+
+#### Scenario: 超限 1001 时真 LRU 淘汰最久未用者
+
+- **WHEN** 连续注册 1001 个不同 PII 值（`PII_MAX_ENTRIES=1000` 单表上限）且期间对首个值再次 `register` 命中提升
+- **THEN** 最久未用者（非热值）被 `popitem(last=False)` 淘汰，热值保留，非 FIFO（如 `FIFO popitem(last=True)` 则热值被误淘汰）
+
+#### Scenario: 并发注册不丢号
+
+- **WHEN** 20 协程并发 `await register` 不同值（`asyncio.Lock` 保护）
+- **THEN** 各得唯一 `__PII_<seq>_<rand8>__` 且 `_seq` 递增至 20，无 `coroutine never awaited` 且无重复 `seq`
+
+#### Scenario: 并发请求状态隔离
+
+- **WHEN** 并发发送两条含不同 PII 的请求
+- **THEN** 各自的脱敏与还原互不覆盖、不串扰，`hermes` 侧收到的还原结果与各自原文一致
+
+#### Scenario: 占位符含随机段不可枚举
+
+- **WHEN** 同一请求内多个 PII 值被脱敏，或客户端尝试猜测占位符序号（如批量注入 `__PII_<seq>_<guess>__` 探测）
+- **THEN** 每个占位符包含 8 位十六进制随机段（`__PII_<seq>_<rand8>__`，≈4G 空间，首次生成后持久复用），猜测命中还原的概率可忽略；`_restore` 仅还原映射中存在的 token，序号越界/格式不符原样保留并记审计事件
+
+#### Scenario: 响应期新检测 PII 不被还原
+
+- **WHEN** 响应侧检测发现的新 PII 被注册为响应期 token（模型输出中的 PII 被掩码）
+- **THEN** 该响应期 token 即使形态匹配也不被还原为明文（`_restore` 仅还原请求期注册 token）；客户端收到占位符而非明文
+
+#### Scenario: 中文紧贴 PII 被检测
+
+- **WHEN** 请求正文中 PII 与中文汉字直接相邻（如 `联系13812345678处理`、`身份证号110101199001011234`）
+- **THEN** 该 PII 被替换为占位符（lookaround 边界而非 `\\b`，中文环境 `\\b` 失效）
+
+### Requirement: PII 脱敏不干扰凭据脱敏
+
+系统 SHALL 保证 PII 脱敏与既有凭据 token 脱敏（`__VG_CRED_*__`）互不干扰：凭据 token 的处理逻辑与格式不被 PII 机制改变。
+
+#### Scenario: 凭据与 PII 同时存在
+
+- **WHEN** 请求正文同时包含已注册凭据和 PII
+- **THEN** 两者都被各自替换为对应占位符，响应中各自还原，互不串扰
+
+#### Scenario: 凭据 token 格式不受影响
+
+- **WHEN** 启用 PII 脱敏后执行既有凭据获取与还原流程
+- **THEN** 凭据占位符仍使用原格式，既有客户端行为不变
+
+### Requirement: 响应侧 PII 回显检测
+
+系统 SHALL 在 LLM 响应转发给客户端前检测响应正文中的 PII；当响应中出现请求阶段未脱敏（即未产生对应占位符）的 PII 时，系统 SHALL 替换为占位符（默认启用），并可配置关闭响应侧检测。**响应侧检测 SHALL NOT 二次掩码 `_restore` 还原路径产出的明文**（即：模型回显请求期占位符 → 还原为原文后，不得再被掩码为新占位符——客户端应收到原文）；**模型独立输出（非还原产物）的同值明文 SHALL 仍被掩码为新占位符**（不得因值与请求期已注册值等价而放行——模型从自身知识/训练数据复述用户 PII 时明文透传即泄漏）。还原产物与模型独立输出在**文本层不可区分**（两者都是同一明文串），区分依赖内部状态（实现机制：还原替换回调内对还原产物打标记/维护还原位置集合，检测时仅跳过标记区间——机制细节见 design D2，不在本 spec 断言范围）。skip 判定按规范化等价匹配（**分隔符集合定义：`[-. ]`**（连字符、点、空格）——去除这些分隔符后与已注册值一致即跳过；比较顺序：先规范化后等值比较；**仅适用于还原产物**）。**可测试性**：通过测试构造区分两条路径——测试 A 构造「模型回显请求期占位符」（还原路径产物，应跳过不掩码，客户端收到原文）；测试 B 构造「模型独立输出与请求期同值的明文」（非还原产物，应掩码为新占位符）；两测试分别断言不同行为。
+
+#### Scenario: 模型回显用户 PII
+
+- **WHEN** 上游响应复述了请求中出现的 PII 原文（如手机号）
+- **THEN** 转发给客户端的响应中该 PII 被替换为占位符，不泄漏明文
+
+#### Scenario: 响应侧检测可配置
+
+- **WHEN** 配置关闭响应侧 PII 检测
+- **THEN** 响应正文原样转发，不做 PII 替换
+
+### Requirement: 并发请求的可变状态隔离
+
+系统在处理并发 LLM 代理请求时，对每请求可变状态 SHALL 使用请求局部或 `ContextVar` 隔离，禁止共享实例变量导致覆盖。隔离范围至少包括：`PII` 作用域（`_pii_scope`）、审计参数累积（`_audit_arg_accum`）、审计挂起（`_audit_hold_active/_audit_hold_buf/_audit_hold_bytes`）、工具名（`_last_responses_tool_name/_last_anthropic_tool_name`）、工具调用缓冲（`tool_calls_buf/tool_calls_pending_events/tool_calls_audited/tool_calls_blocked`）、`sse` 计数（`sse_event_count/fast_sse_event_count`）与 `bytes_written`/`audit_block_injected`、协议形态标记（`is_responses_stream/is_anthropic_stream`）及内容缓冲（`content_buf/reasoning_buf/arg_buf`）。
+
+#### Scenario: 并发审计与 PII 不串扰
+
+- **WHEN** 并发两请求，一请求进入 `audit_hold`，另一请求正常文本
+- **THEN** 正常请求的文本不被错误缓冲或注入，`hold` 请求的缓冲不泄漏到另一请求的流
+
+#### Scenario: 并发 bytes_written 与协议标记互不覆盖
+
+- **WHEN** 并发两请求不同 PII 且一流含 `tool_calls_pending`、`audit_block_injected`、`is_*_stream` 状态
+- **THEN** 各自 `bytes_written/fast_bytes_written/sse_event_count/audit_block_injected/is_responses_stream` 互不覆盖，守门判定按各自 `bytes_written` 独立生效
+

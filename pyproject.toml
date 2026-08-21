@@ -1,6 +1,6 @@
 [project]
 name = "credential-proxy"
-version = "0.9.5"
+version = "0.9.6"
 description = "三因子认证凭据代理服务 — Matrix 审批 + TPM 硬件解封 + KeePassXC 后端 + LLM 脱敏反向代理"
 requires-python = ">=3.12"
 license = {text = "MIT"}
@@ -43,7 +43,13 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"test_*.py" = ["D", "ANN", "S"]
+"test_*.py" = ["D", "ANN", "S", "E402", "E741"]
+"audit_*.py" = ["D", "ANN", "S", "E402", "E741"]
+"credential_test.py" = ["D", "ANN", "S", "E402", "E741"]
+"llm_test.py" = ["D", "ANN", "S", "E402"]
+"sse_stream_loop_test.py" = ["D", "ANN", "S", "E402"]
+"matrix_test.py" = ["D", "ANN", "S", "E402"]
+"pii_*.py" = ["D", "ANN", "S", "E402"]
 
 [tool.ruff.format]
 quote-style = "single"

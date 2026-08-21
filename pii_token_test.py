@@ -35,9 +35,10 @@ def test_pii_token_format():
     assert PII_TOKEN_RE.fullmatch(tok.encode())
 
 
-def test_pii_token_rand8_is_hex():
+@pytest.mark.asyncio
+async def test_pii_token_rand8_is_hex():
     t = RequestScopedTokens()
-    tok = t.register('13812345678')
+    tok = await t.register('13812345678')
     m = re.fullmatch(r'__PII_\d+_([0-9a-f]{8})__', tok)
     assert m, f'token 格式不符: {tok}'
 
@@ -53,44 +54,49 @@ def test_pii_token_prefix_distinct_from_cred():
 # ═══════════════════════════════════════════════════════════
 
 
-def test_register_creates_mapping():
+@pytest.mark.asyncio
+async def test_register_creates_mapping():
     t = RequestScopedTokens()
-    tok = t.register('13812345678')
+    tok = await t.register('13812345678')
     assert tok in t.pii_t2p
     assert t.pii_p2t['13812345678'] == tok
 
 
-def test_register_duplicate_reuses_token():
+@pytest.mark.asyncio
+async def test_register_duplicate_reuses_token():
     t = RequestScopedTokens()
-    tok1 = t.register('13812345678')
-    tok2 = t.register('13812345678')
+    tok1 = await t.register('13812345678')
+    tok2 = await t.register('13812345678')
     assert tok1 == tok2
     assert len(t.pii_p2t) == 1
 
 
-def test_register_sequential_distinct():
+@pytest.mark.asyncio
+async def test_register_sequential_distinct():
     t = RequestScopedTokens()
-    tok1 = t.register('13812345678')
-    tok2 = t.register('zhangsan@example.com')
+    tok1 = await t.register('13812345678')
+    tok2 = await t.register('zhangsan@example.com')
     assert tok1 != tok2
     assert t._seq == 2
 
 
-def test_register_empty():
+@pytest.mark.asyncio
+async def test_register_empty():
     t = RequestScopedTokens()
-    assert t.register('') == ''
+    assert await t.register('') == ''
     assert len(t.pii_p2t) == 0
 
 
-def test_register_rejects_token_shape_value():
+@pytest.mark.asyncio
+async def test_register_rejects_token_shape_value():
     """值注册校验：拒绝 token 形态值及包含 token 形态子串的值。"""
     t = RequestScopedTokens()
     with pytest.raises(ValueError):
-        t.register('__PII_1_ab12cd34__')
+        await t.register('__PII_1_ab12cd34__')
     with pytest.raises(ValueError):
-        t.register('__VG_CRED_000001__')
+        await t.register('__VG_CRED_000001__')
     with pytest.raises(ValueError):
-        t.register('prefix __PII_1_ab12cd34__ suffix')  # 包含子串即拒
+        await t.register('prefix __PII_1_ab12cd34__ suffix')  # 包含子串即拒
 
 
 # ═══════════════════════════════════════════════════════════
@@ -98,16 +104,18 @@ def test_register_rejects_token_shape_value():
 # ═══════════════════════════════════════════════════════════
 
 
-def test_restore_request_scoped_token():
+@pytest.mark.asyncio
+async def test_restore_request_scoped_token():
     t = RequestScopedTokens()
-    tok = t.register('13812345678')
+    tok = await t.register('13812345678')
     assert t.restore(f'号码 {tok} 结束') == '号码 13812345678 结束'
 
 
-def test_restore_response_side_token_kept():
+@pytest.mark.asyncio
+async def test_restore_response_side_token_kept():
     """响应期注册 token 形态匹配也原样保留（不还原为明文）。"""
     t = RequestScopedTokens()
-    resp_tok = t.register('13900001111', response_side=True)
+    resp_tok = await t.register('13900001111', response_side=True)
     assert resp_tok in t.resp_t2p
     assert resp_tok not in t.pii_t2p
     assert t.restore(f'输出 {resp_tok}') == f'输出 {resp_tok}'
@@ -148,10 +156,11 @@ def test_restore_never_touches_global():
 # ═══════════════════════════════════════════════════════════
 
 
-def test_clear_removes_all():
+@pytest.mark.asyncio
+async def test_clear_removes_all():
     t = RequestScopedTokens()
-    t.register('13812345678')
-    t.register('13900001111', response_side=True)
+    await t.register('13812345678')
+    await t.register('13900001111', response_side=True)
     t.restore('__PII_9_bad__')
     t.clear()
     assert not t.pii_p2t
@@ -161,9 +170,10 @@ def test_clear_removes_all():
     assert not t._malformed_counts
 
 
-def test_clear_then_restore_noop():
+@pytest.mark.asyncio
+async def test_clear_then_restore_noop():
     t = RequestScopedTokens()
-    tok = t.register('13812345678')
+    tok = await t.register('13812345678')
     t.clear()
     assert t.restore(tok) == tok  # 清理后无法还原
 
@@ -365,3 +375,43 @@ def test_pii_audit_cb_executor_offloads_io():
             assert '__PII_3_zz__' not in content  # note 无原始 token
 
     asyncio.run(_run())
+
+
+@pytest.mark.asyncio
+async def test_global_lru_eviction_true_lru():
+    """PII_MAX_ENTRIES=1000 真 LRU：超限淘汰最久未用，命中 move_to_end 提升。"""
+    from _token import GlobalPiiTokens, PII_MAX_ENTRIES
+
+    g = GlobalPiiTokens()
+    # 填满 1000
+    for i in range(PII_MAX_ENTRIES):
+        await g.register(f'1380000{i:04d}')
+    assert len(g.pii_p2t) == PII_MAX_ENTRIES
+    first_val = '13800000000'
+    first_tok = g.pii_p2t[first_val]
+    # 命中 first_val，应 move_to_end 提升为最新
+    tok_again = await g.register(first_val)
+    assert tok_again == first_tok
+    assert list(g.pii_p2t.keys())[-1] == first_val
+    # 再注册新值，应淘汰最旧（非 first_val，而是第二旧）
+    # 此时最旧应为 13800000001
+    second_val = '13800000001'
+    assert second_val in g.pii_p2t
+    await g.register('13999999999')
+    assert len(g.pii_p2t) == PII_MAX_ENTRIES
+    assert second_val not in g.pii_p2t, (
+        'LRU 应淘汰最久未用的 second_val，而非 first_val'
+    )
+    assert first_val in g.pii_p2t, '命中的 first_val 已提升，不应被淘汰'
+    assert '13999999999' in g.pii_p2t
+
+
+@pytest.mark.asyncio
+async def test_global_lru_1000_distinct_from_credential_5000():
+    """PII 1000 与凭据 5000 上限区分。"""
+    from _token import PII_MAX_ENTRIES
+    from _token import MAX_TOKEN_ENTRIES
+
+    assert PII_MAX_ENTRIES == 1000
+    assert MAX_TOKEN_ENTRIES == 5000
+    assert PII_MAX_ENTRIES != MAX_TOKEN_ENTRIES

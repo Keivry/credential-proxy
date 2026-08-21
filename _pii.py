@@ -15,10 +15,11 @@ import asyncio
 import logging
 import os
 import re as _re
+import ipaddress as _ipaddress
 import time as _time
 from concurrent.futures import ThreadPoolExecutor
 
-from _token import RequestScopedTokens
+from _token import GlobalPiiTokens, RequestScopedTokens  # noqa: F401  RequestScopedTokens为兼容别名
 
 logger = logging.getLogger('credential-proxy')
 
@@ -174,8 +175,6 @@ _RESERVED_IPV6_PREFIXES = (
     '2001:db8:',  # 文档段必须带冒号（裸 2001:db8 误豁免 2001:db80::）
 )
 # 兜底精确判定（对粗筛后段内边界值走 ipaddress 精确 in-network）
-import ipaddress as _ipaddress
-
 _RESERVED_NETWORKS = [
     _ipaddress.ip_network('10.0.0.0/8'),
     _ipaddress.ip_network('172.16.0.0/12'),
@@ -614,7 +613,7 @@ class PiiDetector:
                 out = out.replace(value, _mask_placeholder(value, typ))
             return out
         for _, typ, value in items:
-            token = self.request_tokens.register(value, response_side)
+            token = await self.request_tokens.register(value, response_side)
             if token != value:
                 text = text.replace(value, token)
         return text
@@ -629,20 +628,30 @@ class PiiMixin:
     """Mixin：为宿主类提供 PII 检测/脱敏能力。"""
 
     def _init_pii(self, request_tokens=None):
+        # 全局持久化：若未传参，创建进程级全局单例（D1）
+        if request_tokens is None:
+            request_tokens = GlobalPiiTokens(audit_cb=self._pii_audit_cb)
+            self._global_pii_scope = request_tokens
+        else:
+            self._global_pii_scope = request_tokens
         self._pii_detector = PiiDetector(request_tokens=request_tokens)
         self.pii_enabled = False
         self.pii_response_side = True
         self.pii_hold_max = PII_HOLD_MAX_DEFAULT
-        self._pii_scope = None
+        self._pii_scope = self._global_pii_scope  # 兼容旧路径：默认指向全局单例
 
     def _pii_request_scope(self):
-        """创建请求级 PII token 作用域（每请求一个，handler finally 清理）。
+        """返回全局 PII token 作用域（命中复用，不再每请求新建）。
 
-        返回 RequestScopedTokens 实例并挂到 self._pii_scope（当前请求
-        上下文）；detector 指向它（请求期/响应期注册都进该作用域，
-        响应期值标记 response_side 不还原）。
+        D1 改动：不再 `new RequestScopedTokens`，直接返回全局单例并
+        确保 detector 指向它。`_pii_cleanup` 不再 `clear()`，故此方法
+        不再创建新实例，仅保证引用正确。
         """
-        scope = RequestScopedTokens(audit_cb=self._pii_audit_cb)
+        # 懒初始化：若 _init_pii 未曾调用或全局丢失，重建
+        scope = getattr(self, '_global_pii_scope', None)
+        if scope is None:
+            scope = GlobalPiiTokens(audit_cb=self._pii_audit_cb)
+            self._global_pii_scope = scope
         self._pii_detector.request_tokens = scope
         self._pii_scope = scope
         return scope
@@ -715,15 +724,23 @@ class PiiMixin:
 
     def _pii_active(self) -> bool:
         """当前请求是否有活跃 PII 作用域（PII 启用且已建 scope）。"""
-        return self._pii_scope is not None
+        # D1 后 _pii_scope 指向全局单例，是否活跃仅看 pii_enabled
+        return (
+            getattr(self, 'pii_enabled', False)
+            and getattr(self, '_pii_scope', None) is not None
+        )
 
     def _pii_cleanup(self):
-        """请求结束清理请求级映射与上下文（handler finally 调用）。"""
-        scope = getattr(self, '_pii_scope', None)
-        if scope is not None and hasattr(scope, 'clear'):
-            scope.clear()
-        self._pii_detector.request_tokens = None
-        self._pii_scope = None
+        """请求结束清理（全局持久化后不再 clear 映射）。
+
+        D1 改动：不再 `clear()` 全局 `LRU`，仅保证 detector 仍指向全局单例。
+        ContextVar 的 per-request 引用由 handler 的 `reset(token)` 清理，此处不触碰 `_pii_scope_var`。
+        供 handler `finally` 调用，幂等、无 `await`。
+        """
+        # 不再 clear 全局映射，保留 LRU 供下次命中复用
+        scope = getattr(self, '_global_pii_scope', None)
+        if scope is not None:
+            self._pii_detector.request_tokens = scope
 
     async def pii_scan(self, text: str) -> list[tuple[str, str]]:
         """检测 PII（供 _llm.py 调用）。"""

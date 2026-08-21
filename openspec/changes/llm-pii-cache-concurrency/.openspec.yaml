@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-08-21
+goal: 修复 v0.9.x PII 请求级随机 token 导致 LLM prompt cache
+  失效，并发下实例变量共享导致状态覆盖，以及流式/非流式空体导致 hermes JSONDecodeError 重试 5 次后沉默
