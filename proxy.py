@@ -236,6 +236,12 @@ class CredentialProxy(
     # ── 主循环 ──
 
     async def run(self):
+        # 审批孤儿清扫需运行循环（显式生命周期，见 _audit.py v0.9.2 修复）
+        if (
+            getattr(self, 'audit_enabled_flag', False)
+            and getattr(self, 'audit_mode', '') == 'approve'
+        ):
+            self._start_approval_sweeper()
         tasks = [
             self.start_credential_api(CREDENTIAL_API_PORT),
             self.start_llm_proxies(),

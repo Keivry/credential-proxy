@@ -219,16 +219,44 @@ class TestEnsureAuditInitDefensive:
         assert h.audit_mode == 'block'  # 已降级
         assert h.audit_enabled_flag is True  # 审计仍启用（block 模式）
 
-    @pytest.mark.asyncio
-    async def test_approve_with_whitelist_stays_approve(self):
-        """approve + 有 APPROVAL_WHITELIST → 保持 approve。"""
+    def test_ensure_audit_init_does_not_create_task_sync(self):
+        """同步期 _ensure_audit_init 不建 task（方案 B 根因回归）。
+
+        00:57 事故：proxy.py __init__ 同步期调 _ensure_audit_init →
+        _start_approval_sweeper → asyncio.create_task → no running
+        event loop → 进程崩溃重启循环。方案 B 将 sweeper 启动挪到
+        proxy.run() 异步期；同步期必须不抛 RuntimeError 且不自启。
+        """
         os.environ['AUDIT_MODE'] = 'approve'
         os.environ['APPROVAL_WHITELIST'] = '@admin:example.com'
         h = self._make_host()
-        # approve 模式会启动审批孤儿清扫 task（asyncio.create_task）→ 需运行循环
+        # 同步上下文（无运行循环）—— 必须不抛 RuntimeError
+        h._ensure_audit_init()
+        assert h.audit_mode == 'approve'
+        assert not getattr(h, '_approval_sweeper_started', False)
+        assert not hasattr(h, '_approval_sweep_task')
+
+    @pytest.mark.asyncio
+    async def test_approve_with_whitelist_stays_approve(self):
+        """approve + 有 APPROVAL_WHITELIST → 保持 approve。
+
+        显式生命周期（方案 B）：_ensure_audit_init 同步期不自启
+        sweeper（避免 no running event loop）；首次 audit_tool_call
+        或 proxy.run() 异步期内才启动。测试中显式手动启动以验证
+        create_task 路径及清理。
+        """
+        os.environ['AUDIT_MODE'] = 'approve'
+        os.environ['APPROVAL_WHITELIST'] = '@admin:example.com'
+        h = self._make_host()
         h._ensure_audit_init()
         assert h.audit_mode == 'approve'
         assert h.approval_whitelist == {'@admin:example.com'}
+        # 同步期不自启（方案 B 根因修复）
+        assert not getattr(h, '_approval_sweeper_started', False)
+        # 异步期显式启动（等价 proxy.run() 或 audit_tool_call 兜底）
+        h._start_approval_sweeper()
+        assert h._approval_sweeper_started is True
+        assert hasattr(h, '_approval_sweep_task')
         # 清理清扫 task（防测试泄漏）
         if hasattr(h, '_approval_sweep_task'):
             h._approval_sweep_task.cancel()

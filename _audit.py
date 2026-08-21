@@ -641,12 +641,16 @@ class AuditMixin:
                     self.audit_mode,
                     policy_file or '(default)',
                 )
-            # 审批模式：启动周期清扫兜底（孤儿 pending 置 rejected）
-            if self.audit_enabled_flag and self.audit_mode == 'approve':
-                self._start_approval_sweeper()
+            # 审批模式的孤儿清扫不在此启动（显式生命周期：proxy.run() 内
+            # 启动，需运行循环；同步的 _ensure_audit_init/__init__ 期无 loop
+            # 会 RuntimeError: no running event loop — 见 v0.9.1 热修复）。
 
     def _start_approval_sweeper(self):
         """启动审批孤儿清扫定时任务（design D4 6.4：周期 60s）。
+
+        显式生命周期：仅在运行循环内调用（proxy.run() 或
+        audit_tool_call 异步路径）；__init__/_ensure_audit_init
+        同步期不再自动启动，避免 no running event loop 崩溃。
 
         流结束/异常但 pending 未清理（如 handler 崩溃路径）时，
         孤儿审批条目置 rejected（event.set() 唤醒等待者）+ 清理。
@@ -704,6 +708,12 @@ class AuditMixin:
         self._ensure_audit_init()
         if not self.audit_enabled():
             return 'allow'
+        # 审批孤儿清扫显式启动（有运行循环的异步路径兜底；__init__
+        # 同步期不自启，避免 no running event loop — 方案 B）
+        if self.audit_mode == 'approve' and not getattr(
+            self, '_approval_sweeper_started', False
+        ):
+            self._start_approval_sweeper()
         # deny 名单（精确匹配）
         if name in self.policy.get('deny', []):
             await self._audit_log_event(
