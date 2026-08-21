@@ -88,11 +88,20 @@ def _extract_conv_id(data: dict) -> str | None:
     """从 SSE data JSON 中提取 conversation ID。
 
     兼容 OpenAI 格式 (data.id) 和 Anthropic 格式 (data.message.id)。
+    新增 Responses API 兼容：response.created/in_progress/completed 等
+    事件的 id 藏在 data.response.id（顶层无 id）。
     """
-    if 'id' in data:
+    if 'id' in data and isinstance(data['id'], str) and data['id']:
         return data['id']
     if isinstance(data.get('message'), dict):
-        return data['message'].get('id')
+        mid = data['message'].get('id')
+        if isinstance(mid, str) and mid:
+            return mid
+    # OpenAI Responses API: {"type":"response.created","response":{"id":"resp_..."},...}
+    if isinstance(data.get('response'), dict):
+        rid = data['response'].get('id')
+        if isinstance(rid, str) and rid:
+            return rid
     return None
 
 
