@@ -323,25 +323,37 @@ def _normalize_dotdot(s: str) -> str:
 
     用 posixpath.normpath 处理参数中的绝对路径形态（鲁棒且无正则陷阱）。
     仅处理被引号/空白包裹的路径片段（不破坏命令结构）。
+
+    性能（Round 17 R2）：不用「非空白字符 + /../ + 非空白字符」的
+    全文正则——贪吃部分在长无匹配/部分匹配文本上逐位置回退 O(n²)
+    （100KB 实测 ~27s）。改为「`/../` 定位 + 局部窗口规范化」O(n) 算法。
     """
     import posixpath
 
-    # 无 `..` 候选直接短路——裸路径正则 (\S*/\.\./\S*) 在长无匹配
-    # 文本上逐位置贪吃+回退 O(n²)（100KB 实测 ~27s）。
-    if '..' not in s:
+    # 无 `/../` 候选直接短路（O(n) 的 in 检查）
+    if '/../' not in s:
         return s
 
-    # 提取路径片段（/xxx/../xxx 或 引号内路径）
-    def _norm(m):
-        return posixpath.normpath(m.group(1))
-
-    # 引号内路径（最常见：{"path":"/tmp/../etc/passwd"}）
-    s = _re.sub(
-        r'"([^"]*/\.\./[^"]*)"', lambda m: f'"{posixpath.normpath(m.group(1))}"', s
-    )
-    # 裸路径（空格分隔的 /a/../b 片段）
-    s = _re.sub(r'(\S*/\.\./\S*)', lambda m: posixpath.normpath(m.group(1)), s)
-    return s
+    # 引号内路径（最常见：{"path":"/tmp/../etc/passwd"}）——定位每个
+    # `/../`，向两侧扩展到引号边界，局部 normpath，O(n)。
+    result = []
+    last = 0
+    i = s.find('/../')
+    while i != -1:
+        # 向两侧扩展：左到最近引号/空白/行首，右到最近引号/空白/行尾
+        left = i
+        while left > last and s[left - 1] not in '"\'\t ':
+            left -= 1
+        right = i + 4
+        while right < len(s) and s[right] not in '"\'\t ':
+            right += 1
+        segment = s[left:right]
+        result.append(s[last:left])
+        result.append(posixpath.normpath(segment))
+        last = right
+        i = s.find('/../', right)
+    result.append(s[last:])
+    return ''.join(result)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -896,7 +908,10 @@ _SECRET_PATTERNS = (
     ),
     ('id_card', _re.compile(r'\d{17}[\dXx]')),
     ('phone', _re.compile(r'(?<!\d)1[3-9]\d{9}(?!\d)')),
-    ('email', _re.compile(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')),
+    (
+        'email',
+        _re.compile(r'\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,}\b'),
+    ),
 )
 
 

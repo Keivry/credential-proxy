@@ -138,6 +138,25 @@ class TestRedactSummary:
         assert s.startswith(big[:120])
         assert s.endswith('…')
 
+    def test_long_input_with_at_fast(self):
+        """大输入含单个 `@` 时仍快速返回（R1 完整回归：锚定+限长消除绕过）。
+
+        仅 `@` 预检查不够——攻击者在 tool args 里放一个 `@` 即可绕过
+        （旧正则 `[A-Za-z0-9._%+-]+@...` 仍从每个位置重试，100KB+@ 实测
+        ~20s）。R1 完整修复：email 正则加 `\\b` 锚定 + 长度限制
+        `{1,64}`（local part 上限），长无匹配文本上快速失败。
+        """
+        import time
+
+        big = 'k' * 100_000 + '@'
+        t0 = time.monotonic()
+        s = redact_summary(big)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.0, (
+            f'redact_summary 100KB+@ 耗时 {elapsed:.2f}s（锚定修复未生效）'
+        )
+        assert s.startswith(big[:120])
+
 
 # ═══════════════════════════════════════════════════════════
 # _request_audit_approval 四路径（6.1）

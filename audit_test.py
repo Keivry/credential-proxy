@@ -145,11 +145,11 @@ class TestNormalizeArgs:
         assert '/etc/passwd' in norm
 
     def test_long_input_no_dotdot_fast(self):
-        """大输入无 `..` 时快速返回（R2 回归：二次方回溯已短路）。
+        """大输入无 `/../` 时快速返回（R2 回归：二次方回溯已短路）。
 
         旧实现 `_normalize_dotdot` 的裸路径正则（非空白字符 + /../ + 非空白字符）
-        在长无 `..` 文本上逐位置贪吃+回退 O(n²)——100KB 实测 ~27s。
-        `..` 预检查短路后应毫秒级返回。
+        在长无匹配文本上逐位置贪吃+回退 O(n²)——100KB 实测 ~27s。
+        `/../` 预检查短路后应毫秒级返回。
         """
         import time
 
@@ -159,9 +159,46 @@ class TestNormalizeArgs:
         elapsed = time.monotonic() - t0
         # 100KB 输入处理总预算：远小于旧实现 ~27s（宽松阈值防 CI 抖动）
         assert elapsed < 1.0, (
-            f'normalize_args 100KB 无 .. 耗时 {elapsed:.2f}s（二次方回溯未修复）'
+            f'normalize_args 100KB 无 /../ 耗时 {elapsed:.2f}s（二次方回溯未修复）'
         )
         assert '/etc/passwd' in norm
+
+    def test_long_input_with_dotdot_fast(self):
+        """大输入含 `..`（无 /../）仍快速返回（R2 完整回归：绕过形态）。
+
+        仅 `..` 预检查不够——攻击者在参数里放一个 `..`（如 echo ...）即
+        可绕过（旧正则仍从每个位置重试，100KB+.. 实测 ~27s）。
+        R2 完整修复：`/../` 精确预检查 + 「定位+局部规范化」O(n) 算法，
+        长文本上快速失败。
+        """
+        import time
+
+        big = 'cat /etc/passwd ' + 'a' * 100_000 + ' ..'
+        t0 = time.monotonic()
+        norm = normalize_args(big)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.0, (
+            f'normalize_args 100KB+.. 耗时 {elapsed:.2f}s（O(n) 算法未生效）'
+        )
+        assert '/etc/passwd' in norm
+
+    def test_long_input_with_trail_dotdot_fast(self):
+        """`/../` 在长前缀末尾时仍快速返回（R2 完整回归：贪吃+回退形态）。
+
+        旧正则（非空白字符 + /../ + 非空白字符）的贪吃部分先吞整个长前缀
+        再回退找 `/../`（O(n²)）——100KB 前缀 + 末尾 /../ 实测 ~27s。
+        O(n) 定位算法消除该形态。
+        """
+        import time
+
+        big = 'a' * 100_000 + ' /tmp/../etc'
+        t0 = time.monotonic()
+        norm = normalize_args(big)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.0, (
+            f'normalize_args 100KB+/../末尾 耗时 {elapsed:.2f}s（O(n) 算法未生效）'
+        )
+        assert '/etc' in norm
 
     def test_alias_bin_rm(self):
         """/bin/rm -rf → rm -rf。"""
