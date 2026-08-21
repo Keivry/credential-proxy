@@ -628,7 +628,7 @@ class AuditMixin:
                 if _invalid:
                     logger.error(
                         'APPROVAL_WHITELIST 成员格式非法: %r'
-                        '（应为 @user:domain，如 @keivry:matrix.example）',
+                        '（应为 @user:domain，如 @user:matrix.example）',
                         _invalid,
                     )
                     self.approval_whitelist = {
@@ -1135,7 +1135,7 @@ def parse_audit_env_config(require_whitelist: bool = False) -> dict:
         if invalid:
             errors.append(
                 f'APPROVAL_WHITELIST 成员格式非法: {invalid!r}'
-                '（应为 @user:domain，如 @keivry:matrix.example）'
+                '（应为 @user:domain，如 @user:matrix.example）'
             )
     if require_whitelist and mode == 'approve' and not whitelist:
         errors.append(
