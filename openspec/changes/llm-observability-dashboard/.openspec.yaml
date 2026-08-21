@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-08-21
+goal: 解决两轮 change 后无可观测性的黑盒问题，将 PII/凭据脱敏计数、上游转发、token、审计、缓存等核心指标通过内存环形缓冲+SQLite
+  聚合+单 HTML 实时大盘清晰美观地展示
