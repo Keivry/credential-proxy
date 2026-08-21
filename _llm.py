@@ -1527,6 +1527,7 @@ class LlmMixin(AuditMixin):
                             tool_calls_blocked = (
                                 False  # 审计 deny：抑制后续 tool_calls 事件流出
                             )
+                            audit_block_injected = False
                             # 审计启用时缓冲 tool_calls SSE 行（design D4：未出 verdict 不流出）
                             tool_calls_pending_events: list[str] = []
 
@@ -1820,6 +1821,7 @@ class LlmMixin(AuditMixin):
                                                         await resp.write(
                                                             ev.encode('utf-8')
                                                         )
+                                                    audit_block_injected = True
                                                 else:
                                                     # allow：verdict 后统一放行缓冲事件
                                                     for ev in tool_calls_pending_events:
@@ -2161,11 +2163,15 @@ class LlmMixin(AuditMixin):
                                 if _inj:
                                     tool_calls_blocked = True
                                     tool_calls_pending_events.clear()
+                                    _eof_injected_ok = False
                                     for _ev in _inj:
                                         try:
                                             await resp.write(_ev.encode('utf-8'))
+                                            _eof_injected_ok = True
                                         except SSE_CLIENT_GONE:
                                             break
+                                    if _eof_injected_ok:
+                                        audit_block_injected = True
                                 else:
                                     for _ev in tool_calls_pending_events:
                                         try:
@@ -2211,6 +2217,7 @@ class LlmMixin(AuditMixin):
                                         _block = self._build_block_event_responses()
                                     try:
                                         await resp.write(_block.encode('utf-8'))
+                                        audit_block_injected = True
                                     except SSE_CLIENT_GONE:
                                         pass
                                 self._audit_arg_accum = ''
@@ -2316,13 +2323,64 @@ class LlmMixin(AuditMixin):
                                 ):
                                     logger.debug('SSE 残余写入失败')
                             if sse_event_count == 0 and upstream_resp.status == 200:
-                                logger.error(
-                                    'LLM 上游返回空流(0 data events, %d bytes): %s %s '
-                                    '(client may see EmptyStreamError)',
-                                    len(byte_buf),
-                                    request.method,
-                                    target_url,
-                                )
+                                if audit_block_injected or tool_calls_blocked:
+                                    # 审计拦截：上游 0 events 属预期，不计为空流错误；若前序注入失败则补发
+                                    if not audit_block_injected:
+                                        try:
+                                            if is_responses_stream:
+                                                _fb = (
+                                                    self._build_block_event_responses()
+                                                )
+                                            elif is_anthropic_stream:
+                                                _fb = (
+                                                    self._build_block_event_anthropic()
+                                                )
+                                            else:
+                                                _fb = self._build_block_event()
+                                            await resp.write(_fb.encode('utf-8'))
+                                            audit_block_injected = True
+                                        except (
+                                            ConnectionResetError,
+                                            ConnectionAbortedError,
+                                            BrokenPipeError,
+                                        ):
+                                            logger.debug(
+                                                '审计拦截补发写入失败，客户端已断连'
+                                            )
+                                    logger.info(
+                                        '审计拦截已注入拒绝消息(上游0 data events, %d bytes): %s %s',
+                                        len(byte_buf),
+                                        request.method,
+                                        target_url,
+                                    )
+                                else:
+                                    # 上游真空流（非审计）：注入最小拒绝消息避免 hermes JSONDecodeError 空体
+                                    try:
+                                        if is_responses_stream:
+                                            _fb = self._build_block_event_responses()
+                                        elif is_anthropic_stream:
+                                            _fb = self._build_block_event_anthropic()
+                                        else:
+                                            _fb = self._build_block_event()
+                                        await resp.write(_fb.encode('utf-8'))
+                                        logger.error(
+                                            'LLM 上游返回空流(0 data events, %d bytes)已兜底注入拒绝消息: %s %s',
+                                            len(byte_buf),
+                                            request.method,
+                                            target_url,
+                                        )
+                                    except (
+                                        ConnectionResetError,
+                                        ConnectionAbortedError,
+                                        BrokenPipeError,
+                                    ):
+                                        logger.error(
+                                            'LLM 上游返回空流(0 data events, %d bytes): %s %s '
+                                            '(client may see EmptyStreamError)',
+                                            len(byte_buf),
+                                            request.method,
+                                            target_url,
+                                        )
                             try:
                                 await resp.write_eof()
                             except (
@@ -2453,13 +2511,34 @@ class LlmMixin(AuditMixin):
                                 fast_sse_event_count == 0
                                 and upstream_resp.status == 200
                             ):
-                                logger.error(
-                                    'LLM 上游返回空流(0 data events, %d bytes): %s %s '
-                                    '(client may see EmptyStreamError)',
-                                    len(byte_buf),
-                                    request.method,
-                                    target_url,
-                                )
+                                # fast path 无审计：上游真空流，注入最小拒绝消息避免空体
+                                try:
+                                    _tail_norm = tail.rstrip('/')
+                                    if _tail_norm.endswith('v1/responses'):
+                                        _fb = self._build_block_event_responses()
+                                    elif _tail_norm.endswith('v1/messages'):
+                                        _fb = self._build_block_event_anthropic()
+                                    else:
+                                        _fb = self._build_block_event()
+                                    await resp.write(_fb.encode('utf-8'))
+                                    logger.error(
+                                        'LLM 上游返回空流(0 data events, %d bytes)已兜底注入拒绝消息: %s %s',
+                                        len(byte_buf),
+                                        request.method,
+                                        target_url,
+                                    )
+                                except (
+                                    ConnectionResetError,
+                                    ConnectionAbortedError,
+                                    BrokenPipeError,
+                                ):
+                                    logger.error(
+                                        'LLM 上游返回空流(0 data events, %d bytes): %s %s '
+                                        '(client may see EmptyStreamError)',
+                                        len(byte_buf),
+                                        request.method,
+                                        target_url,
+                                    )
                             try:
                                 await resp.write_eof()
                             except (

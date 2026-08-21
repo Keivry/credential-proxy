@@ -499,14 +499,15 @@ async def test_bad_json_passthrough():
 
 @pytest.mark.asyncio
 async def test_empty_stream_no_crash():
-    """空流（无事件）→ 不崩溃。"""
+    """空流（无事件）→ 不崩溃，A 方案永不空流：兜底注入 BLOCK_MESSAGE。"""
     am = AskMock()
     async with env_error(ask_mock=am), ClientSession() as s:
         body = json.dumps({'case': 'empty_stream'})
         async with s.post(CHAT_BASE, headers=HEADERS, data=body) as r:
             assert r.status == 200
             text = await r.text()
-        assert text == '' or '[DONE]' in text
+        # A 方案：空流不再返回 0 bytes（会致 hermes JSONDecodeError），而是注入拒绝消息
+        assert BLOCK_MESSAGE in text
 
 
 @pytest.mark.asyncio
