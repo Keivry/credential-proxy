@@ -18,6 +18,7 @@ import pytest
 from _audit import (
     AuditMixin,
     _append_audit_log,
+    _expand_aliases,
     is_external_host,
     load_policy_file,
     normalize_args,
@@ -199,6 +200,29 @@ class TestNormalizeArgs:
             f'normalize_args 100KB+/../末尾 耗时 {elapsed:.2f}s（O(n) 算法未生效）'
         )
         assert '/etc' in norm
+
+    def test_find_delete_alias_with_args(self):
+        """find -delete 带参数 → rm -rf 别名展开（R9 回归）。"""
+        s = _expand_aliases('find /tmp -name "*.log" -delete')
+        assert 'rm -rf /tmp -name "*.log"' in s
+
+    def test_find_flood_fast(self):
+        """大量 `find` 无 `-delete` 仍快速返回（R9 回归：find 二次方回溯）。
+
+        旧实现 `\\bfind\\s+([^;|&]*?)\\s+-delete\\b` 懒惰 `[^;|&]*?` 在
+        大量 `find` 但无 `-delete` 的文本上每个位置回溯 O(n²)——60KB
+        实测 3.2s / 120KB 12.9s。改为「-delete 定位 + 向前找 find」
+        O(n) 算法后应毫秒级返回。
+        """
+        import time
+
+        big = 'find /usr/bin/foo ' * 6667  # ~120KB
+        t0 = time.monotonic()
+        _expand_aliases(big)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 1.0, (
+            f'_expand_aliases find-flood 120KB 耗时 {elapsed:.2f}s（O(n) 算法未生效）'
+        )
 
     def test_alias_bin_rm(self):
         """/bin/rm -rf → rm -rf。"""

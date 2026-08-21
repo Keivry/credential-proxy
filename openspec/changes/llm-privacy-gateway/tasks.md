@@ -118,3 +118,18 @@
 - **R9（🟡）非流式整包缺 `_strip_partials`**：与 R4 合并处理（非流式整包路径单独补）。
 
 全部修复后：`openspec validate --strict` 通过；377 pytest 全绿（新增 8 个回归测试）；ruff check/format 全绿。
+
+## 12. 修复记录（Round 17 审查补充，2026-08-21）
+
+第八轮审查（三子任务 + 主代理实证复验）在 Round 17 初版修复上发现绕过/语义/泄漏问题，已全部修复：
+
+- **R1 完整修复（🔴）email 二次方可单字符绕过**：`2363ba6` 的 `@` 预检查短路可被单个 `@` 绕过（`'k'*100_000 + '@'` 实测 20.3s）。完整修复：email 正则加 `\b` 锚定 + local part 长度限制 `{1,64}`，长无匹配文本上快速失败（100KB+@ 20.3s → 0.012s）。回归测试：`test_long_input_with_at_fast`。
+- **R2 完整修复（🔴）dotdot 二次方可单字符绕过**：`2363ba6` 的 `'..' not in s` 短路可被 `a..a..a..`（含 `..` 但无 `/../`）绕过（100KB 实测 27.5s）。完整修复：`_normalize_dotdot` 弃用全文正则，改为「`/../` 定位 + 局部窗口规范化」O(n) 算法（100KB+.. 27.5s → 0.014s）。回归测试：`test_long_input_with_dotdot_fast` / `test_long_input_with_trail_dotdot_fast`。旧/新独立进程对比：`..+a/b/` 最恶劣形态 119.8s → 0.020s（5990x）。
+- **R9（🔴）`_expand_aliases` find-delete 二次方**：sa-1 发现 `\bfind\s+([^;|&]*?)\s+-delete\b` 懒惰 `[^;|&]*?` 在大量 `find` 无 `-delete` 文本上每个位置回溯 O(n²)——60KB 3.2s / 120KB 12.9s。修复：改为「`-delete` 定位 + 向前找 find」O(n) 算法（120KB → 0.005s）。回归测试：`test_find_delete_alias_with_args` / `test_find_flood_fast`。
+- **R9 语义修正（🟡）find 词边界漂移**：O(n) 重写初版把 `findx`/`finding`/`-deleted`/`--delete` 误当 `find`/`-delete` 处理（sa-0 边界测试发现）。修正：`find` 后须词边界、`-delete` 后须非词字符/结尾，与旧正则 `\bfind\b`/`-delete\b` 语义一致。
+- **预存 bug（🟡）`/bin/rm` 别名从不生效**：`\b/bin/(\w+)` 的 `\b` 在字符串开头的 `/` 处不成立（`/` 非词字符 ↔ 开头无词字符）→ `/bin/rm` 不匹配、`x/bin/rm` 反而错误折叠成 `xrm`。修复：改用 `(?<!\S)/bin/(\w+)`（前面是空白/开头）。回归测试：`test_alias_bin_rm` 现真实断言 `/bin/rm` → `rm`。
+- **R4 收尾（🟡）流末残余出口补 `_strip_partials`**：`_llm.py:2278-2289`/`2408-2419` 两个流末残余出口只走 `_pii_response_process`（不清理残缺 token 前缀），补 `_strip_partials(restored)`。
+- **deny 日志泄漏（🔴）`args_json[:120]` 明文落日志**：`_audit.py:726` `logger.warning('审计拦截: ... %s', args_json[:120])` 直接打原始 tool args 前 120 字符（可含明文密码）。修复：改 `self._audit_live_redact(args_json)[:120]`（与审计记录同脱敏路径）。
+- **R10（🔴）`_SECRET_PATTERNS` JSON 键形态漏脱敏**：`passw(?:or)?d\s*[:=]\s*\S+` 要求键后紧跟 `:`，实际 tool args 是 JSON（`"password":"x"` 键带引号）→ 全部漏脱敏（实测 `{"password":"hunter2"}` 原样落摘要）。修复：补 JSON 键形态（键/值引号用捕获组保留结构）+ `pwd`/短 `key` 键 + Bearer/JWT；值 `[^"\s,}]+` 限定防跨 JSON 字段贪吃；前瞻排除已脱敏占位符防二次覆盖。回归测试：`test_api_key_redacted` 更新为真实 JSON 键值形态。
+
+全部修复后：`openspec validate --strict` 通过；382 pytest 全绿（新增 13 个回归测试）；ruff check/format 全绿。

@@ -313,9 +313,51 @@ def _expand_vars(s: str) -> str:
 def _expand_aliases(s: str) -> str:
     """别名形态展开（保持原文 + 展开形态，便于规则命中）。"""
     # /bin/rm → rm（规则里用 rm 前缀即可命中 /bin/rm 原文；此处补充 find -delete）
-    s = _re.sub(r'\bfind\s+([^;|&]*?)\s+-delete\b', r'rm -rf \1', s)
-    s = _re.sub(r'\b/bin/(\w+)', r'\1', s)
-    return s
+    # 注意：不能用 `\b/bin/(\w+)`——`\b` 在字符串开头的 `/` 处不成立
+    # （`/` 非词字符 ↔ 开头无词字符），导致 `/bin/rm` 不匹配、`x/bin/rm`
+    # 反而错误折叠成 `xrm`。用 `(?<!\S)`（前面是空白/开头）精确限定独立路径。
+    s = _re.sub(r'(?<!\S)/bin/(\w+)', r'\1', s)
+    # find -delete → rm -rf：不能用 `\bfind\s+([^;|&]*?)\s+-delete\b` 全文正则——
+    # 懒惰 `[^;|&]*?` 在大量 `find` 但无 `-delete` 的文本上每个位置回溯 O(n²)
+    # （Round 17 R9：60KB 实测 3.2s / 120KB 12.9s）。改为「-delete 定位 +
+    # 向前找 find」O(n) 算法。
+    out = []
+    last = 0
+    i = s.find('-delete')
+    while i != -1:
+        # 词边界检查：-delete 后必须是非词字符/结尾（排除 -deleted/-deleteit）
+        del_end = i + len('-delete')
+        if del_end < len(s) and (s[del_end].isalnum() or s[del_end] == '-'):
+            # 不是独立 -delete：跳过（保留原样）
+            out.append(s[last:del_end])
+            last = del_end
+            i = s.find('-delete', last)
+            continue
+        # 向前找最近的独立 find（find 是独立单词，前后都是词边界）
+        find_pos = -1
+        j = i
+        while j > last:
+            if (
+                s[j - 4 : j] == 'find'
+                and (j - 4 == 0 or not (s[j - 5].isalnum() or s[j - 5] in '_/'))
+                and (j == len(s) or not (s[j].isalnum() or s[j] in '_/'))
+            ):
+                find_pos = j - 4
+                break
+            j -= 1
+        if find_pos >= 0:
+            out.append(s[last:find_pos])
+            # 提取 find 后到 -delete 前的命令参数（去掉尾部空白）
+            args = s[find_pos + 4 : i].strip()
+            out.append(f'rm -rf {args}'.rstrip())
+            last = i + len('-delete')
+        else:
+            # 无前置 find：保留原样，跳过这个 -delete 继续
+            out.append(s[last : i + len('-delete')])
+            last = i + len('-delete')
+        i = s.find('-delete', last)
+    out.append(s[last:])
+    return ''.join(out)
 
 
 def _normalize_dotdot(s: str) -> str:
@@ -691,7 +733,7 @@ class AuditMixin:
                     logger.warning(
                         '审计拦截: %s (%s) — 命中规则 %s',
                         name,
-                        args_json[:120],
+                        self._audit_live_redact(args_json)[:120],
                         rule.get('reason', pattern)
                         if isinstance(rule, dict)
                         else pattern,
@@ -893,12 +935,40 @@ BLOCK_MESSAGE = '该工具调用已被安全策略拦截（审计拒绝）。如
 # ═══════════════════════════════════════════════════════════
 
 # 密钥/敏感值形态（摘要中替换为 [REDACTED:<type>]）
+# Round 17 R10：补 JSON 键形态（"password":"x"）——旧模式 `passw...[:=]\S+`
+# 要求键后紧跟 `:`，实际 tool args 是 JSON（键带引号）导致全部漏脱敏；
+# 补 pwd/短 key 键 + Bearer/JWT；值用 `[^"\s,}]+` 限定防跨 JSON 字段贪吃。
+# 键前不放 `"?`（避免吞键开引号：`{"password":...` 的 `{` 后引号属键，
+# 匹配应从键本体开始，`\b` 前无需引号处理）。
 _SECRET_PATTERNS = (
     ('api_key', _re.compile(r'sk-[A-Za-z0-9_-]{16,}')),
     ('token', _re.compile(r'(?:gh[pous]_|glpat-|xox[baprs]-)[A-Za-z0-9_-]{10,}')),
-    ('password', _re.compile(r'(?i)passw(?:or)?d\s*[:=]\s*\S+')),
-    ('secret', _re.compile(r'(?i)secret\s*[:=]\s*\S+')),
-    ('token', _re.compile(r'(?i)token\s*[:=]\s*\S+')),
+    # 键值形态（"password":"x"）：`"` 值开引号用捕获组保留（替换时还原），
+    # 值 `[^"\s,}]+` 限定防跨 JSON 字段贪吃；前瞻排除已脱敏占位符
+    # [REDACTED:...]——防后续模式二次覆盖先替换的值（Round 17 R10）。
+    (
+        'password',
+        _re.compile(
+            r'(?i)("?\bpassw(?:or)?d\b"?\s*[:=]\s*)("?)(?!\[REDACTED:)[^"\s,}]+'
+        ),
+    ),
+    (
+        'secret',
+        _re.compile(r'(?i)("?\bsecret\b"?\s*[:=]\s*)("?)(?!\[REDACTED:)[^"\s,}]+'),
+    ),
+    (
+        'token',
+        _re.compile(r'(?i)("?\btoken\b"?\s*[:=]\s*)("?)(?!\[REDACTED:)[^"\s,}]+'),
+    ),
+    ('pwd', _re.compile(r'(?i)("?\bpwd\b"?\s*[:=]\s*)("?)(?!\[REDACTED:)[^"\s,}]+')),
+    # 不含 api_key（sk- 形态由 api_key 模式覆盖，避免双重替换）
+    (
+        'key',
+        _re.compile(
+            r'(?i)("?\b(?:access[_-]?key|auth[_-]?key|secret[_-]?key|private[_-]?key)\b"?\s*[:=]\s*)("?)(?!\[REDACTED:)[^"\s,}]+'
+        ),
+    ),
+    ('bearer', _re.compile(r'(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+')),
     (
         'private_key',
         _re.compile(
@@ -929,7 +999,17 @@ def redact_summary(text: str, max_len: int = 120) -> str:
         # （100KB 纯字母实测 ~20s）——先检测候选字符，无则整条跳过。
         if label == 'email' and '@' not in redacted:
             continue
-        redacted = pat.sub(f'[REDACTED:{label}]', redacted)
+        # R10：键值形态模式含捕获组（组1=键+分隔符，组2=值开引号），
+        # 替换时保留结构只替换值本体；无捕获组模式直接整体替换。
+        if pat.groups:
+            redacted = pat.sub(
+                lambda m, _label=label: (
+                    m.group(1) + m.group(2) + f'[REDACTED:{_label}]'
+                ),
+                redacted,
+            )
+        else:
+            redacted = pat.sub(f'[REDACTED:{label}]', redacted)
     if len(redacted) <= max_len:
         return redacted
     # 截断边界半字符保护：回退到最后一个完整字符

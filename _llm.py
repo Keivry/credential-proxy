@@ -2284,6 +2284,10 @@ class LlmMixin(AuditMixin):
                                     restored = await self._pii_response_process(
                                         residual, active_t2p
                                     )
+                                    # 流末残余清理（Round 17 R4 收尾）：残余字节可能
+                                    # 含分片切断的 token 前缀（__VG_C…/__PII_…），
+                                    # _pii_response_process 不清理，这里统一剥除防泄漏。
+                                    restored = _strip_partials(restored)
                                     await resp.write(
                                         restored.encode('utf-8'),
                                     )
@@ -2414,6 +2418,10 @@ class LlmMixin(AuditMixin):
                                     restored = await self._pii_response_process(
                                         residual, active_t2p
                                     )
+                                    # 流末残余清理（Round 17 R4 收尾）：残余字节可能
+                                    # 含分片切断的 token 前缀（__VG_C…/__PII_…），
+                                    # _pii_response_process 不清理，这里统一剥除防泄漏。
+                                    restored = _strip_partials(restored)
                                     await resp.write(
                                         restored.encode('utf-8'),
                                     )

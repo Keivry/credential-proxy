@@ -79,8 +79,9 @@ class ApproveStub(LlmMixin):
 
 class TestRedactSummary:
     def test_api_key_redacted(self):
-        s = redact_summary('{"token":"sk-abc12345678901234567"}')
-        assert 'sk-abc12345678901234567' not in s
+        # sk- 前缀 ≥16 字符的 API key（R10：JSON 键值形态也覆盖）
+        s = redact_summary('{"token":"sk-abcdefghijklmnopqrstuvwxyz"}')
+        assert 'sk-abcdefghijklmnopqrstuvwxyz' not in s
         assert '[REDACTED:api_key]' in s
 
     def test_phone_redacted(self):
