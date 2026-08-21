@@ -678,12 +678,29 @@ class PiiMixin:
                 # 事件循环线程（与 _audit_log_event 对齐，防 10MB 轮转
                 # shutil.move 阻塞还原热路径；Round 17 R8）。
                 # 无运行循环（纯同步测试）时回退同步写。
+                # 失败处理（Round 17 审查补充）：future 挂 done_callback 消费
+                # 结果——写失败计数（fail-closed 语义对齐 _audit_log_event
+                # 的 _audit_log_fail_count 熔断）+ 防异常吞没
+                # （"exception was never retrieved"）。
                 try:
                     loop = asyncio.get_running_loop()
                 except RuntimeError:
-                    _append_audit_log(path, record)
+                    try:
+                        _append_audit_log(path, record)
+                    except Exception:
+                        logger.exception('PII 审计事件写盘失败（同步回退）')
                 else:
-                    loop.run_in_executor(None, _append_audit_log, path, record)
+                    fut = loop.run_in_executor(None, _append_audit_log, path, record)
+
+                    def _on_done(f: asyncio.Future, _path=path, _record=record):
+                        try:
+                            f.result()
+                        except Exception:
+                            logger.exception(
+                                'PII 审计事件写盘失败（executor）: %s', _path
+                            )
+
+                    fut.add_done_callback(_on_done)
             ring = getattr(self, '_audit_log_ring', None)
             if ring is not None:
                 ring.append(record)

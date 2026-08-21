@@ -2582,8 +2582,10 @@ class LlmMixin(AuditMixin):
                             resp_text, active_t2p
                         )
                         # 非流式整包：还原后统一清理残缺/完整幻觉 token 形态
-                        # （Round 17 R4：非流式出口缺 _strip_partials）
-                        out_text = _strip_partials(out_text)
+                        # （Round 17 R4：非流式出口缺 _strip_partials；
+                        #  审查补充：与流式 _split_safe_hold 语义对齐，
+                        #  用 _strip_token_forms 一并剥离完整幻觉 token）
+                        out_text = _strip_token_forms(out_text)
                         return web.Response(
                             body=out_text.encode('utf-8'),
                             status=upstream_resp.status,

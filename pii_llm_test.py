@@ -218,6 +218,20 @@ class TestSplitSafeHoldPii:
         safe2, _ = _split_safe_hold('hello world', {}, scope)
         assert safe2 == 'hello world'
 
+    def test_non_streaming_out_strips_full_and_partial(self):
+        """Round 17 审查补充回归：非流式整包出口用 `_strip_token_forms`
+        （残缺 + 完整幻觉 token 一并清理，与流式 `_split_safe_hold` 语义
+        对齐；旧实现只调 `_strip_partials` 清残缺，完整幻觉 token
+        `__VG_CRED_000042__` 直出）。"""
+        from _llm import _strip_token_forms
+
+        out = 'answer __VG_CRED_000042__ done __PII_7_a1b2c3d4__ tail __PII_9_ab'
+        cleaned = _strip_token_forms(out)
+        assert '__VG_CRED_000042__' not in cleaned
+        assert '__PII_7_a1b2c3d4__' not in cleaned
+        assert '__PII_9_ab' not in cleaned
+        assert 'answer' in cleaned and 'done' in cleaned and 'tail' in cleaned
+
 
 # ═══════════════════════════════════════════════════════════
 # 请求级映射生命周期

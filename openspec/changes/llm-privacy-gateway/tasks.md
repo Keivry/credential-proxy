@@ -133,3 +133,13 @@
 - **R10（🔴）`_SECRET_PATTERNS` JSON 键形态漏脱敏**：`passw(?:or)?d\s*[:=]\s*\S+` 要求键后紧跟 `:`，实际 tool args 是 JSON（`"password":"x"` 键带引号）→ 全部漏脱敏（实测 `{"password":"hunter2"}` 原样落摘要）。修复：补 JSON 键形态（键/值引号用捕获组保留结构）+ `pwd`/短 `key` 键 + Bearer/JWT；值 `[^"\s,}]+` 限定防跨 JSON 字段贪吃；前瞻排除已脱敏占位符防二次覆盖。回归测试：`test_api_key_redacted` 更新为真实 JSON 键值形态。
 
 全部修复后：`openspec validate --strict` 通过；382 pytest 全绿（新增 13 个回归测试）；ruff check/format 全绿。
+
+## 13. 修复记录（Round 17 审查二轮补充，2026-08-21）
+
+第九轮审查（三子任务批量返回）在 `c9786b6` 上发现 2 个一致性/健壮性缺口，已全部修复：
+
+- **R8 收尾（🟡）executor fire-and-forget future**：`_pii.py` `_pii_audit_cb` 的 `loop.run_in_executor(None, _append_audit_log, ...)` 返回值未持有/未 await/无 done_callback——异常被 loop exception handler 吞掉（"exception was never retrieved"）、写失败静默丢失 fail-closed 语义（`_audit_log_event` 有 `_audit_log_fail_count` 熔断，此路径没有）。修复：future 挂 `add_done_callback` 消费结果（`f.result()` 捕获异常 + `logger.exception`），同步回退分支也补 try/except。回归测试：`pii_token_test.py::test_pii_audit_cb_executor_offloads_io` 已有（覆盖 executor 路径），补异常路径断言。
+- **非流式出口语义对齐（🟡）完整幻觉 token 直出**：`_llm.py:2586` 非流式整包出口只调 `_strip_partials`（清残缺），完整幻觉 token（`__VG_CRED_000042__`/`__PII_7_a1b2c3d4__`）直出——与流式 `_split_safe_hold` 的 `_strip_token_forms`（残缺+完整剥离）语义不一致。修复：改 `_strip_token_forms(out_text)`。回归测试：`pii_llm_test.py::test_non_streaming_out_strips_full_and_partial`。
+- **category 枚举约束注释（🟢）**：`_token.py::_audit_malformed` docstring 注明 category 必须保持固定枚举集（malformed/unregistered）——它直接进审计日志 rule/summary 字段，零明文承诺基于此，禁止扩展为携带 token 形态的动态值。
+
+全部修复后：`openspec validate --strict` 通过；383 pytest 全绿（新增 1 个回归测试）；ruff check/format 全绿。

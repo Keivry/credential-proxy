@@ -122,7 +122,13 @@ class RequestScopedTokens:
         return restored
 
     def _audit_malformed(self, tok: str) -> None:
-        """格式不符/未注册 PII token 审计（聚合限流：同类只记一次 + 计数）。"""
+        """格式不符/未注册 PII token 审计（聚合限流：同类只记一次 + 计数）。
+
+        ⚠️ category 必须保持固定枚举集（malformed/unregistered）——
+        它会被 `_pii_audit_cb` 直接写入审计日志的 rule/summary 字段
+        （零明文承诺基于此）。禁止扩展为携带 token 形态/前缀细分的
+        动态值（如 `malformed:__PII_` 前缀类），否则明文特征落盘。
+        """
         if self._audit_cb is None:
             return
         cat = 'malformed'
