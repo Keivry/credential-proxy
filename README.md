@@ -291,6 +291,7 @@ cd get && make build  # → /tmp/get-credential-linux-amd64
 
 ## 版本历史
 
+- **v0.9.1** — 审查修复合集（Round 15/17）：① ReDoS 二次方回溯防御（工具参数拆链/`_normalize_dotdot` 锚定+限长、`O(n)` 定位、`find --delete` 拆链防误匹配、耗时断言补绕过形态）；② 审计日志脱敏加固（PII `malformed` token 零明文、`deny` 摘要 `Bearer`/键值 `JSON` 形态、`_SECRET_PATTERNS` 补短键+前瞻防二次覆盖、`executor` `done_callback` 防异常吞没）；③ 审批白名单精确匹配+显式排除审计消息；④ `PII` 流式/非流式出口统一剥离残缺+完整幻觉 `token`；⑤ 审计审批分支可达性与 `PII` 残缺清理/单管道拆分修复
 - **v0.9.0** — LLM 隐私网关正式版：① PII 脱敏（请求/响应双侧，`PII_REDACTION_ENABLED` / `PII_RESPONSE_SIDE` / `PII_HOLD_MAX`）；② 输出审计（`AUDIT_MODE=off|block|approve`、`AUDIT_POLICY_FILE`、`AUDIT_TIMEOUT`、`AUDIT_HOLD_MAX_BYTES`），block 模式危险工具调用阻断，approve 模式 Matrix ✅/❎ 审批（`APPROVAL_WHITELIST`）；③ JSONL 审计日志（10MB×5 轮转、0600、fail-closed）；④ 配置启动校验（非法值启动报错，approve 无白名单报错）；⑤ 真实流量验证修复：阻断后后续 content 转发、轻量入口统一 `_ensure_audit_init`（policy 初始化）、`_init_pii` 顺序修正。**安全警示**：PII 脱敏与输出审计默认关闭（保护默认 fail-open），生产启用需显式设置环境变量并配置策略
 - **v0.8.11** — ① LLM 上游连接重试：`session.request()` 对瞬时连接异常（`ServerDisconnectedError` / `ClientConnectionError` / `TimeoutError`）指数退避重试 3 次（0.5s→1s→2s），仅在拿到响应头之前重试，修复 opencode-go 网关间歇性 Server disconnected 导致下游 500；② Matrix 异常保护：`_ask` 的 `room_send` 加保护（断连时 unlock_event 状态残留 → 永久 408 死锁），`_resolve_hash_change` task 异常不再无人检索；③ 凭据审批消息显示调用方信息（已注册：名称/用途/脚本路径；未注册：脚本路径+提示；终端直调单独标记）。新增集成测试（真实 aiohttp 模拟上游断开）+ matrix/credential 单元测试
 - **v0.8.10** — LLM 代理空流检测：SSE 流结束且 0 个 data 事件（或非流式 200 空响应体）时打 WARNING（`LLM 上游返回空流...`），捕获上游 200+空 body 场景（客户端表现为 EmptyStreamError），此前该场景无任何日志
