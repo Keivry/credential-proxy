@@ -6,7 +6,7 @@
 
 ### Requirement: 脱敏与缓存指标采集
 
-系统 SHALL 在 PII 检测命中、凭据注册/还原、LRU 淘汰路径采集计数：PII 按 `kind`（内置 phone/id_card/email/bank_card/ipv4/ipv6/api_key + 自定义正则名 + 字典类型）分两类计数——`pii_detected_total{kind}`（`PiiDetector.scan` 检测到即 +1）与 `pii_cache_hit/miss`（`GlobalPiiTokens.register` 命中已注册复用即 `hit`、新建即 `miss`；响应侧 `resp_p2t` 还原不参与 `pii_cache_*` 计数），凭据按 `cred_hit/cred_miss`（`_register_secret` 新建与 `_redact` 快照命中均计 `hit`，按请求 `out!=in` 计 1 而非替换次数）与 `cred_lru_evictions`（`popitem(last=False)`）计数；自定义正则名 SHALL 经集中 `sanitize_kind` 消毒（长度 >32、含 `__`、含 `\x00`、或经大小写归一后不在内置 7 种 + 自定义模式白名单 → 归 `custom_other`，防 label 基数爆炸，`audit_by_rule` 存 `reason` 非 `pattern`）；所有计数 SHALL 可按聚合窗口查询且不含明文 PII（仅 `kind` 与 `[REDACTED:<kind>]` 形态，摘要经 `redact_summary(raw,120)` 先脱敏后 `truncate(120)` 单一路径）。
+系统 SHALL 在 PII 检测命中、凭据注册/还原、LRU 淘汰路径采集计数：PII 按 `kind`（内置 phone/id_card/email/bank_card/ipv4/ipv6/api_key + 自定义正则名 + 字典类型）分两类计数——`pii_detected_total{kind}`（`PiiDetector.scan` 检测到即 +1）与 `pii_cache_hit/miss`（`GlobalPiiTokens.register` 命中已注册复用即 `hit`、新建即 `miss`；响应侧 `resp_p2t` 还原不参与 `pii_cache_*` 计数）及 `pii_lru_evictions`（`while len(table_p2t)>PII_MAX_ENTRIES: popitem(last=False)` 淘汰时 +1，暴露到 `/_admin/metrics` 与 `health`），凭据按 `cred_hit/cred_miss`（`_register_secret` 新建与 `_redact` 快照命中均计 `hit`，按请求 `out!=in` 计 1 而非替换次数）与 `cred_lru_evictions`（`len(pwd_to_token)>=MAX_TOKEN_ENTRIES` 分支内 `next(iter(pwd_to_token))` 取最老并 `pop(oldest)` 时 +1，文案旧称 `popitem(last=False)` 已对齐真代码）计数；自定义正则名 SHALL 经集中 `sanitize_kind` 消毒（长度 >32、含 `__`、含 `\x00`、或经大小写归一后不在内置 7 种 + 自定义模式白名单 → 归 `custom_other`，防 label 基数爆炸，`audit_by_rule` 存 `reason` 非 `pattern`）；所有计数 SHALL 可按聚合窗口查询且不含明文 PII（仅 `kind` 与 `[REDACTED:<kind>]` 形态，摘要经 `redact_summary(raw,120)` 先脱敏后 `truncate(120)` 单一路径）。
 
 #### Scenario: PII 命中按类型计数
 
@@ -15,8 +15,8 @@
 
 #### Scenario: 凭据 LRU 淘汰可观测
 
-- **WHEN** 凭据映射 `pwd_to_token` 因达到 `MAX_TOKEN_ENTRIES` 触发 `popitem(last=False)` 淘汰
-- **THEN** 指标中 `cred_lru_evictions` 递增且总数可查询
+- **WHEN** 凭据映射 `pwd_to_token` 因达到 `MAX_TOKEN_ENTRIES` 触发 `next(iter(pwd_to_token))` 取最老并 `pop(oldest)` 淘汰（旧文案 `popitem(last=False)` 已对齐真代码）
+- **THEN** 指标中 `cred_lru_evictions` 递增且总数可查询；PII 分表淘汰同理 `pii_lru_evictions` 递增
 
 #### Scenario: 指标不含明文
 
@@ -68,7 +68,7 @@
 
 ### Requirement: 聚合与窗口化查询
 
-系统 SHALL 维护进程级内存聚合（`recent_events: deque(10000)` 每条含 `latency_ms`，单锁批递增，用 `asyncio.Lock` 保护，`p95` 计算置 `run_in_executor` 并返回 `ring_coverage_s/is_precise`）与 `DATA_DIR/metrics.sqlite` WAL 双表：`daily_agg(date TEXT, upstream TEXT, pii_by_type JSON, pii_hits, pii_miss, cred_hits, cred_miss, cred_lru_evictions, requests, tokens JSON, audit_by_verdict JSON, audit_by_rule JSON, latency_buckets JSON, PRIMARY KEY(date, upstream))` 30天滚动 + `hourly_agg(hour TEXT, upstream TEXT, requests, tokens JSON, latency_buckets JSON, pii_by_type JSON, PRIMARY KEY(hour, upstream))` 7天滑动小时聚合；每 5min 原子快照 UPSERT（`INSERT ... ON CONFLICT DO UPDATE SET col=col+excluded.col`，计数器单锁批递增，落盘用有界 `asyncio.Queue(maxsize=5)` 单写者 `ThreadPoolExecutor(max_workers=1)` 串行，深拷贝快照 `dropped_snapshots` 计入 `health`）+ 优雅关闭显式 `await collector.close()`（cancel 定时器 + 最终 flush + `PRAGMA wal_checkpoint(TRUNCATE)` + 重 `chmod 0600`）；`PRAGMA journal_mode=WAL` + `busy_timeout=5000` + `synchronous=NORMAL` + `wal_autocheckpoint=1000` + `PRAGMA user_version=1`，`CREATE INDEX idx_daily_agg_date, idx_hourly_agg_hour`，文件与 `-wal`/`-shm` 均 `0600`；所有 `date`/`hour` 统一 **UTC ISO**（`date=%Y-%m-%d`、`hour=%Y-%m-%dT%H:00:00Z`，`datetime.now(timezone.utc)` 生成），滚动清理同 TZ（`WHERE date < date('now','-30 days')` / `WHERE hour < strftime('%Y-%m-%dT%H:00:00Z','now','-7 days')`）。`GET /_admin/metrics?range=1h|24h|7d|30d` SHALL 按窗口返回聚合（`1h` 走内存 ring 精确分位、`24h/7d` 走 `hourly_agg`、`30d` 走 `daily_agg` 的 `latency_buckets` 近似并标 `≈`），缺失文件时自动建表且不报错；`metrics.sqlite` 不存在时启动期 `PRAGMA user_version` 建表，`synchronous=NORMAL` 断电丢 ≤5min 已在文档明示。
+系统 SHALL 维护进程级内存聚合（`recent_events: deque(10000)` 每条含 `latency_ms`，单锁批递增，用 `asyncio.Lock` 保护，`p95` 计算置 `run_in_executor` 并返回 `ring_coverage_s/is_precise`；延迟分桶 `LATENCY_BUCKETS=[10,25,50,100,200,400,800,1500,3000,5000,10000,Inf] ms` 固定 12 桶，`metrics_bucket(latency_ms)` 命中 `+1`，聚合后桶 `SUM` 逆分位取首个累计 `>=0.95*total` 的桶中位作为 `p95≈`）与 `DATA_DIR/metrics.sqlite` WAL 双表：`daily_agg(date TEXT, upstream TEXT, pii_by_type JSON, pii_hits INT, pii_miss INT, cred_hits INT, cred_miss INT, cred_lru_evictions INT, pii_lru_evictions INT, requests INT, requests_by_status JSON, tokens JSON, audit_by_verdict JSON, audit_by_rule JSON, latency_buckets JSON, PRIMARY KEY(date, upstream))` 30天滚动 + `hourly_agg(hour TEXT, upstream TEXT, requests INT, requests_by_status JSON, tokens JSON, latency_buckets JSON, pii_by_type JSON, pii_lru_evictions INT, cred_lru_evictions INT, PRIMARY KEY(hour, upstream))` 7天滑动小时聚合；每 5min 原子快照覆盖式 UPSERT（`INSERT ... ON CONFLICT DO UPDATE SET col=excluded.col` 覆盖，累计快照直接覆盖，单写者串行避免 `col+excluded.col` 的持续双计；落盘用有界 `asyncio.Queue(maxsize=5)` 单写者 `ThreadPoolExecutor(max_workers=1)` 串行，深拷贝快照 `dropped_snapshots` 计入 `health`）+ 优雅关闭显式 `await collector.close()`（cancel 定时器 + 最终 flush + `PRAGMA wal_checkpoint(TRUNCATE)` + 重 `chmod 0600`）；`PRAGMA journal_mode=WAL` + `busy_timeout=5000` + `synchronous=NORMAL` + `wal_autocheckpoint=1000` + `PRAGMA user_version=1`，`CREATE INDEX idx_daily_agg_date, idx_hourly_agg_hour`，文件与 `-wal`/`-shm` 均 `0600`；所有 `date`/`hour` 统一 **UTC ISO**（`date=%Y-%m-%d`、`hour=%Y-%m-%dT%H:00:00Z`，`datetime.now(timezone.utc)` 生成），滚动清理同 TZ（`WHERE date < date('now','-30 days')` / `WHERE hour < strftime('%Y-%m-%dT%H:00:00Z','now','-7 days')`）。`GET /_admin/metrics?range=1h|24h|7d|30d` SHALL 按窗口返回聚合（`1h` 走内存 ring 精确分位、`24h/7d` 走 `hourly_agg`、`30d` 走 `daily_agg` 的 `latency_buckets` 近似并标 `≈`，`requests_by_status` 同窗口 `SUM(JSON)` 归并并标 `≈`），缺失文件时自动建表且不报错；`metrics.sqlite` 不存在时启动期 `PRAGMA user_version` 建表，`synchronous=NORMAL` 断电丢 ≤5min 已在文档明示。
 
 #### Scenario: 窗口化查询
 

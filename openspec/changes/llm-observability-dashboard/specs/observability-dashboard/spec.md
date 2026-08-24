@@ -6,7 +6,7 @@
 
 ### Requirement: 单 HTML 实时大盘展示
 
-系统 SHALL 提供单一静态 `admin.html`（无构建、内联 CSS、内联 `Chart.js` ~200KB，`Chart is not defined` 时降级为 SVG）在 `/_admin/` 下访问，首帧展示：总览 KPI 卡（今日请求、脱敏请求占比、PII 命中总数、阻断数、上游 p95 延迟，p95 标注 `1h精确(低流量≈)/24h≈/7d≈/30d≈`）、时序趋势（`1h` 细粒度/`24h` 小时粒度/`7d` 小时粒度/`30d` 日粒度，请求/token/延迟）、类型分布（PII 按 `kind`）、上游分布（按 `port`）、最近事件表；所有数值 SHALL 精确（个位/小数一位）且与 `/_admin/metrics` 聚合一致。
+系统 SHALL 提供单一静态 `admin.html`（无构建、内联 CSS、内联 `Chart.js` ~200KB，`Chart is not defined` 时降级为 SVG，首访无 `__Host-admin_token` Cookie 时展示居中密码输入框 `type=password` 回车提交 `X-Admin-Token` 校验，成功由服务端 `Set-Cookie` 写入 `__Host-admin_token` 并 `history.replaceState` 清参，失败 401 抖动，`http` 下 `__Host-` 拒写时 `ENV==dev && ALLOW_LOOPBACK_NO_TOKEN=1` 回退 `SameSite=Lax` 提示 TLS）在 `/_admin/` 下访问，首帧展示：总览 KPI 卡（今日请求、脱敏请求占比、PII 命中总数、阻断数、上游 p95 延迟，p95 标注 `1h精确(低流量≈)/24h≈/7d≈/30d≈`）、时序趋势（`1h` 细粒度/`24h` 小时粒度/`7d` 小时粒度/`30d` 日粒度，请求/token/延迟，分桶 `LATENCY_BUCKETS` 支撑 `p95≈`）、类型分布（PII 按 `kind`）、上游分布（按 `port`）、最近事件表；所有数值 SHALL 精确（个位/小数一位）且与 `/_admin/metrics` 聚合一致。
 
 #### Scenario: 首帧可见且数值精确
 
@@ -25,7 +25,7 @@
 
 ### Requirement: 事件 Inspector 与实时流
 
-系统 SHALL 提供 `GET /_admin/events?limit&kind&upstream&verdict` 的环形缓冲视图（数据源仅 `recent_events`，`audit.log` 仅作 `raw-tail` 排障，不 merge）以及 `GET /_admin/events/stream` 的 SSE 实时推送（鉴权三选一严格优先级 `X-Admin-Token` 头优先 > `Cookie: __Host-admin_token`（`HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=3600`）> `?access_token` 查询参数仅作 `EventSource` 兼容回退且仅限 SSE，日志掩码 `access_token`，`history.replaceState` 清 URL）；事件 SHALL 仅含脱敏摘要（`redact_summary(raw,120)` 先脱敏后 `truncate(120)` 的 `[REDACTED:<kind>]` 单一路径，PII 明文不落 `recent_events` 与 SSE），不含明文；点击事件 SHALL 可查看 `request_id` 级摘要（命中类型、上游、tokens、verdict、延迟）。首版 SHALL 不注册 `GET /_admin/metrics/prometheus`（请求返回 404）。
+系统 SHALL 提供 `GET /_admin/events?limit&kind&upstream&verdict` 的环形缓冲视图（数据源仅 `recent_events`，`audit.log` 仅作 `raw-tail` 排障，不 merge）以及 `GET /_admin/events/stream` 的 SSE 实时推送（鉴权三选一严格优先级 `X-Admin-Token` 头优先 > `Cookie: __Host-admin_token`（`HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=3600`）> `?access_token` 查询参数仅作 `EventSource` 兼容回退且仅限 SSE，日志掩码 `access_token`，`history.replaceState` 清 URL，且 `GET /_admin/metrics` / `/_admin/events` 带 `?access_token` SHALL 返回 `401`）；事件 SHALL 仅含脱敏摘要（`redact_summary(raw,120)` 先脱敏后 `truncate(120)` 的 `[REDACTED:<kind>]` 单一路径，PII 明文不落 `recent_events` 与 SSE），不含明文；点击事件 SHALL 可查看 `request_id` 级摘要（命中类型、上游、tokens、verdict、延迟）。首版 SHALL 不注册 `GET /_admin/metrics/prometheus`（请求返回 404）。
 
 #### Scenario: 事件可过滤可追溯
 
@@ -40,7 +40,7 @@
 #### Scenario: SSE 兼容鉴权
 
 - **WHEN** 浏览器原生 `EventSource` 无法携带自定义头（`X-Admin-Token`）
-- **THEN** 携带 `Cookie` 的 SSE 请求返回 200 流，仅回退时带 `?access_token` 亦返回 200；无任何凭证的 SSE 返回 401 且不推送数据
+- **THEN** 携带 `Cookie` 的 SSE 请求返回 200 流，仅回退时带 `?access_token` 亦返回 200；无任何凭证的 SSE 返回 401 且不推送数据；`GET /_admin/metrics?access_token=x` 与 `GET /_admin/events?access_token=x` 返回 401（非 SSE 带 `?access_token` 拒）
 
 ### Requirement: 健康检查
 
