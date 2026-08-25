@@ -1698,6 +1698,9 @@ class LlmMixin(AuditMixin):
 
                                         payload = line[5:]
                                         payload = payload.removeprefix(' ')
+                                        # 空 data 行不计为有效事件，避免下游 JSONDecodeError (char 0)
+                                        if not payload.strip():
+                                            continue
 
                                         sse_event_count += 1
 
@@ -2533,6 +2536,9 @@ class LlmMixin(AuditMixin):
                                         if line.startswith('data:'):
                                             payload = line[5:]
                                             payload = payload.removeprefix(' ')
+                                            # 空 data 行不计为有效事件，避免下游 JSONDecodeError
+                                            if not payload.strip():
+                                                continue
 
                                             fast_sse_event_count += 1
 
@@ -2695,23 +2701,33 @@ class LlmMixin(AuditMixin):
                             'utf-8',
                             errors='replace',
                         )
-                        # 空体转 502：上游 200 却返回空体时，原逻辑会透传 200 空 JSON
+                        # 空体/非JSON 转 502：上游 200 却返回空体或非JSON时，原逻辑会透传 200 坏体
                         # 导致 Hermes OpenAI SDK 执行 response.json() → JSONDecodeError
                         # 重试 5 次仍 empty；改为 502 显式错误，便于观测与 failover
                         # 仅对话接口转 502，非对话（如 /v1/models）空体按原样透传
+                        _is_empty = not resp_text.strip()
+                        _is_invalid_json = False
+                        if not _is_empty:
+                            try:
+                                json.loads(resp_text)
+                            except json.JSONDecodeError:
+                                _is_invalid_json = True
                         if (
-                            not resp_text.strip()
+                            (_is_empty or _is_invalid_json)
                             and upstream_resp.status == 200
                             and tail.rstrip('/').endswith(
                                 ('chat/completions', 'v1/messages', 'v1/responses')
                             )
                         ):
                             logger.error(
-                                'LLM 上游空体转 502: %s %s status=%d '
+                                'LLM 上游空体/非JSON转 502: %s %s status=%d empty=%s invalid_json=%s len=%d '
                                 '(client would see JSONDecodeError)',
                                 request.method,
                                 target_url,
                                 upstream_resp.status,
+                                _is_empty,
+                                _is_invalid_json,
+                                len(resp_text),
                             )
                             return web.Response(
                                 body=json.dumps(
