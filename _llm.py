@@ -2721,13 +2721,28 @@ class LlmMixin(AuditMixin):
                                         'utf-8',
                                         errors='replace',
                                     )
-                                    restored = await self._pii_response_process(
-                                        residual, active_t2p
-                                    )
+                                    # JSON-aware: 残余可能为半行 JSON，走 json-aware 避免 \u 破坏
+                                    if hasattr(
+                                        self, '_pii_response_process_json_aware'
+                                    ):
+                                        restored = (
+                                            await self._pii_response_process_json_aware(
+                                                residual, active_t2p
+                                            )
+                                        )
+                                    else:
+                                        restored = await self._pii_response_process(
+                                            residual, active_t2p
+                                        )
                                     # 流末残余清理（Round 17 R4 收尾）：残余字节可能
                                     # 含分片切断的 token 前缀（__VG_C…/__PII_…），
                                     # _pii_response_process 不清理，这里统一剥除防泄漏。
-                                    restored = _strip_partials(restored)
+                                    try:
+                                        restored = _strip_token_forms_json_aware(
+                                            restored
+                                        )
+                                    except NameError:
+                                        restored = _strip_partials(restored)
                                     await _tracked_write(
                                         restored.encode('utf-8'),
                                     )
@@ -2947,17 +2962,32 @@ class LlmMixin(AuditMixin):
                                                 except json.JSONDecodeError:
                                                     pass
 
-                                            restored = 'data: ' + (
-                                                await self._pii_response_process(
+                                            # JSON-aware: data 载荷为 JSON 时走 loads→walk→dumps，避免 p@ss"quote/\u 破坏
+                                            if hasattr(
+                                                self, '_pii_response_process_json_aware'
+                                            ):
+                                                _restored_payload = await self._pii_response_process_json_aware(
                                                     payload, active_t2p
                                                 )
-                                            )
+                                            else:
+                                                _restored_payload = (
+                                                    await self._pii_response_process(
+                                                        payload, active_t2p
+                                                    )
+                                                )
+                                            restored = 'data: ' + _restored_payload
                                             await _tracked_write(
                                                 (restored + '\n').encode('utf-8'),
                                             )
                                         else:
+                                            # 非 data 行（event:/id:）走 SSE 行 JSON-aware
+                                            restored_line = (
+                                                await self._pii_process_sse_line(
+                                                    line, active_t2p
+                                                )
+                                            )
                                             await _tracked_write(
-                                                (line + '\n').encode('utf-8'),
+                                                (restored_line + '\n').encode('utf-8'),
                                             )
                                     # Trim processed portion
                                     if pos > 0:
@@ -2983,13 +3013,27 @@ class LlmMixin(AuditMixin):
                                         'utf-8',
                                         errors='replace',
                                     )
-                                    restored = await self._pii_response_process(
-                                        residual, active_t2p
-                                    )
+                                    if hasattr(
+                                        self, '_pii_response_process_json_aware'
+                                    ):
+                                        restored = (
+                                            await self._pii_response_process_json_aware(
+                                                residual, active_t2p
+                                            )
+                                        )
+                                    else:
+                                        restored = await self._pii_response_process(
+                                            residual, active_t2p
+                                        )
                                     # 流末残余清理（Round 17 R4 收尾）：残余字节可能
                                     # 含分片切断的 token 前缀（__VG_C…/__PII_…），
                                     # _pii_response_process 不清理，这里统一剥除防泄漏。
-                                    restored = _strip_partials(restored)
+                                    try:
+                                        restored = _strip_token_forms_json_aware(
+                                            restored
+                                        )
+                                    except NameError:
+                                        restored = _strip_partials(restored)
                                     await _tracked_write(
                                         restored.encode('utf-8'),
                                     )
