@@ -138,6 +138,71 @@ def _append_jsonl_line(path: str, line: str) -> None:
         f.write(line + '\n')
 
 
+# === DEBUG 调试增强：原版/脱敏请求、原版/恢复回复四份落盘 ===
+def _debug_dir_for_req(req_id: str) -> str:
+    return os.path.join(_DEBUG_DIR, f'req_{req_id}')
+
+
+def _save_debug_bytes(req_id: str, filename: str, data: bytes) -> None:
+    if not _DEBUG_DIR or data is None:
+        return
+    path = os.path.join(_debug_dir_for_req(req_id), filename)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as f:
+            f.write(data)
+    except OSError as exc:
+        logger.debug('保存调试文件失败 %s: %s', filename, exc)
+
+
+def _save_debug_text(req_id: str, filename: str, text: str) -> None:
+    if not _DEBUG_DIR or text is None:
+        return
+    path = os.path.join(_debug_dir_for_req(req_id), filename)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text)
+    except OSError as exc:
+        logger.debug('保存调试文件失败 %s: %s', filename, exc)
+
+
+def _save_debug_json(req_id: str, filename: str, obj) -> None:
+    if not _DEBUG_DIR:
+        return
+    try:
+        txt = json.dumps(obj, ensure_ascii=False, indent=2)
+    except Exception:
+        txt = str(obj)
+    _save_debug_text(req_id, filename, txt)
+
+
+async def _debug_append_line(req_id: str, filename: str, line: str) -> None:
+    if not _DEBUG_DIR:
+        return
+    path = os.path.join(_debug_dir_for_req(req_id), filename)
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _append_jsonl_line, path, line)
+
+
+def _debug_link_conv_id(req_id: str, conv_id: str, out_body: bytes) -> None:
+    if not _DEBUG_DIR or not conv_id:
+        return
+    try:
+        req_dir = _debug_dir_for_req(req_id)
+        conv_dir = os.path.join(_DEBUG_DIR, conv_id)
+        os.makedirs(conv_dir, exist_ok=True)
+        with open(os.path.join(req_dir, 'conv_id.txt'), 'w', encoding='utf-8') as f:
+            f.write(conv_id)
+        with open(os.path.join(conv_dir, 'req_id.txt'), 'w', encoding='utf-8') as f:
+            f.write(req_id)
+        if out_body:
+            with open(os.path.join(conv_dir, 'request.json'), 'wb') as f:
+                f.write(out_body)
+    except OSError as exc:
+        logger.debug('保存conv_id映射失败: %s', exc)
+
+
 def _mk_sse_event(
     content: str = '',
     finish_reason: str | None = None,
@@ -1497,6 +1562,34 @@ class LlmMixin(AuditMixin):
                 or tail.rstrip('/').endswith('v1/responses')
             )
             _debug_saved = False  # 标记是否已在 SSE 响应中保存过
+            # === DEBUG: 原版请求 + meta 立即落盘（早于脱敏，便于对比） ===
+            if _debug_save_eligible:
+                try:
+                    _save_debug_bytes(req_id, 'request_original.json', body)
+                    _save_debug_json(
+                        req_id,
+                        'request_meta.json',
+                        {
+                            'req_id': req_id,
+                            'tail': tail,
+                            'target_url': target_url,
+                            'method': request.method,
+                            'timestamp': __import__('datetime')
+                            .datetime.now(__import__('datetime').timezone.utc)
+                            .isoformat(),
+                            'headers': {
+                                k: v
+                                for k, v in request.headers.items()
+                                if k.lower()
+                                not in ('authorization', 'x-api-key', 'cookie')
+                            },
+                            'query_string': request.query_string,
+                            'body_len': len(body) if body else 0,
+                            'eligible': True,
+                        },
+                    )
+                except Exception as exc:
+                    logger.debug('保存原版请求失败: %s', exc)
 
             # 拍快照防 "forget secrets" 竞态（需持锁，防快照不一致）
             async with self._lock:
@@ -1534,6 +1627,14 @@ class LlmMixin(AuditMixin):
                 out_body = body
                 active_t2p = {}
                 pii_scope = None
+
+            # === DEBUG: 脱敏后请求落盘（与原版对比） ===
+            if _debug_save_eligible:
+                try:
+                    _save_debug_bytes(req_id, 'request_redacted.json', out_body)
+                    _save_debug_bytes(req_id, 'request.json', out_body)
+                except Exception as exc:
+                    logger.debug('保存脱敏请求失败: %s', exc)
 
             # 透传 Hermes headers（过滤逐跳头）
             headers = filter_hop_headers(dict(request.headers))
@@ -1602,6 +1703,17 @@ class LlmMixin(AuditMixin):
                             ),
                         )
                         await resp.prepare(request)
+                        if tail.rstrip('/').endswith(
+                            ('chat/completions', 'v1/messages', 'v1/responses')
+                        ):
+                            logger.info(
+                                'LLM 流式开始: %s %s tail=%s ct=%s status=%d',
+                                request.method,
+                                target_url,
+                                tail,
+                                content_type,
+                                upstream_resp.status,
+                            )
 
                         if active_t2p or self._pii_active() or self.audit_enabled():
                             # ── JSON-aware 流式 token 还原（广义 Plan C） ──
@@ -1623,6 +1735,17 @@ class LlmMixin(AuditMixin):
                                 nonlocal bytes_written
                                 await resp.write(data)
                                 bytes_written += len(data)
+                                if _debug_save_eligible:
+                                    try:
+                                        txt = data.decode('utf-8', errors='replace')
+                                        for _line in txt.splitlines():
+                                            if _line.strip() == '':
+                                                continue
+                                            await _debug_append_line(
+                                                req_id, 'response_restored.jsonl', _line
+                                            )
+                                    except Exception as exc:
+                                        logger.debug('保存下游恢复日志失败: %s', exc)
 
                             # OpenAI chat/completions tool_calls 分片累积：
                             # index → {'name': str, 'arguments': str}
@@ -1703,6 +1826,17 @@ class LlmMixin(AuditMixin):
                                             continue
 
                                         sse_event_count += 1
+                                        if _debug_save_eligible:
+                                            try:
+                                                await _debug_append_line(
+                                                    req_id,
+                                                    'response_original.jsonl',
+                                                    payload,
+                                                )
+                                            except Exception as exc:
+                                                logger.debug(
+                                                    '保存上游原版日志失败: %s', exc
+                                                )
 
                                         # [DONE] 标记：先 flush 累积内容
                                         if payload.strip() == '[DONE]':
@@ -1829,6 +1963,22 @@ class LlmMixin(AuditMixin):
                                                     resp_log_path,
                                                     payload,
                                                 )
+                                            # DEBUG: 已在上游原版落盘，此处补充 conv_id 映射（若首次）
+                                            if (
+                                                _debug_save_eligible
+                                                and not _debug_saved
+                                            ):
+                                                try:
+                                                    _tmp_parsed = json.loads(payload)
+                                                    _tmp_cid = _extract_conv_id(
+                                                        _tmp_parsed
+                                                    )
+                                                    if _tmp_cid:
+                                                        _debug_link_conv_id(
+                                                            req_id, _tmp_cid, out_body
+                                                        )
+                                                except Exception:
+                                                    pass
 
                                             # 首次成功解析 SSE data 时提取 conversation ID 保存原始请求
                                             if (
@@ -1839,6 +1989,9 @@ class LlmMixin(AuditMixin):
                                                 if conv_id:
                                                     _save_request_body(
                                                         conv_id, out_body
+                                                    )
+                                                    _debug_link_conv_id(
+                                                        req_id, conv_id, out_body
                                                     )
                                                     _debug_saved = True
                                                     resp_log_path = os.path.join(
@@ -2502,6 +2655,39 @@ class LlmMixin(AuditMixin):
                                 logger.debug(
                                     'SSE write_eof 失败，客户端已断连',
                                 )
+                            if tail.rstrip('/').endswith(
+                                ('chat/completions', 'v1/messages', 'v1/responses')
+                            ):
+                                logger.info(
+                                    'LLM 流式结束(slow): %s %s status=%d sse_events=%d bytes_written=%d tail=%s',
+                                    request.method,
+                                    target_url,
+                                    upstream_resp.status,
+                                    sse_event_count,
+                                    bytes_written,
+                                    tail,
+                                )
+                            if _debug_save_eligible:
+                                try:
+                                    _save_debug_json(
+                                        req_id,
+                                        'stream_meta.json',
+                                        {
+                                            'mode': 'slow',
+                                            'status': upstream_resp.status,
+                                            'sse_events': sse_event_count,
+                                            'bytes_written': bytes_written,
+                                            'tail': tail,
+                                            'target_url': target_url,
+                                            'is_responses': is_responses_stream,
+                                            'is_anthropic': is_anthropic_stream,
+                                            'audit_block_injected': audit_block_injected,
+                                            'tool_calls_blocked': tool_calls_blocked,
+                                            'bytes_buf_len': len(byte_buf),
+                                        },
+                                    )
+                                except Exception as exc:
+                                    logger.debug('保存流式meta失败: %s', exc)
                         else:
                             # ── Fast path: active_t2p 为空，逐行 text-level 还原 ──
                             byte_buf = bytearray()
@@ -2513,6 +2699,19 @@ class LlmMixin(AuditMixin):
                                 nonlocal fast_bytes_written
                                 await resp.write(data)
                                 fast_bytes_written += len(data)
+                                if _debug_save_eligible:
+                                    try:
+                                        txt = data.decode('utf-8', errors='replace')
+                                        for _line in txt.splitlines():
+                                            if _line.strip() == '':
+                                                continue
+                                            await _debug_append_line(
+                                                req_id, 'response_restored.jsonl', _line
+                                            )
+                                    except Exception as exc:
+                                        logger.debug(
+                                            '保存下游恢复日志失败(fast): %s', exc
+                                        )
 
                             try:
                                 async for chunk in upstream_resp.content.iter_chunked(
@@ -2541,6 +2740,18 @@ class LlmMixin(AuditMixin):
                                                 continue
 
                                             fast_sse_event_count += 1
+                                            if _debug_save_eligible:
+                                                try:
+                                                    await _debug_append_line(
+                                                        req_id,
+                                                        'response_original.jsonl',
+                                                        payload,
+                                                    )
+                                                except Exception as exc:
+                                                    logger.debug(
+                                                        '保存上游原版日志失败(fast): %s',
+                                                        exc,
+                                                    )
 
                                             if resp_log_path:
                                                 # 后续 event 保存 response 行
@@ -2560,6 +2771,9 @@ class LlmMixin(AuditMixin):
                                                     if _cid:
                                                         _save_request_body(
                                                             _cid, out_body
+                                                        )
+                                                        _debug_link_conv_id(
+                                                            req_id, _cid, out_body
                                                         )
                                                         _debug_saved = True
                                                         resp_log_path = os.path.join(
@@ -2655,10 +2869,58 @@ class LlmMixin(AuditMixin):
                                 logger.debug(
                                     'SSE write_eof 失败，客户端已断连',
                                 )
+                            if tail.rstrip('/').endswith(
+                                ('chat/completions', 'v1/messages', 'v1/responses')
+                            ):
+                                logger.info(
+                                    'LLM 流式结束(fast): %s %s status=%d sse_events=%d bytes_written=%d tail=%s',
+                                    request.method,
+                                    target_url,
+                                    upstream_resp.status,
+                                    fast_sse_event_count,
+                                    fast_bytes_written,
+                                    tail,
+                                )
+                            if _debug_save_eligible:
+                                try:
+                                    _save_debug_json(
+                                        req_id,
+                                        'stream_meta.json',
+                                        {
+                                            'mode': 'fast',
+                                            'status': upstream_resp.status,
+                                            'sse_events': fast_sse_event_count,
+                                            'bytes_written': fast_bytes_written,
+                                            'tail': tail,
+                                            'target_url': target_url,
+                                        },
+                                    )
+                                except Exception as exc:
+                                    logger.debug('保存流式meta失败(fast): %s', exc)
                         return resp
                     else:
                         # ── 非流式 ──
                         resp_body = await upstream_resp.read()
+                        # === DEBUG: 非流式原版回复落盘 ===
+                        if _debug_save_eligible:
+                            try:
+                                _save_debug_bytes(
+                                    req_id, 'response_original.json', resp_body
+                                )
+                                _save_debug_json(
+                                    req_id,
+                                    'response_original_meta.json',
+                                    {
+                                        'status': upstream_resp.status,
+                                        'headers': dict(upstream_resp.headers),
+                                        'len': len(resp_body),
+                                        'content_type': upstream_resp.headers.get(
+                                            'Content-Type', ''
+                                        ),
+                                    },
+                                )
+                            except Exception as exc:
+                                logger.debug('保存非流式原版回复失败: %s', exc)
 
                         if (
                             not resp_body
@@ -2683,6 +2945,7 @@ class LlmMixin(AuditMixin):
                                 conv_id = resp_json.get('id')
                                 if conv_id:
                                     _save_request_body(conv_id, out_body)
+                                    _debug_link_conv_id(req_id, conv_id, out_body)
                                     _debug_saved = True
                                     # 非流式 response 写为完整 response.json
                                     resp_path = os.path.join(
@@ -2712,6 +2975,21 @@ class LlmMixin(AuditMixin):
                                 json.loads(resp_text)
                             except json.JSONDecodeError:
                                 _is_invalid_json = True
+                        # DEBUG: 0.9.8 后仍出现 JSONDecodeError 的诊断日志（临时）
+                        if tail.rstrip('/').endswith(
+                            ('chat/completions', 'v1/messages', 'v1/responses')
+                        ):
+                            logger.info(
+                                'LLM 非流式响应诊断: %s %s status=%d empty=%s invalid=%s len=%d tail=%s ct=%s',
+                                request.method,
+                                target_url,
+                                upstream_resp.status,
+                                _is_empty,
+                                _is_invalid_json,
+                                len(resp_text),
+                                tail,
+                                upstream_resp.headers.get('Content-Type', ''),
+                            )
                         if (
                             (_is_empty or _is_invalid_json)
                             and upstream_resp.status == 200
@@ -2831,6 +3109,29 @@ class LlmMixin(AuditMixin):
                         #  审查补充：与流式 _split_safe_hold 语义对齐，
                         #  用 _strip_token_forms 一并剥离完整幻觉 token）
                         out_text = _strip_token_forms(out_text)
+                        if tail.rstrip('/').endswith(
+                            ('chat/completions', 'v1/messages', 'v1/responses')
+                        ):
+                            logger.info(
+                                'LLM 剥离后诊断: %s %s status=%d empty_after_strip=%s out_len=%d tail=%s',
+                                request.method,
+                                target_url,
+                                upstream_resp.status,
+                                not out_text.strip(),
+                                len(out_text),
+                                tail,
+                            )
+                        # === DEBUG: 非流式恢复后回复落盘 ===
+                        if _debug_save_eligible:
+                            try:
+                                _save_debug_text(
+                                    req_id, 'response_restored.json', out_text
+                                )
+                                _save_debug_text(
+                                    req_id, 'response_original_decoded.json', resp_text
+                                )
+                            except Exception as exc:
+                                logger.debug('保存非流式恢复回复失败: %s', exc)
                         if (
                             not out_text.strip()
                             and upstream_resp.status == 200
@@ -2863,6 +3164,16 @@ class LlmMixin(AuditMixin):
             except Exception:
                 if _debug_save_eligible and not _debug_saved:
                     _save_request_body(f'failed-{req_id}', out_body)
+                    _save_debug_json(
+                        req_id,
+                        'exception.json',
+                        {
+                            'error': 'upstream_failed',
+                            'target_url': target_url,
+                            'tail': tail,
+                            'method': request.method,
+                        },
+                    )
                 logger.exception(
                     'LLM 上游请求失败: %s %s',
                     request.method,
