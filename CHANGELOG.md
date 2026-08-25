@@ -1,5 +1,7 @@
 # Changelog
 
+- **v0.9.13** — 细化流末 `byte_buf` 残余的 JSON-aware：`data:` 前缀残余走 `SSE 行级` `_pii_process_sse_line`，裸 JSON 片段走 `payload 级` `_pii_response_process_json_aware`，避免 `data: {JSON}` 残余在 `payload 级` 回退 `plain` 时的 `p@ss"quote`/`\u` 破坏；与 `v0.9.12` 的快路径 `data:`/`event:` 修复互补
+
 - **v0.9.12** — 补全剩余流式 JSON-aware 遗漏：`_llm` 快路径 `data:` 载荷与 `event:`/`id:` 非 data 行改走 `_pii_response_process_json_aware`/`_pii_process_sse_line`，`byte_buf` 流末残余双路径（slow/fast）改走 `json-aware` 且残余清理改用 `_strip_token_forms_json_aware`，修复 `p@ss"quote`/`\u`/`\` 在 fast/残余路径的未转义导致 `Expecting value: line 1 column 1 (char 0)` 空体误判；沿用 `len>1M`/`depth>5` 守卫与 `safe/pending` 分割
 
 - **v0.9.11** — 补全增量 JSON-aware 遗漏：`_llm._flush_anthropic_buf/_flush_responses_buf` 与增量 `arg_buf`（`response.function_call_arguments.delta` / `input_json_delta.partial_json`）改走 `_pii_response_process_json_aware`（覆盖 `p@ss"quote`/`\u` 等特殊字符，片段不完整时自动回退 plain 且 safe/pending 分割保持），修复完整 `arg_buf` 的 `{"key":"p@ss"quote"}` 未转义导致 `Expecting ',' delimiter` 闭环；继续沿用 `len>1M` 与 `depth>5` 守卫

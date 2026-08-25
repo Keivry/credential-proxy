@@ -2721,8 +2721,15 @@ class LlmMixin(AuditMixin):
                                         'utf-8',
                                         errors='replace',
                                     )
-                                    # JSON-aware: 残余可能为半行 JSON，走 json-aware 避免 \u 破坏
-                                    if hasattr(
+                                    # JSON-aware: 残余可能为半行 SSE (data: {JSON}) 或
+                                    # 裸 JSON 片段；data: 前缀走 SSE 行级 json-aware，
+                                    # 否则走 payload 级 json-aware，避免 \u/p@ss"quote 破坏。
+                                    _residual_stripped = residual.lstrip()
+                                    if _residual_stripped.startswith('data:'):
+                                        restored = await self._pii_process_sse_line(
+                                            residual, active_t2p
+                                        )
+                                    elif hasattr(
                                         self, '_pii_response_process_json_aware'
                                     ):
                                         restored = (
@@ -3013,7 +3020,12 @@ class LlmMixin(AuditMixin):
                                         'utf-8',
                                         errors='replace',
                                     )
-                                    if hasattr(
+                                    _residual_stripped = residual.lstrip()
+                                    if _residual_stripped.startswith('data:'):
+                                        restored = await self._pii_process_sse_line(
+                                            residual, active_t2p
+                                        )
+                                    elif hasattr(
                                         self, '_pii_response_process_json_aware'
                                     ):
                                         restored = (
