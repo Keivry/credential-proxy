@@ -1,5 +1,7 @@
 # Changelog
 
+- **v0.9.14** — 移除 `>1M` 纯文本回退：`_llm._pii_response_process_json_aware` 与 `_pii_process_sse_line` 及 `_token._restore_json_aware` 的 `len>1M` 守门改走 JSON-aware（大负载仍 `loads→walk→dumps(ensure_ascii=False)` 正确转义 `p@ss"quote`/`\u`/`\`/`\n`/`emoji`），修复 `>1M` 裸 JSON 经 `plain str.replace` 未转义导致 `Expecting ',' delimiter / Invalid \escape` 的 P0 潜伏；`_strip_token_forms_json_aware` 剥离为空安全保留 1M 守卫
+
 - **v0.9.13** — 细化流末 `byte_buf` 残余的 JSON-aware：`data:` 前缀残余走 `SSE 行级` `_pii_process_sse_line`，裸 JSON 片段走 `payload 级` `_pii_response_process_json_aware`，避免 `data: {JSON}` 残余在 `payload 级` 回退 `plain` 时的 `p@ss"quote`/`\u` 破坏；与 `v0.9.12` 的快路径 `data:`/`event:` 修复互补
 
 - **v0.9.12** — 补全剩余流式 JSON-aware 遗漏：`_llm` 快路径 `data:` 载荷与 `event:`/`id:` 非 data 行改走 `_pii_response_process_json_aware`/`_pii_process_sse_line`，`byte_buf` 流末残余双路径（slow/fast）改走 `json-aware` 且残余清理改用 `_strip_token_forms_json_aware`，修复 `p@ss"quote`/`\u`/`\` 在 fast/残余路径的未转义导致 `Expecting value: line 1 column 1 (char 0)` 空体误判；沿用 `len>1M`/`depth>5` 守卫与 `safe/pending` 分割

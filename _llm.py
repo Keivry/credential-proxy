@@ -1012,8 +1012,6 @@ class LlmMixin(AuditMixin):
         - 叶字符串若本身为 JSON 文本（BOM 剥离后为 { / [ 且可解析为 dict/list），
           则对内层同 walk 后 dumps，失败回退 plain。
         """
-        if len(text) > 1_048_576:
-            return await self._pii_response_process(text, active_t2p)
         stripped = text.lstrip('\ufeff').lstrip()
         if not (stripped.startswith(('{', '['))):
             return await self._pii_response_process(text, active_t2p)
@@ -1083,8 +1081,6 @@ class LlmMixin(AuditMixin):
         try:
             payload = line.split(':', 1)[1].lstrip(' \t')
         except Exception:
-            return await self._pii_response_process(line, active_t2p)
-        if len(payload) > 1_048_576:
             return await self._pii_response_process(line, active_t2p)
         stripped_payload = payload.lstrip('\ufeff').strip()
         if stripped_payload in ('', '[DONE]'):

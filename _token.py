@@ -406,8 +406,6 @@ class TokenMixin:
         )
         if not mapping:
             return text
-        if len(text) > 1_048_576:
-            return self._restore(text, token_to_pwd)
         stripped = text.lstrip('\ufeff').lstrip()
         if not (stripped.startswith(('{', '['))):
             return self._restore(text, token_to_pwd)

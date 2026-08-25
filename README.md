@@ -291,7 +291,7 @@ cd get && make build  # → /tmp/get-credential-linux-amd64
 
 ## 版本历史
 
-- **v0.9.13** — 细化 `byte_buf` 残余 `data:` 前缀走 SSE 行级 `json-aware`，避免残余 `plain` 回退破坏
+- **v0.9.14** — 细化 `byte_buf` 残余 `data:` 前缀走 SSE 行级 `json-aware`，避免残余 `plain` 回退破坏
 - **v0.9.12** — 补全剩余流式 JSON-aware 遗漏：快路径 `data:`/`event:` 与 `byte_buf` 残余双路径改走 `json-aware` 且残余清理改用 `_strip_token_forms_json_aware`，修复 `p@ss"quote`/`\u` 在 fast/残余路径的 `Expecting value: line 1 column 1 (char 0)` 闭环
 - **v0.9.11** — 补全增量 JSON-aware 遗漏：`_llm._flush_anthropic_buf/_flush_responses_buf` 与增量 `arg_buf`（`response.function_call_arguments.delta`/`input_json_delta.partial_json`）改走 `_pii_response_process_json_aware`，覆盖完整 `arg_buf` 的 `p@ss"quote`/`\u` 等特殊字符，片段不完整时自动回退 plain，修复 `{"key":"p@ss"quote"}` 未转义导致 `Expecting ',' delimiter` 闭环；继续沿用 `len>1M`/`depth>5` 守卫 + safe/pending 分割
 - **v0.9.10** — 修复嵌套 JSON 串的脱敏还原破坏：① `_token.py:_cred_json_walk` 与 `_pii.py:_pii_json_walk` 的叶字符串若本身为 JSON（`lstrip("\ufeff")` 后 `strip` 再判 `{`/`[` 且可 `loads` 为 `dict/list`）则对内层同 walk 后 `dumps(ensure_ascii=False, separators=(',',':'))` 回写，覆盖 `tool_calls.arguments` 等 `stringified JSON` 场景；② `_llm.py` 新增 `_pii_process_sse_line` 对 `data: {JSON}` 行按 `split(":",1)` 剥离前缀后对 `payload.lstrip("\ufeff")` 做 JSON-aware（含嵌套与 BOM），`[DONE]`/空行早退，`data:[DONE]`/`data:  ` 多空格兼容，替换 slow path 的 `data:` 行（含 `tool_calls_pending_events`、`_flush_*` 透传行、续行重建 `sanitized`）；③ 非流式整包嵌套由 walk 层递归覆盖，不另做外层二次 `loads`；④ BOM `\ufeff` 统一剥离（外层 `lstrip("\ufeff").lstrip()`），半行残余仅 best-effort；⑤ `separators=(',',':')` 与 `ensure_ascii=False` 的空白压缩/`\uXXXX`→明文属语义等价，非字节级保持（已在 spec 显式契约）；新增 7 个回归用例（嵌套 `p@ss"quote`/`\u`/`\` + BOM + DONE 变体 + 语义等价）
