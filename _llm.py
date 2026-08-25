@@ -368,6 +368,38 @@ def _strip_token_forms(content: str) -> str:
     return _strip_partials(out)
 
 
+def _strip_token_forms_json_aware(content: str) -> str:
+    """JSON 感知的残留 token 清理：仅对字符串节点做剥离，避免破坏 \\u 转义。
+
+    - 若 content 是合法 JSON（object/array），则 loads 后递归 walk 字符串值，
+      逐个调用 _strip_token_forms，再 dumps(ensure_ascii=False) 回写；
+    - 非 JSON 或解析失败回退到纯文本 _strip_token_forms。
+    """
+    stripped = content.lstrip()
+    if not (stripped.startswith(('{', '['))):
+        return _strip_token_forms(content)
+    try:
+        obj = json.loads(content)
+    except Exception:
+        return _strip_token_forms(content)
+
+    def _walk(node):
+        if isinstance(node, str):
+            return _strip_token_forms(node)
+        if isinstance(node, dict):
+            return {k: _walk(v) for k, v in node.items()}
+        if isinstance(node, list):
+            return [_walk(x) for x in node]
+        return node
+
+    try:
+        cleaned = _walk(obj)
+        return json.dumps(cleaned, ensure_ascii=False, separators=(',', ':'))
+    except Exception:
+        logger.debug('_strip_token_forms_json_aware 回退', exc_info=True)
+        return _strip_token_forms(content)
+
+
 def _split_safe_hold(content: str, active_t2p: dict, pii_scope=None) -> tuple[str, str]:
     """将累积文本分割为 (safe, hold)。
 
@@ -950,6 +982,53 @@ class LlmMixin(AuditMixin):
             return self._restore(text, active_t2p)
         restored, restored_spans = self._pii_restore(text, active_t2p, scope)
         return await self._pii_response_scan(restored, restored_spans, scope)
+
+    async def _pii_response_process_json_aware(
+        self,
+        text: str,
+        active_t2p: dict,
+    ) -> str:
+        """JSON 感知的响应侧处理：仅对字符串节点做还原+检测，避免破坏 \\u 转义。
+
+        - 若 text 是合法 JSON（object/array），则 loads 后递归 walk 字符串值，
+          逐个调用 _pii_restore + _pii_response_scan，再 dumps(ensure_ascii=False)；
+        - 非 JSON 或解析失败回退到纯文本 _pii_response_process。
+        - 凭据还原走 _restore_json_aware 路径（字符串节点级），PII 检测同理。
+        """
+        stripped = text.lstrip()
+        if not (stripped.startswith(('{', '['))):
+            return await self._pii_response_process(text, active_t2p)
+        try:
+            obj = json.loads(text)
+        except Exception:
+            return await self._pii_response_process(text, active_t2p)
+        scope = self._pii_scope_or_none()
+
+        async def _walk(node):
+            if isinstance(node, str):
+                if scope is None:
+                    # 无 PII：仅凭据还原（JSON 感知）
+                    if hasattr(self, '_restore_json_aware'):
+                        # _restore_json_aware 内部会 walk，这里直接对单 leaf 用 _restore
+                        return self._restore(node, active_t2p)
+                    return self._restore(node, active_t2p)
+                restored, spans = self._pii_restore(node, active_t2p, scope)
+                return await self._pii_response_scan(restored, spans, scope)
+            if isinstance(node, dict):
+                out = {}
+                for k, v in node.items():
+                    out[k] = await _walk(v)
+                return out
+            if isinstance(node, list):
+                return [await _walk(x) for x in node]
+            return node
+
+        try:
+            new_obj = await _walk(obj)
+            return json.dumps(new_obj, ensure_ascii=False, separators=(',', ':'))
+        except Exception:
+            logger.debug('_pii_response_process_json_aware 回退', exc_info=True)
+            return await self._pii_response_process(text, active_t2p)
 
     # ── Anthropic Messages API SSE 事件处理 ──
 
@@ -1599,10 +1678,19 @@ class LlmMixin(AuditMixin):
             if body_text:
                 # PII 请求侧脱敏（在凭据 redact 前，PII_REDACTION_ENABLED 时）：
                 # 检测 PII → 注册请求级映射 → 替换为 __PII_*__ 占位符
+                # JSON-aware：仅对字符串节点替换，避免纯文本替换破坏 \u 转义（Invalid \escape）
                 if getattr(self, 'pii_enabled', False):
                     self._pii_request_scope()
-                    body_text = await self.pii_redact(body_text)
-                out_body = self._redact(body_text, snapshot_p2t).encode('utf-8')
+                    if hasattr(self, 'pii_redact_json_aware'):
+                        body_text = await self.pii_redact_json_aware(body_text)
+                    else:
+                        body_text = await self.pii_redact(body_text)
+                if hasattr(self, '_redact_json_aware'):
+                    out_body = self._redact_json_aware(body_text, snapshot_p2t).encode(
+                        'utf-8'
+                    )
+                else:
+                    out_body = self._redact(body_text, snapshot_p2t).encode('utf-8')
                 # 快速路径：无 token 时不扫描（门控扩展：PII token 同样触发还原路径）
                 pii_scope = self._pii_scope_or_none()
                 has_cred = snapshot_t2p and b'__VG_CRED_' in out_body
@@ -1978,7 +2066,10 @@ class LlmMixin(AuditMixin):
                                                             req_id, _tmp_cid, out_body
                                                         )
                                                 except Exception:
-                                                    pass
+                                                    logger.debug(
+                                                        '解析临时 payload 失败',
+                                                        exc_info=True,
+                                                    )
 
                                             # 首次成功解析 SSE data 时提取 conversation ID 保存原始请求
                                             if (
@@ -3101,14 +3192,24 @@ class LlmMixin(AuditMixin):
                                     dict(upstream_resp.headers),
                                 ),
                             )
-                        out_text = await self._pii_response_process(
-                            resp_text, active_t2p
-                        )
+                        # JSON-aware：仅对字符串节点做还原/检测，避免纯文本替换破坏 \\u 转义（Invalid \\escape）
+                        if hasattr(self, '_pii_response_process_json_aware'):
+                            out_text = await self._pii_response_process_json_aware(
+                                resp_text, active_t2p
+                            )
+                        else:
+                            out_text = await self._pii_response_process(
+                                resp_text, active_t2p
+                            )
                         # 非流式整包：还原后统一清理残缺/完整幻觉 token 形态
                         # （Round 17 R4：非流式出口缺 _strip_partials；
                         #  审查补充：与流式 _split_safe_hold 语义对齐，
                         #  用 _strip_token_forms 一并剥离完整幻觉 token）
-                        out_text = _strip_token_forms(out_text)
+                        # JSON-aware 清理：仅对字符串节点剥离，避免破坏 \\u
+                        try:
+                            out_text = _strip_token_forms_json_aware(out_text)
+                        except NameError:
+                            out_text = _strip_token_forms(out_text)
                         if tail.rstrip('/').endswith(
                             ('chat/completions', 'v1/messages', 'v1/responses')
                         ):

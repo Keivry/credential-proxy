@@ -14,6 +14,7 @@
 import asyncio
 import contextlib
 import ipaddress as _ipaddress
+import json as _json
 import logging
 import os
 import re as _re
@@ -33,6 +34,24 @@ PII_RE_DOS_BUDGET = 0.1  # 自定义正则单规则超时预算 100ms
 PII_RE_DOS_MAX_WORKERS = 2  # 独立线程池（与日志写 run_in_executor 不同池）
 PII_RE_DOS_STRIKES = 3  # 连续超时 3 次临时停用
 PII_SCAN_INPUT_LIMIT = 1_048_576  # 单次扫描输入上限 1MB
+
+
+# ── JSON-aware 脱敏辅助（修复纯文本替换破坏 \u 转义的 Invalid \escape）──
+async def _pii_json_walk(obj, detector, credential_p2t, response_side):
+    """递归遍历 JSON 结构，仅对字符串节点做 PII 脱敏。"""
+    if isinstance(obj, str):
+        return await detector.detect_and_redact(obj, credential_p2t, response_side)
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            out[k] = await _pii_json_walk(v, detector, credential_p2t, response_side)
+        return out
+    if isinstance(obj, list):
+        return [
+            await _pii_json_walk(x, detector, credential_p2t, response_side)
+            for x in obj
+        ]
+    return obj
 
 
 # ═══════════════════════════════════════════════════════════
@@ -324,7 +343,7 @@ class PiiDetector:
             try:
                 sample = 'a' * 64
                 compiled.search(sample)
-            except Exception:  # noqa: BLE001 - 自检异常均拒绝加载（fail-closed）
+            except Exception:
                 logger.warning('自定义正则 %s 自检异常，拒绝加载', name)
                 continue
             new_items.append((name, compiled, pattern))
@@ -437,7 +456,7 @@ class PiiDetector:
                         name,
                         strikes,
                     )
-            except Exception as exc:  # noqa: BLE001 - 扫描异常跳过该规则（fail-open 必报）
+            except Exception as exc:
                 logger.warning('自定义正则 %s 扫描异常: %s，跳过', name, exc)
         return hits
 
@@ -766,3 +785,29 @@ class PiiMixin:
             credential_p2t=cred_p2t,
             response_side=response_side,
         )
+
+    async def pii_redact_json_aware(
+        self, text: str, response_side: bool = False
+    ) -> str:
+        """JSON 感知的 PII 脱敏：仅对字符串节点做替换，避免破坏 \\u 转义。
+
+        - 若 text 是合法 JSON（object/array），则 loads 后递归 walk 字符串值，逐个
+          调用 detect_and_redact，再 dumps(ensure_ascii=False) 回写；\n        - 非 JSON 或解析/序列化失败时回退到纯文本 pii_redact。\n"""
+        if not self.pii_enabled or not text:
+            return text
+        stripped = text.lstrip()
+        if not (stripped.startswith(('{', '['))):
+            return await self.pii_redact(text, response_side)
+        try:
+            obj = _json.loads(text)
+        except Exception:
+            return await self.pii_redact(text, response_side)
+        cred_p2t = getattr(self, 'pwd_to_token', None)
+        try:
+            redacted = await _pii_json_walk(
+                obj, self._pii_detector, cred_p2t, response_side
+            )
+            return _json.dumps(redacted, ensure_ascii=False, separators=(',', ':'))
+        except Exception:
+            logger.debug('pii_redact_json_aware 回退到纯文本路径', exc_info=True)
+            return await self.pii_redact(text, response_side)

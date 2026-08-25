@@ -93,7 +93,7 @@ class TestRequestSide:
         # 通过 ContextVar 清空 scope（LlmMixin property）
         try:
             proxy._pii_scope = None
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         body = '邮箱 zhangsan@example.com'
         out = await proxy.pii_redact(body)

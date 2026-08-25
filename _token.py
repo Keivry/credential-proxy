@@ -10,6 +10,7 @@ RequestScopedTokens 保留为兼容别名（指向 GlobalPiiTokens）。
 """
 
 import asyncio
+import json as _json
 import logging
 import re as _re
 import secrets
@@ -42,6 +43,17 @@ _PII_PARTIAL_TOKEN_RE = _re.compile(r'__PI(?:I(?:_(?:\d+_)?[0-9a-fA-F]*)?)?_*$')
 PII_MAX_ENTRIES = (
     1000  # 单表上限（pii/resp 各 1000，总量≤2000，真 LRU），与凭据 5000 区分
 )
+
+
+def _cred_json_walk(obj, redact_func):
+    """递归遍历 JSON 结构，仅对字符串节点调用 redact_func。"""
+    if isinstance(obj, str):
+        return redact_func(obj)
+    if isinstance(obj, dict):
+        return {k: _cred_json_walk(v, redact_func) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_cred_json_walk(x, redact_func) for x in obj]
+    return obj
 
 
 def _make_pii_token(seq: int, rand8: str) -> str:
@@ -290,6 +302,46 @@ class TokenMixin:
     def _redact_cache_repl_func(self, m):
         return self._redact_cache_repl.get(m.group(0), m.group(0))
 
+    def _redact_json_aware(self, text: str, pwd_to_token: dict | None = None) -> str:
+        """JSON 感知的凭据脱敏：仅对字符串节点做替换，避免破坏 \\u 转义。
+
+        - 若 text 是合法 JSON（object/array），则 loads 后递归 walk 字符串值，逐个
+          调用 _redact，再 dumps(ensure_ascii=False) 回写；\n        - 非 JSON 或解析/序列化失败时回退到纯文本 _redact。\n"""
+        _mapping = (
+            pwd_to_token
+            if pwd_to_token is not None
+            else getattr(self, 'pwd_to_token', None)
+        )
+        if not _mapping:
+            return text
+        stripped = text.lstrip()
+        if not (stripped.startswith(('{', '['))):
+            return self._redact(text, pwd_to_token)
+        try:
+            obj = _json.loads(text)
+        except Exception:
+            return self._redact(text, pwd_to_token)
+        # 为字符串节点构造单次编译的 redact 函数（显式 mapping 场景）
+        if pwd_to_token is not None:
+            items = sorted(_mapping.items(), key=lambda x: len(x[0]), reverse=True)
+            pat = _re.compile('|'.join(_re.escape(pwd) for pwd, _ in items))
+            repl = {pwd: token for pwd, token in _mapping.items()}
+
+            def _redact_str(s: str) -> str:
+                return pat.sub(lambda m: repl.get(m.group(0), m.group(0)), s)
+
+        else:
+
+            def _redact_str(s: str) -> str:
+                return self._redact(s, None)
+
+        try:
+            redacted = _cred_json_walk(obj, _redact_str)
+            return _json.dumps(redacted, ensure_ascii=False, separators=(',', ':'))
+        except Exception:
+            logger.debug('_redact_json_aware 回退到纯文本路径', exc_info=True)
+            return self._redact(text, pwd_to_token)
+
     def _restore(self, text: str, token_to_pwd: dict | None = None) -> str:
         """将 token 还原为原始密码。
 
@@ -319,3 +371,43 @@ class TokenMixin:
 
     def _restore_cache_repl_func(self, m):
         return self._restore_cache_repl.get(m.group(0), m.group(0))
+
+    def _restore_json_aware(self, text: str, token_to_pwd: dict | None = None) -> str:
+        """JSON 感知的凭据还原：仅对字符串节点做替换，避免破坏 \\u 转义。
+
+        - 若 text 是合法 JSON（object/array），则 loads 后递归 walk 字符串值，逐个
+          调用 _restore，再 dumps(ensure_ascii=False) 回写；
+        - 非 JSON 或解析/序列化失败时回退到纯文本 _restore。
+        """
+        mapping = (
+            token_to_pwd
+            if token_to_pwd is not None
+            else getattr(self, 'token_to_pwd', None)
+        )
+        if not mapping:
+            return text
+        stripped = text.lstrip()
+        if not (stripped.startswith(('{', '['))):
+            return self._restore(text, token_to_pwd)
+        try:
+            obj = _json.loads(text)
+        except Exception:
+            return self._restore(text, token_to_pwd)
+        if token_to_pwd is not None:
+            items = sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True)
+            pat = _re.compile('|'.join(_re.escape(tok) for tok, _ in items))
+
+            def _restore_str(s: str) -> str:
+                return pat.sub(lambda m: mapping.get(m.group(0), m.group(0)), s)
+
+        else:
+
+            def _restore_str(s: str) -> str:
+                return self._restore(s, None)
+
+        try:
+            restored = _cred_json_walk(obj, _restore_str)
+            return _json.dumps(restored, ensure_ascii=False, separators=(',', ':'))
+        except Exception:
+            logger.debug('_restore_json_aware 回退到纯文本路径', exc_info=True)
+            return self._restore(text, token_to_pwd)
