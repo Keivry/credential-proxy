@@ -18,6 +18,58 @@ from collections import OrderedDict
 
 logger = logging.getLogger('credential-proxy')
 
+# ── orjson 加速封装（有则用，无则回退 stdlib；行为保持 ensure_ascii=False, separators=(',',':') 语义等价）──
+try:
+    import orjson as _orjson  # type: ignore
+
+    _USE_ORJSON = True
+except ImportError:  # pragma: no cover - 回退路径
+    _orjson = None  # type: ignore
+    _USE_ORJSON = False
+
+
+def _jloads(s: str):  # noqa: D103
+    if _USE_ORJSON:
+        return _orjson.loads(s)  # type: ignore
+    return _json.loads(s)
+
+
+def _jdumps(obj) -> str:  # noqa: D103
+    if _USE_ORJSON:
+        return _orjson.dumps(obj).decode()  # type: ignore
+    return _json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
+
+
+def _validate_json_roundtrip(original: str, output: str, label: str) -> str:
+    """json-aware 后置校验：若原文本是合法 JSON，输出必须仍是合法 JSON。
+
+    失败时打 warning（带前后预览，便于 debug）并回退到原始文本，
+    保证下游不收到 JSONDecodeError。预览截断 4000 字符，避免超大体撑爆日志。
+    """
+    stripped = original.lstrip('\ufeff').lstrip()
+    if not (stripped.startswith('{') or stripped.startswith('[')):
+        return output
+    try:
+        _json.loads(original.lstrip('\ufeff'))
+    except Exception:
+        return output
+    try:
+        _json.loads(output.lstrip('\ufeff'))
+        return output
+    except Exception as exc:
+        logger.warning(
+            '%s json-aware broke JSON, fallback to original: error=%s '
+            'input_len=%d output_len=%d input_preview=%r output_preview=%r',
+            label,
+            exc,
+            len(original),
+            len(output),
+            original[:4000],
+            output[:4000],
+        )
+        return original
+
+
 TOKEN_PREFIX = '__VG_CRED_'
 TOKEN_SUFFIX = '__'
 MAX_TOKEN_ENTRIES = 5000
@@ -45,32 +97,75 @@ PII_MAX_ENTRIES = (
 )
 
 
-def _cred_json_walk(obj, redact_func, _depth: int = 0):
-    """递归遍历 JSON 结构，仅对字符串节点调用 redact_func。
+def _cred_json_walk(obj, redact_func, path: str = '$', _depth: int = 0):
+    """递归遍历 JSON 结构，仅对字符串节点调用 redact_func，叶子级最小回退。
 
     若叶字符串本身为 JSON 文本（lstrip BOM 后 strip 再判 { / [ 且可解析为
     dict/list），则对内层同走 walk→redact/restore→dumps，失败回退 plain。
+    叶子级：仅当 redact 后值变化时做 _jdumps 校验，失败仅回退该叶子。
     """
     if _depth > 5:
-        return redact_func(obj) if isinstance(obj, str) else obj
+        if isinstance(obj, str):
+            try:
+                new_s = redact_func(obj)
+            except Exception:
+                return obj
+            if new_s != obj:
+                try:
+                    _jdumps(new_s)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        'cred json leaf broke, fallback leaf: path=%s error=%s '
+                        'leaf_preview=%r new_preview=%r',
+                        path,
+                        exc,
+                        obj[:500],
+                        new_s[:500],
+                    )
+                    return obj
+            return new_s
+        return obj
     if isinstance(obj, str):
         # 嵌套 JSON 字符串递归（tool_calls.arguments 等）
         inner_stripped = obj.lstrip('\ufeff').strip()
         if inner_stripped.startswith(('{', '[')):
             try:
-                inner = _json.loads(inner_stripped)
+                inner = _jloads(inner_stripped)
                 if isinstance(inner, (dict, list)):
-                    walked = _cred_json_walk(inner, redact_func, _depth + 1)
-                    return _json.dumps(
-                        walked, ensure_ascii=False, separators=(',', ':')
+                    walked = _cred_json_walk(
+                        inner, redact_func, f'{path}→$.inner', _depth + 1
                     )
+                    return _jdumps(walked)
             except Exception:  # noqa: S110 - "{not json" 叶回退 plain
                 pass
-        return redact_func(obj)
+        try:
+            new_s = redact_func(obj)
+        except Exception:
+            return obj
+        if new_s != obj:
+            try:
+                _jdumps(new_s)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    'cred json leaf broke, fallback leaf: path=%s error=%s '
+                    'leaf_preview=%r new_preview=%r',
+                    path,
+                    exc,
+                    obj[:500],
+                    new_s[:500],
+                )
+                return obj
+        return new_s
     if isinstance(obj, dict):
-        return {k: _cred_json_walk(v, redact_func, _depth) for k, v in obj.items()}
+        return {
+            k: _cred_json_walk(v, redact_func, f'{path}.{k}', _depth)
+            for k, v in obj.items()
+        }
     if isinstance(obj, list):
-        return [_cred_json_walk(x, redact_func, _depth) for x in obj]
+        return [
+            _cred_json_walk(x, redact_func, f'{path}[{i}]', _depth)
+            for i, x in enumerate(obj)
+        ]
     return obj
 
 
@@ -324,7 +419,10 @@ class TokenMixin:
         """JSON 感知的凭据脱敏：仅对字符串节点做替换，避免破坏 \\u 转义。
 
         - 若 text 是合法 JSON（object/array），则 loads 后递归 walk 字符串值，逐个
-          调用 _redact，再 dumps(ensure_ascii=False) 回写；\n        - 非 JSON 或解析/序列化失败时回退到纯文本 _redact。\n"""
+          调用 _redact，再 dumps 回写（orjson 优先）；
+        - 非 JSON 或解析/序列化失败时回退到纯文本 _redact；
+        - 大 JSON 不再按 len 回退 plain，全走 json-aware（C 方案）。
+        """
         _mapping = (
             pwd_to_token
             if pwd_to_token is not None
@@ -332,13 +430,11 @@ class TokenMixin:
         )
         if not _mapping:
             return text
-        if len(text) > 1_048_576:
-            return self._redact(text, pwd_to_token)
         stripped = text.lstrip('\ufeff').lstrip()
         if not (stripped.startswith(('{', '['))):
             return self._redact(text, pwd_to_token)
         try:
-            obj = _json.loads(text.lstrip('\ufeff'))
+            obj = _jloads(text.lstrip('\ufeff'))
         except Exception:
             return self._redact(text, pwd_to_token)
         # 为字符串节点构造单次编译的 redact 函数（显式 mapping 场景）
@@ -356,8 +452,8 @@ class TokenMixin:
                 return self._redact(s, None)
 
         try:
-            redacted = _cred_json_walk(obj, _redact_str)
-            return _json.dumps(redacted, ensure_ascii=False, separators=(',', ':'))
+            redacted = _cred_json_walk(obj, _redact_str, path='$')
+            return _jdumps(redacted)
         except Exception:
             logger.debug('_redact_json_aware 回退到纯文本路径', exc_info=True)
             return self._redact(text, pwd_to_token)
@@ -396,8 +492,9 @@ class TokenMixin:
         """JSON 感知的凭据还原：仅对字符串节点做替换，避免破坏 \\u 转义。
 
         - 若 text 是合法 JSON（object/array），则 loads 后递归 walk 字符串值，逐个
-          调用 _restore，再 dumps(ensure_ascii=False) 回写；
-        - 非 JSON 或解析/序列化失败时回退到纯文本 _restore。
+          调用 _restore，再 dumps 回写（orjson 优先）；
+        - 非 JSON 或解析/序列化失败时回退到纯文本 _restore；
+        - 大 JSON 不再回退 plain，全走 json-aware。
         """
         mapping = (
             token_to_pwd
@@ -410,7 +507,7 @@ class TokenMixin:
         if not (stripped.startswith(('{', '['))):
             return self._restore(text, token_to_pwd)
         try:
-            obj = _json.loads(text.lstrip('\ufeff'))
+            obj = _jloads(text.lstrip('\ufeff'))
         except Exception:
             return self._restore(text, token_to_pwd)
         if token_to_pwd is not None:
@@ -426,8 +523,8 @@ class TokenMixin:
                 return self._restore(s, None)
 
         try:
-            restored = _cred_json_walk(obj, _restore_str)
-            return _json.dumps(restored, ensure_ascii=False, separators=(',', ':'))
+            restored = _cred_json_walk(obj, _restore_str, path='$')
+            return _jdumps(restored)
         except Exception:
             logger.debug('_restore_json_aware 回退到纯文本路径', exc_info=True)
             return self._restore(text, token_to_pwd)

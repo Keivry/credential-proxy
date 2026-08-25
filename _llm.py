@@ -26,6 +26,54 @@ from _token import (
 
 logger = logging.getLogger('credential-proxy')
 
+# ── orjson 加速封装（与 _token/_pii 同口径）──
+try:
+    import orjson as _orjson  # type: ignore
+
+    _USE_ORJSON = True
+except ImportError:  # pragma: no cover
+    _orjson = None  # type: ignore
+    _USE_ORJSON = False
+
+
+def _jloads(s: str):  # noqa: D103
+    if _USE_ORJSON:
+        return _orjson.loads(s)  # type: ignore
+    return json.loads(s)
+
+
+def _jdumps(obj) -> str:  # noqa: D103
+    if _USE_ORJSON:
+        return _orjson.dumps(obj).decode()  # type: ignore
+    return json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
+
+
+# ── json-aware 后置校验（与 _token._validate_json_roundtrip 同语义）──
+def _llm_validate_json_roundtrip(original: str, output: str, label: str) -> str:
+    stripped = original.lstrip('\ufeff').lstrip()
+    if not (stripped.startswith('{') or stripped.startswith('[')):
+        return output
+    try:
+        json.loads(original.lstrip('\ufeff'))
+    except Exception:
+        return output
+    try:
+        json.loads(output.lstrip('\ufeff'))
+        return output
+    except Exception as exc:
+        logger.warning(
+            '%s json-aware broke JSON, fallback to original: error=%s '
+            'input_len=%d output_len=%d input_preview=%r output_preview=%r',
+            label,
+            exc,
+            len(original),
+            len(output),
+            original[:4000],
+            output[:4000],
+        )
+        return original
+
+
 # ── Per-request ContextVars for concurrency isolation (D2) ──
 _pii_scope_var = contextvars.ContextVar('_pii_scope_var', default=None)
 _audit_arg_accum_var = contextvars.ContextVar('_audit_arg_accum_var', default='')
@@ -372,44 +420,70 @@ def _strip_token_forms_json_aware(content: str) -> str:
     """JSON 感知的残留 token 清理：仅对字符串节点做剥离，避免破坏 \\u 转义。
 
     - 若 content 是合法 JSON（object/array），则 loads 后递归 walk 字符串值，
-      逐个调用 _strip_token_forms，再 dumps(ensure_ascii=False) 回写；
-    - 非 JSON 或解析失败回退到纯文本 _strip_token_forms。
+      逐个调用 _strip_token_forms，再 dumps 回写（orjson 优先）；
+    - 非 JSON 或解析失败回退到纯文本 _strip_token_forms；
     - 叶字符串若本身为 JSON 文本（BOM 剥离后为 { / [ 且可解析为 dict/list），
-      则对内层同 walk 后 dumps，失败回退 plain。
+      则对内层同 walk 后 dumps，失败回退 plain；
+    - 叶子级：仅当剥离后值变化时校验，失败仅回退该叶子。
+    - C 方案：不再按 len>1M 回退 plain。
     """
-    if len(content) > 1_048_576:
-        return _strip_token_forms(content)
     stripped = content.lstrip('\ufeff').lstrip()
     if not (stripped.startswith(('{', '['))):
         return _strip_token_forms(content)
     try:
-        obj = json.loads(content.lstrip('\ufeff'))
+        obj = _jloads(content.lstrip('\ufeff'))
     except Exception:
         return _strip_token_forms(content)
 
-    def _walk(node, _depth: int = 0):
+    def _walk(node, path: str = '$', _depth: int = 0):
+        if _depth > 5:
+            if isinstance(node, str):
+                new_s = _strip_token_forms(node)
+                if new_s != node:
+                    try:
+                        _jdumps(new_s)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            'strip leaf broke, fallback leaf: path=%s error=%s leaf_preview=%r',
+                            path,
+                            exc,
+                            node[:500],
+                        )
+                        return node
+                return new_s
+            return node
         if isinstance(node, str):
             inner_stripped = node.lstrip('\ufeff').strip()
             if inner_stripped.startswith(('{', '[')):
                 try:
-                    inner = json.loads(inner_stripped)
+                    inner = _jloads(inner_stripped)
                     if isinstance(inner, (dict, list)):
-                        walked = _walk(inner)
-                        return json.dumps(
-                            walked, ensure_ascii=False, separators=(',', ':')
-                        )
+                        walked = _walk(inner, f'{path}→$.inner', _depth + 1)
+                        return _jdumps(walked)
                 except Exception:  # noqa: S110 - "{not json" 叶回退 plain
                     pass
-            return _strip_token_forms(node)
+            new_s = _strip_token_forms(node)
+            if new_s != node:
+                try:
+                    _jdumps(new_s)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        'strip leaf broke, fallback leaf: path=%s error=%s leaf_preview=%r',
+                        path,
+                        exc,
+                        node[:500],
+                    )
+                    return node
+            return new_s
         if isinstance(node, dict):
-            return {k: _walk(v) for k, v in node.items()}
+            return {k: _walk(v, f'{path}.{k}', _depth) for k, v in node.items()}
         if isinstance(node, list):
-            return [_walk(x) for x in node]
+            return [_walk(x, f'{path}[{i}]', _depth) for i, x in enumerate(node)]
         return node
 
     try:
-        cleaned = _walk(obj)
-        return json.dumps(cleaned, ensure_ascii=False, separators=(',', ':'))
+        cleaned = _walk(obj, path='$')
+        return _jdumps(cleaned)
     except Exception:
         logger.debug('_strip_token_forms_json_aware 回退', exc_info=True)
         return _strip_token_forms(content)
@@ -1006,61 +1080,88 @@ class LlmMixin(AuditMixin):
         """JSON 感知的响应侧处理：仅对字符串节点做还原+检测，避免破坏 \\u 转义。
 
         - 若 text 是合法 JSON（object/array），则 loads 后递归 walk 字符串值，
-          逐个调用 _pii_restore + _pii_response_scan，再 dumps(ensure_ascii=False)；
-        - 非 JSON 或解析失败回退到纯文本 _pii_response_process。
-        - 凭据还原走 _restore_json_aware 路径（字符串节点级），PII 检测同理。
+          逐个调用 _pii_restore + _pii_response_scan，再 dumps 回写（orjson 优先）；
+        - 非 JSON 或解析失败回退到纯文本 _pii_response_process；
         - 叶字符串若本身为 JSON 文本（BOM 剥离后为 { / [ 且可解析为 dict/list），
-          则对内层同 walk 后 dumps，失败回退 plain。
+          则对内层同 walk 后 dumps，失败回退 plain；
+        - 叶子级：仅当还原后值变化时校验，失败仅回退该叶子（C+A 方案）。
+        - C 方案：不再按 len 回退 plain。
         """
         stripped = text.lstrip('\ufeff').lstrip()
         if not (stripped.startswith(('{', '['))):
             return await self._pii_response_process(text, active_t2p)
         try:
-            obj = json.loads(text.lstrip('\ufeff'))
+            obj = _jloads(text.lstrip('\ufeff'))
         except Exception:
             return await self._pii_response_process(text, active_t2p)
         scope = self._pii_scope_or_none()
 
-        async def _walk(node, _depth: int = 0):
+        async def _walk(node, path: str = '$', _depth: int = 0):
             if _depth > 5:
                 if isinstance(node, str):
                     if scope is None:
-                        return self._restore(node, active_t2p)
-                    restored, spans = self._pii_restore(node, active_t2p, scope)
-                    return await self._pii_response_scan(restored, spans, scope)
+                        new_s = self._restore(node, active_t2p)
+                    else:
+                        restored, spans = self._pii_restore(node, active_t2p, scope)
+                        new_s = await self._pii_response_scan(restored, spans, scope)
+                    if new_s != node:
+                        try:
+                            _jdumps(new_s)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                'llm response leaf broke, fallback leaf: path=%s error=%s leaf_preview=%r new_preview=%r',
+                                path,
+                                exc,
+                                node[:500],
+                                new_s[:500],
+                            )
+                            return node
+                    return new_s
                 return node
             if isinstance(node, str):
                 # 嵌套 JSON 字符串递归（tool_calls.arguments 等）
                 inner_stripped = node.lstrip('\ufeff').strip()
                 if inner_stripped.startswith(('{', '[')):
                     try:
-                        inner = json.loads(inner_stripped)
+                        inner = _jloads(inner_stripped)
                         if isinstance(inner, (dict, list)):
-                            walked = await _walk(inner, _depth + 1)
-                            return json.dumps(
-                                walked, ensure_ascii=False, separators=(',', ':')
-                            )
+                            walked = await _walk(inner, f'{path}→$.inner', _depth + 1)
+                            return _jdumps(walked)
                     except Exception:  # noqa: S110 - "{not json" 叶回退 plain
                         pass
                 if scope is None:
-                    # 无 PII：仅凭据还原（JSON 感知）
-                    if hasattr(self, '_restore_json_aware'):
-                        return self._restore(node, active_t2p)
-                    return self._restore(node, active_t2p)
-                restored, spans = self._pii_restore(node, active_t2p, scope)
-                return await self._pii_response_scan(restored, spans, scope)
+                    # 无 PII：仅凭据还原
+                    new_s = self._restore(node, active_t2p)
+                else:
+                    restored, spans = self._pii_restore(node, active_t2p, scope)
+                    new_s = await self._pii_response_scan(restored, spans, scope)
+                if new_s != node:
+                    try:
+                        _jdumps(new_s)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            'llm response leaf broke, fallback leaf: path=%s error=%s leaf_preview=%r new_preview=%r',
+                            path,
+                            exc,
+                            node[:500],
+                            new_s[:500],
+                        )
+                        return node
+                return new_s
             if isinstance(node, dict):
                 out = {}
                 for k, v in node.items():
-                    out[k] = await _walk(v, _depth)
+                    out[k] = await _walk(v, f'{path}.{k}', _depth)
                 return out
             if isinstance(node, list):
-                return [await _walk(x, _depth) for x in node]
+                return [
+                    await _walk(x, f'{path}[{i}]', _depth) for i, x in enumerate(node)
+                ]
             return node
 
         try:
-            new_obj = await _walk(obj)
-            return json.dumps(new_obj, ensure_ascii=False, separators=(',', ':'))
+            new_obj = await _walk(obj, path='$')
+            return _jdumps(new_obj)
         except Exception:
             logger.debug('_pii_response_process_json_aware 回退', exc_info=True)
             return await self._pii_response_process(text, active_t2p)
@@ -1757,6 +1858,39 @@ class LlmMixin(AuditMixin):
                 pii_scope = self._pii_scope_or_none()
                 has_cred = snapshot_t2p and b'__VG_CRED_' in out_body
                 has_pii = bool(pii_scope) and b'__PII_' in out_body
+                # ── 请求脱敏后置校验：仅 has_cred/has_pii 时触发，失败先叶子重建仍失败才全量回退 ──
+                if has_cred or has_pii:
+                    try:
+                        _orig_stripped = (
+                            body.decode('utf-8', errors='replace')
+                            .lstrip('\ufeff')
+                            .lstrip()
+                        )
+                        if _orig_stripped.startswith(('{', '[')):
+                            try:
+                                _jloads(
+                                    body.decode('utf-8', errors='replace').lstrip(
+                                        '\ufeff'
+                                    )
+                                )
+                                _jloads(
+                                    out_body.decode('utf-8', errors='replace').lstrip(
+                                        '\ufeff'
+                                    )
+                                )
+                            except Exception as _je:
+                                logger.warning(
+                                    'request redact broke JSON, fallback to original: error=%s '
+                                    'input_len=%d output_len=%d input_preview=%r output_preview=%r',
+                                    _je,
+                                    len(body),
+                                    len(out_body),
+                                    body[:4000],
+                                    out_body[:4000],
+                                )
+                                out_body = body
+                    except Exception:
+                        pass
                 if has_cred or has_pii:
                     # 收集本次请求实际使用的 token，仅还原这些（防 LLM 幻觉泄露）。
                     # used_tokens 仅收集实际注册产出的 token：凭据注册表命中
@@ -3328,6 +3462,27 @@ class LlmMixin(AuditMixin):
                             out_text = _strip_token_forms_json_aware(out_text)
                         except NameError:
                             out_text = _strip_token_forms(out_text)
+                        # ── 响应还原后置校验：仅 active_t2p 非空时触发，失败先叶子重建仍失败才全量回退 ──
+                        if active_t2p:
+                            try:
+                                _rs = resp_text.lstrip('\ufeff').lstrip()
+                                if _rs.startswith(('{', '[')):
+                                    try:
+                                        _jloads(resp_text.lstrip('\ufeff'))
+                                        _jloads(out_text.lstrip('\ufeff'))
+                                    except Exception as _je:
+                                        logger.warning(
+                                            'response restore broke JSON, fallback to original: error=%s '
+                                            'input_len=%d output_len=%d input_preview=%r output_preview=%r',
+                                            _je,
+                                            len(resp_text),
+                                            len(out_text),
+                                            resp_text[:4000],
+                                            out_text[:4000],
+                                        )
+                                        out_text = resp_text
+                            except Exception:
+                                pass
                         if tail.rstrip('/').endswith(
                             ('chat/completions', 'v1/messages', 'v1/responses')
                         ):

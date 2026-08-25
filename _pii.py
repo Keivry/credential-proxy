@@ -28,6 +28,54 @@ from _token import (  # noqa: F401  RequestScopedTokens为兼容别名
 
 logger = logging.getLogger('credential-proxy')
 
+# ── orjson 加速封装（与 _token 同口径，行为保持 ensure_ascii=False 语义等价）──
+try:
+    import orjson as _orjson  # type: ignore
+
+    _USE_ORJSON = True
+except ImportError:  # pragma: no cover
+    _orjson = None  # type: ignore
+    _USE_ORJSON = False
+
+
+def _jloads(s: str):  # noqa: D103
+    if _USE_ORJSON:
+        return _orjson.loads(s)  # type: ignore
+    return _json.loads(s)
+
+
+def _jdumps(obj) -> str:  # noqa: D103
+    if _USE_ORJSON:
+        return _orjson.dumps(obj).decode()  # type: ignore
+    return _json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
+
+
+# ── json-aware 后置校验（与 _token._validate_json_roundtrip 同语义）──
+def _pii_validate_json_roundtrip(original: str, output: str, label: str) -> str:
+    stripped = original.lstrip('\ufeff').lstrip()
+    if not (stripped.startswith('{') or stripped.startswith('[')):
+        return output
+    try:
+        _json.loads(original.lstrip('\ufeff'))
+    except Exception:
+        return output
+    try:
+        _json.loads(output.lstrip('\ufeff'))
+        return output
+    except Exception as exc:
+        logger.warning(
+            '%s json-aware broke JSON, fallback to original: error=%s '
+            'input_len=%d output_len=%d input_preview=%r output_preview=%r',
+            label,
+            exc,
+            len(original),
+            len(output),
+            original[:4000],
+            output[:4000],
+        )
+        return original
+
+
 # ── 常量 ──
 PII_HOLD_MAX_DEFAULT = 64
 PII_RE_DOS_BUDGET = 0.1  # 自定义正则单规则超时预算 100ms
@@ -37,44 +85,78 @@ PII_SCAN_INPUT_LIMIT = 1_048_576  # 单次扫描输入上限 1MB
 
 
 # ── JSON-aware 脱敏辅助（修复纯文本替换破坏 \u 转义的 Invalid \escape）──
-async def _pii_json_walk(obj, detector, credential_p2t, response_side, _depth: int = 0):
-    """递归遍历 JSON 结构，仅对字符串节点做 PII 脱敏。
+async def _pii_json_walk(
+    obj, detector, credential_p2t, response_side, path: str = '$', _depth: int = 0
+):
+    """递归遍历 JSON 结构，仅对字符串节点做 PII 脱敏，叶子级最小回退。
 
     若叶字符串本身为 JSON 文本（lstrip BOM 后 strip 再判 { / [ 且可解析为
     dict/list），则对内层同走 walk→detect→dumps，失败回退 plain。
+    叶子级：仅当 detect 后值变化时做 _jdumps 校验，失败仅回退该叶子。
     """
     if _depth > 5:
-        return (
-            await detector.detect_and_redact(obj, credential_p2t, response_side)
-            if isinstance(obj, str)
-            else obj
-        )
+        if isinstance(obj, str):
+            new_s = await detector.detect_and_redact(obj, credential_p2t, response_side)
+            if new_s != obj:
+                try:
+                    _jdumps(new_s)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        'pii json leaf broke, fallback leaf: path=%s error=%s '
+                        'leaf_preview=%r new_preview=%r',
+                        path,
+                        exc,
+                        obj[:500],
+                        new_s[:500],
+                    )
+                    return obj
+            return new_s
+        return obj
     if isinstance(obj, str):
         inner_stripped = obj.lstrip('\ufeff').strip()
         if inner_stripped.startswith(('{', '[')):
             try:
-                inner = _json.loads(inner_stripped)
+                inner = _jloads(inner_stripped)
                 if isinstance(inner, (dict, list)):
                     walked = await _pii_json_walk(
-                        inner, detector, credential_p2t, response_side, _depth + 1
+                        inner,
+                        detector,
+                        credential_p2t,
+                        response_side,
+                        f'{path}→$.inner',
+                        _depth + 1,
                     )
-                    return _json.dumps(
-                        walked, ensure_ascii=False, separators=(',', ':')
-                    )
+                    return _jdumps(walked)
             except Exception:  # noqa: S110 - "{not json" 叶回退 plain
                 pass
-        return await detector.detect_and_redact(obj, credential_p2t, response_side)
+        new_s = await detector.detect_and_redact(obj, credential_p2t, response_side)
+        if new_s != obj:
+            try:
+                _jdumps(new_s)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    'pii json leaf broke, fallback leaf: path=%s error=%s '
+                    'leaf_preview=%r new_preview=%r',
+                    path,
+                    exc,
+                    obj[:500],
+                    new_s[:500],
+                )
+                return obj
+        return new_s
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
             out[k] = await _pii_json_walk(
-                v, detector, credential_p2t, response_side, _depth
+                v, detector, credential_p2t, response_side, f'{path}.{k}', _depth
             )
         return out
     if isinstance(obj, list):
         return [
-            await _pii_json_walk(x, detector, credential_p2t, response_side, _depth)
-            for x in obj
+            await _pii_json_walk(
+                x, detector, credential_p2t, response_side, f'{path}[{i}]', _depth
+            )
+            for i, x in enumerate(obj)
         ]
     return obj
 
@@ -817,24 +899,25 @@ class PiiMixin:
         """JSON 感知的 PII 脱敏：仅对字符串节点做替换，避免破坏 \\u 转义。
 
         - 若 text 是合法 JSON（object/array），则 loads 后递归 walk 字符串值，逐个
-          调用 detect_and_redact，再 dumps(ensure_ascii=False) 回写；\n        - 非 JSON 或解析/序列化失败时回退到纯文本 pii_redact。\n"""
+          调用 detect_and_redact，再 dumps 回写（orjson 优先）；
+        - 非 JSON 或解析/序列化失败时回退到纯文本 pii_redact；
+        - 大 JSON 不再按 len 回退 plain，全走 json-aware（C 方案）。
+        """
         if not self.pii_enabled or not text:
             return text
-        if len(text) > 1_048_576:
-            return await self.pii_redact(text, response_side)
         stripped = text.lstrip('\ufeff').lstrip()
         if not (stripped.startswith(('{', '['))):
             return await self.pii_redact(text, response_side)
         try:
-            obj = _json.loads(text.lstrip('\ufeff'))
+            obj = _jloads(text.lstrip('\ufeff'))
         except Exception:
             return await self.pii_redact(text, response_side)
         cred_p2t = getattr(self, 'pwd_to_token', None)
         try:
             redacted = await _pii_json_walk(
-                obj, self._pii_detector, cred_p2t, response_side
+                obj, self._pii_detector, cred_p2t, response_side, path='$'
             )
-            return _json.dumps(redacted, ensure_ascii=False, separators=(',', ':'))
+            return _jdumps(redacted)
         except Exception:
             logger.debug('pii_redact_json_aware 回退到纯文本路径', exc_info=True)
             return await self.pii_redact(text, response_side)
