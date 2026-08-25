@@ -1,0 +1,3 @@
+schema: spec-driven
+created: 2026-08-25
+goal: 确保下游请求及上游回复的JSON格式与特殊字符不被脱敏token替换破坏，覆盖流式与非流式及所有API

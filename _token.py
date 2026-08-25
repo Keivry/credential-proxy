@@ -45,14 +45,32 @@ PII_MAX_ENTRIES = (
 )
 
 
-def _cred_json_walk(obj, redact_func):
-    """递归遍历 JSON 结构，仅对字符串节点调用 redact_func。"""
+def _cred_json_walk(obj, redact_func, _depth: int = 0):
+    """递归遍历 JSON 结构，仅对字符串节点调用 redact_func。
+
+    若叶字符串本身为 JSON 文本（lstrip BOM 后 strip 再判 { / [ 且可解析为
+    dict/list），则对内层同走 walk→redact/restore→dumps，失败回退 plain。
+    """
+    if _depth > 5:
+        return redact_func(obj) if isinstance(obj, str) else obj
     if isinstance(obj, str):
+        # 嵌套 JSON 字符串递归（tool_calls.arguments 等）
+        inner_stripped = obj.lstrip('\ufeff').strip()
+        if inner_stripped.startswith(('{', '[')):
+            try:
+                inner = _json.loads(inner_stripped)
+                if isinstance(inner, (dict, list)):
+                    walked = _cred_json_walk(inner, redact_func, _depth + 1)
+                    return _json.dumps(
+                        walked, ensure_ascii=False, separators=(',', ':')
+                    )
+            except Exception:  # noqa: S110 - "{not json" 叶回退 plain
+                pass
         return redact_func(obj)
     if isinstance(obj, dict):
-        return {k: _cred_json_walk(v, redact_func) for k, v in obj.items()}
+        return {k: _cred_json_walk(v, redact_func, _depth) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_cred_json_walk(x, redact_func) for x in obj]
+        return [_cred_json_walk(x, redact_func, _depth) for x in obj]
     return obj
 
 
@@ -314,11 +332,13 @@ class TokenMixin:
         )
         if not _mapping:
             return text
-        stripped = text.lstrip()
+        if len(text) > 1_048_576:
+            return self._redact(text, pwd_to_token)
+        stripped = text.lstrip('\ufeff').lstrip()
         if not (stripped.startswith(('{', '['))):
             return self._redact(text, pwd_to_token)
         try:
-            obj = _json.loads(text)
+            obj = _json.loads(text.lstrip('\ufeff'))
         except Exception:
             return self._redact(text, pwd_to_token)
         # 为字符串节点构造单次编译的 redact 函数（显式 mapping 场景）
@@ -386,11 +406,13 @@ class TokenMixin:
         )
         if not mapping:
             return text
-        stripped = text.lstrip()
+        if len(text) > 1_048_576:
+            return self._restore(text, token_to_pwd)
+        stripped = text.lstrip('\ufeff').lstrip()
         if not (stripped.startswith(('{', '['))):
             return self._restore(text, token_to_pwd)
         try:
-            obj = _json.loads(text)
+            obj = _json.loads(text.lstrip('\ufeff'))
         except Exception:
             return self._restore(text, token_to_pwd)
         if token_to_pwd is not None:

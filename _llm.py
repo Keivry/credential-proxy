@@ -374,17 +374,32 @@ def _strip_token_forms_json_aware(content: str) -> str:
     - 若 content 是合法 JSON（object/array），则 loads 后递归 walk 字符串值，
       逐个调用 _strip_token_forms，再 dumps(ensure_ascii=False) 回写；
     - 非 JSON 或解析失败回退到纯文本 _strip_token_forms。
+    - 叶字符串若本身为 JSON 文本（BOM 剥离后为 { / [ 且可解析为 dict/list），
+      则对内层同 walk 后 dumps，失败回退 plain。
     """
-    stripped = content.lstrip()
+    if len(content) > 1_048_576:
+        return _strip_token_forms(content)
+    stripped = content.lstrip('\ufeff').lstrip()
     if not (stripped.startswith(('{', '['))):
         return _strip_token_forms(content)
     try:
-        obj = json.loads(content)
+        obj = json.loads(content.lstrip('\ufeff'))
     except Exception:
         return _strip_token_forms(content)
 
-    def _walk(node):
+    def _walk(node, _depth: int = 0):
         if isinstance(node, str):
+            inner_stripped = node.lstrip('\ufeff').strip()
+            if inner_stripped.startswith(('{', '[')):
+                try:
+                    inner = json.loads(inner_stripped)
+                    if isinstance(inner, (dict, list)):
+                        walked = _walk(inner)
+                        return json.dumps(
+                            walked, ensure_ascii=False, separators=(',', ':')
+                        )
+                except Exception:  # noqa: S110 - "{not json" 叶回退 plain
+                    pass
             return _strip_token_forms(node)
         if isinstance(node, dict):
             return {k: _walk(v) for k, v in node.items()}
@@ -994,22 +1009,44 @@ class LlmMixin(AuditMixin):
           逐个调用 _pii_restore + _pii_response_scan，再 dumps(ensure_ascii=False)；
         - 非 JSON 或解析失败回退到纯文本 _pii_response_process。
         - 凭据还原走 _restore_json_aware 路径（字符串节点级），PII 检测同理。
+        - 叶字符串若本身为 JSON 文本（BOM 剥离后为 { / [ 且可解析为 dict/list），
+          则对内层同 walk 后 dumps，失败回退 plain。
         """
-        stripped = text.lstrip()
+        if len(text) > 1_048_576:
+            return await self._pii_response_process(text, active_t2p)
+        stripped = text.lstrip('\ufeff').lstrip()
         if not (stripped.startswith(('{', '['))):
             return await self._pii_response_process(text, active_t2p)
         try:
-            obj = json.loads(text)
+            obj = json.loads(text.lstrip('\ufeff'))
         except Exception:
             return await self._pii_response_process(text, active_t2p)
         scope = self._pii_scope_or_none()
 
-        async def _walk(node):
+        async def _walk(node, _depth: int = 0):
+            if _depth > 5:
+                if isinstance(node, str):
+                    if scope is None:
+                        return self._restore(node, active_t2p)
+                    restored, spans = self._pii_restore(node, active_t2p, scope)
+                    return await self._pii_response_scan(restored, spans, scope)
+                return node
             if isinstance(node, str):
+                # 嵌套 JSON 字符串递归（tool_calls.arguments 等）
+                inner_stripped = node.lstrip('\ufeff').strip()
+                if inner_stripped.startswith(('{', '[')):
+                    try:
+                        inner = json.loads(inner_stripped)
+                        if isinstance(inner, (dict, list)):
+                            walked = await _walk(inner, _depth + 1)
+                            return json.dumps(
+                                walked, ensure_ascii=False, separators=(',', ':')
+                            )
+                    except Exception:  # noqa: S110 - "{not json" 叶回退 plain
+                        pass
                 if scope is None:
                     # 无 PII：仅凭据还原（JSON 感知）
                     if hasattr(self, '_restore_json_aware'):
-                        # _restore_json_aware 内部会 walk，这里直接对单 leaf 用 _restore
                         return self._restore(node, active_t2p)
                     return self._restore(node, active_t2p)
                 restored, spans = self._pii_restore(node, active_t2p, scope)
@@ -1017,10 +1054,10 @@ class LlmMixin(AuditMixin):
             if isinstance(node, dict):
                 out = {}
                 for k, v in node.items():
-                    out[k] = await _walk(v)
+                    out[k] = await _walk(v, _depth)
                 return out
             if isinstance(node, list):
-                return [await _walk(x) for x in node]
+                return [await _walk(x, _depth) for x in node]
             return node
 
         try:
@@ -1029,6 +1066,39 @@ class LlmMixin(AuditMixin):
         except Exception:
             logger.debug('_pii_response_process_json_aware 回退', exc_info=True)
             return await self._pii_response_process(text, active_t2p)
+
+    async def _pii_process_sse_line(self, line: str, active_t2p: dict) -> str:
+        """SSE 行的 JSON-aware 处理：剥离 data: 前缀后对 payload 做 JSON-aware。
+
+        - 对 data: {JSON} 形态：payload = split(":",1)[1].lstrip(" \t") 后，
+          对 payload.lstrip('\ufeff').strip() 判空 / "[DONE]" 早退，
+          非 { / [ 开头回退 plain，否则 payload 走
+          _pii_response_process_json_aware（含嵌套与 BOM）。
+        - fast path（active_t2p==0 且无 PII/审计）由调用方守门，本 helper
+          不再二次守门；对非 data: 前缀行直接回退 plain。
+        """
+        if not line.startswith('data:'):
+            return await self._pii_response_process(line, active_t2p)
+        # 统一剥离前缀（含 data:[DONE] 无空格与 data:  多空格）
+        try:
+            payload = line.split(':', 1)[1].lstrip(' \t')
+        except Exception:
+            return await self._pii_response_process(line, active_t2p)
+        if len(payload) > 1_048_576:
+            return await self._pii_response_process(line, active_t2p)
+        stripped_payload = payload.lstrip('\ufeff').strip()
+        if stripped_payload in ('', '[DONE]'):
+            return line
+        if not stripped_payload.startswith(('{', '[')):
+            return await self._pii_response_process(line, active_t2p)
+        try:
+            payload_aware = await self._pii_response_process_json_aware(
+                payload, active_t2p
+            )
+            return 'data: ' + payload_aware
+        except Exception:
+            logger.debug('_pii_process_sse_line 回退', exc_info=True)
+            return await self._pii_response_process(line, active_t2p)
 
     # ── Anthropic Messages API SSE 事件处理 ──
 
@@ -1134,7 +1204,7 @@ class LlmMixin(AuditMixin):
         for line in buf:
             try:
                 await write(
-                    (await self._pii_response_process(line, active_t2p) + '\n').encode(
+                    (await self._pii_process_sse_line(line, active_t2p) + '\n').encode(
                         'utf-8'
                     )
                 )
@@ -1145,7 +1215,7 @@ class LlmMixin(AuditMixin):
             try:
                 await write(
                     (
-                        await self._pii_response_process(extra_line, active_t2p) + '\n'
+                        await self._pii_process_sse_line(extra_line, active_t2p) + '\n'
                     ).encode('utf-8')
                 )
             except SSE_CLIENT_GONE:
@@ -1187,7 +1257,7 @@ class LlmMixin(AuditMixin):
         event = _anthropic_event(parsed)
         if event is None:  # pragma: no cover — 调用方已保证是 Anthropic 事件
             await write(
-                (await self._pii_response_process(line, active_t2p) + '\n').encode(
+                (await self._pii_process_sse_line(line, active_t2p) + '\n').encode(
                     'utf-8'
                 )
             )
@@ -1252,7 +1322,7 @@ class LlmMixin(AuditMixin):
                 self._audit_arg_accum = ''
             self._last_anthropic_tool_name = None
             await write(
-                (await self._pii_response_process(line, active_t2p) + '\n').encode(
+                (await self._pii_process_sse_line(line, active_t2p) + '\n').encode(
                     'utf-8'
                 )
             )
@@ -1263,7 +1333,7 @@ class LlmMixin(AuditMixin):
             if delta_text:
                 self._last_anthropic_tool_name = delta_text
             await write(
-                (await self._pii_response_process(line, active_t2p) + '\n').encode(
+                (await self._pii_process_sse_line(line, active_t2p) + '\n').encode(
                     'utf-8'
                 )
             )
@@ -1333,7 +1403,7 @@ class LlmMixin(AuditMixin):
             write, parsed, 'partial_json', arg_buf, active_t2p
         )
         await write(
-            (await self._pii_response_process(line, active_t2p) + '\n').encode('utf-8')
+            (await self._pii_process_sse_line(line, active_t2p) + '\n').encode('utf-8')
         )
         return content_buf, reasoning_buf, arg_buf
 
@@ -1451,7 +1521,7 @@ class LlmMixin(AuditMixin):
         kind, delta_text = _responses_event(parsed)
         if kind is None:  # pragma: no cover — 调用方已保证是 Responses 事件
             await write(
-                (await self._pii_response_process(line, active_t2p) + '\n').encode(
+                (await self._pii_process_sse_line(line, active_t2p) + '\n').encode(
                     'utf-8'
                 )
             )
@@ -1514,7 +1584,7 @@ class LlmMixin(AuditMixin):
                 self._audit_arg_accum = ''
             self._last_responses_tool_name = None
             await write(
-                (await self._pii_response_process(line, active_t2p) + '\n').encode(
+                (await self._pii_process_sse_line(line, active_t2p) + '\n').encode(
                     'utf-8'
                 )
             )
@@ -1589,7 +1659,7 @@ class LlmMixin(AuditMixin):
                 if isinstance(name, str) and name:
                     self._last_responses_tool_name = name
         await write(
-            (await self._pii_response_process(line, active_t2p) + '\n').encode('utf-8')
+            (await self._pii_process_sse_line(line, active_t2p) + '\n').encode('utf-8')
         )
         return content_buf, reasoning_buf, arg_buf
 
@@ -1899,7 +1969,7 @@ class LlmMixin(AuditMixin):
                                         if not line.startswith('data:'):
                                             await _tracked_write(
                                                 (
-                                                    await self._pii_response_process(
+                                                    await self._pii_process_sse_line(
                                                         line, active_t2p
                                                     )
                                                     + '\n'
@@ -1953,7 +2023,7 @@ class LlmMixin(AuditMixin):
                                                     for ev in tool_calls_pending_events:
                                                         await _tracked_write(
                                                             (
-                                                                await self._pii_response_process(
+                                                                await self._pii_process_sse_line(
                                                                     ev, active_t2p
                                                                 )
                                                                 + '\n'
@@ -2037,7 +2107,7 @@ class LlmMixin(AuditMixin):
                                             if not isinstance(parsed, dict):
                                                 await _tracked_write(
                                                     (
-                                                        await self._pii_response_process(
+                                                        await self._pii_process_sse_line(
                                                             line, active_t2p
                                                         )
                                                         + '\n'
@@ -2180,7 +2250,7 @@ class LlmMixin(AuditMixin):
                                                     for ev in tool_calls_pending_events:
                                                         await _tracked_write(
                                                             (
-                                                                await self._pii_response_process(
+                                                                await self._pii_process_sse_line(
                                                                     ev, active_t2p
                                                                 )
                                                                 + '\n'
@@ -2290,7 +2360,7 @@ class LlmMixin(AuditMixin):
                                                     continue
                                                 await _tracked_write(
                                                     (
-                                                        await self._pii_response_process(
+                                                        await self._pii_process_sse_line(
                                                             line, active_t2p
                                                         )
                                                         + '\n'
@@ -2345,7 +2415,7 @@ class LlmMixin(AuditMixin):
                                                 if not isinstance(parsed, dict):
                                                     await _tracked_write(
                                                         (
-                                                            await self._pii_response_process(
+                                                            await self._pii_process_sse_line(
                                                                 'data: ' + sanitized,
                                                                 active_t2p,
                                                             )
@@ -2442,9 +2512,9 @@ class LlmMixin(AuditMixin):
                                                     )
                                                     await _tracked_write(
                                                         (
-                                                            'data: '
-                                                            + await self._pii_response_process(
-                                                                sanitized, active_t2p
+                                                            await self._pii_process_sse_line(
+                                                                'data: ' + sanitized,
+                                                                active_t2p,
                                                             )
                                                             + '\n'
                                                         ).encode('utf-8'),
@@ -2458,7 +2528,7 @@ class LlmMixin(AuditMixin):
                                                 )
                                                 await _tracked_write(
                                                     (
-                                                        await self._pii_response_process(
+                                                        await self._pii_process_sse_line(
                                                             line, active_t2p
                                                         )
                                                         + '\n'
@@ -2471,7 +2541,7 @@ class LlmMixin(AuditMixin):
                                             )
                                             await _tracked_write(
                                                 (
-                                                    await self._pii_response_process(
+                                                    await self._pii_process_sse_line(
                                                         line, active_t2p
                                                     )
                                                     + '\n'
@@ -2530,7 +2600,7 @@ class LlmMixin(AuditMixin):
                                         try:
                                             await _tracked_write(
                                                 (
-                                                    await self._pii_response_process(
+                                                    await self._pii_process_sse_line(
                                                         _ev, active_t2p
                                                     )
                                                     + '\n'

@@ -9,6 +9,7 @@
 """
 
 import asyncio
+import json as _json
 
 import pytest
 
@@ -528,3 +529,166 @@ def test_strip_partials_keeps_cred_partials_and_plain():
     assert _strip_partials('__PII_0001_ab,') == '__PII_0001_ab,'
     # 空输入
     assert _strip_partials('') == ''
+
+
+# ═══════════════════════════════════════════════════════════
+# fix-json-nested-restore 回归：嵌套 JSON 字符串与 BOM（3.1/3.2）
+# ═══════════════════════════════════════════════════════════
+
+
+class _CredProxy(TokenMixin):
+    __test__ = False
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self.token_to_pwd = {}
+        self._token_seq = 0
+        self.pwd_to_token = {}
+        self._shared_session = None
+        self.proxies = {}
+
+
+class TestNestedToolArgsSpecialChars:
+    @pytest.mark.asyncio
+    async def test_nested_tool_args_special_chars_non_stream(self):
+        """非流式整包：tool_calls.arguments 内层 JSON 含 p@ss\"quote 不破坏双层合法性."""
+        cp = _CredProxy()
+        pwd = 'p@ss"quote'
+        tok = await cp._register_secret(pwd)
+        # 外层 JSON 的叶 arguments 本身是 stringified JSON
+        inner = _json.dumps({'key': tok}, ensure_ascii=False, separators=(',', ':'))
+        outer = _json.dumps(
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'tool_calls': [
+                                {'function': {'name': 'x', 'arguments': inner}}
+                            ]
+                        }
+                    }
+                ]
+            },
+            ensure_ascii=False,
+            separators=(',', ':'),
+        )
+        # 凭据还原（JSON-aware，含嵌套）
+        restored = cp._restore_json_aware(outer, {tok: pwd})
+        # 外层合法
+        outer_parsed = _json.loads(restored)
+        assert (
+            outer_parsed['choices'][0]['message']['tool_calls'][0]['function']['name']
+            == 'x'
+        )
+        # 内层仍合法且值为明文
+        args_str = outer_parsed['choices'][0]['message']['tool_calls'][0]['function'][
+            'arguments'
+        ]
+        inner_parsed = _json.loads(args_str)
+        assert inner_parsed['key'] == pwd
+
+    @pytest.mark.asyncio
+    async def test_nested_tool_args_special_chars_stream(self, proxy):
+        """流式 SSE 行：data: 嵌套 arguments 行经 _pii_process_sse_line 双层合法."""
+        # 用 LlmMixin 的 SSE helper（proxy 为 PiiProxy，兼具 LlmMixin）
+        pwd = 'p@ss"quote'
+        tok = '__VG_CRED_000001__'
+        active = {tok: pwd}
+        inner = _json.dumps({'key': tok}, ensure_ascii=False, separators=(',', ':'))
+        payload = _json.dumps(
+            {
+                'choices': [
+                    {
+                        'delta': {
+                            'tool_calls': [
+                                {
+                                    'index': 0,
+                                    'function': {'name': 'x', 'arguments': inner},
+                                }
+                            ]
+                        },
+                        'index': 0,
+                    }
+                ],
+                'object': 'chat.completion.chunk',
+            },
+            ensure_ascii=False,
+            separators=(',', ':'),
+        )
+        line = 'data: ' + payload
+        out_line = await proxy._pii_process_sse_line(line, active)
+        assert out_line.startswith('data: ')
+        out_payload = out_line[5:].lstrip()
+        outer_parsed = _json.loads(out_payload)
+        args_str = outer_parsed['choices'][0]['delta']['tool_calls'][0]['function'][
+            'arguments'
+        ]
+        inner_parsed = _json.loads(args_str)
+        assert inner_parsed['key'] == pwd
+
+    @pytest.mark.asyncio
+    async def test_nested_with_u_escape_and_backslash(self):
+        """\\u 转义 + \\ 嵌套同路径不破坏."""
+        cp = _CredProxy()
+        pwd = 'a\\b"c\nline'
+        tok = await cp._register_secret(pwd)
+        inner = _json.dumps({'k': tok}, ensure_ascii=False, separators=(',', ':'))
+        outer = _json.dumps({'a': inner}, ensure_ascii=False, separators=(',', ':'))
+        restored = cp._restore_json_aware(outer, {tok: pwd})
+        outer_parsed = _json.loads(restored)
+        inner_parsed = _json.loads(outer_parsed['a'])
+        assert inner_parsed['k'] == pwd
+
+    @pytest.mark.asyncio
+    async def test_bom_prefix_nested_stream(self, proxy):
+        """BOM 前缀的 SSE 行仍按 JSON-aware 处理."""
+        pwd = 'p@ss"quote'
+        tok = '__VG_CRED_000001__'
+        active = {tok: pwd}
+        inner = _json.dumps({'key': tok}, ensure_ascii=False, separators=(',', ':'))
+        payload = '\ufeff' + _json.dumps(
+            {
+                'choices': [
+                    {'delta': {'tool_calls': [{'function': {'arguments': inner}}]}}
+                ]
+            },
+            ensure_ascii=False,
+            separators=(',', ':'),
+        )
+        line = 'data: ' + payload
+        out_line = await proxy._pii_process_sse_line(line, active)
+        assert out_line.startswith('data: ')
+        outer = _json.loads(out_line[5:].lstrip().lstrip('\ufeff'))
+        args_str = outer['choices'][0]['delta']['tool_calls'][0]['function'][
+            'arguments'
+        ]
+        assert _json.loads(args_str)['key'] == pwd
+
+    def test_bom_and_not_json_fallback(self):
+        """\"{not json\" 与 BOM 非 JSON 回退不抛异常."""
+        cp = _CredProxy()
+        # 非 JSON 叶回退
+        out = cp._restore_json_aware('{"k": "{not json"}', {'__VG_CRED_000001__': 'x'})
+        # 外层仍合法
+        _json.loads(out)
+        # BOM 前缀的非容器
+        out2 = cp._restore_json_aware('\ufeff{"a": 1}', {})
+        assert _json.loads(out2.lstrip('\ufeff')) == {'a': 1}
+
+    @pytest.mark.asyncio
+    async def test_done_and_non_json_lines_untouched(self, proxy):
+        """data: [DONE] / data: not-json 原样."""
+        for line in ('data: [DONE]', 'data:[DONE]', 'data:  ', 'data: not-json'):
+            out = await proxy._pii_process_sse_line(line, {})
+            assert out == line
+
+    def test_serialization_form_may_change_but_semantic_equal(self):
+        """空白压缩与 \\uXXXX→明文属语义等价."""
+        cp = _CredProxy()
+        inner = _json.dumps({'a': 1, 'b': 2}, ensure_ascii=True)
+        out = cp._restore_json_aware(inner, {})
+        assert _json.loads(out) == _json.loads(inner)
+        # 中文转义形态
+        zh = _json.dumps({'c': '\u4e2d\u6587'}, ensure_ascii=False)
+        out2 = cp._restore_json_aware(zh, {})
+        assert _json.loads(out2)['c'] == '中文'

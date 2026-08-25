@@ -37,18 +37,43 @@ PII_SCAN_INPUT_LIMIT = 1_048_576  # 单次扫描输入上限 1MB
 
 
 # ── JSON-aware 脱敏辅助（修复纯文本替换破坏 \u 转义的 Invalid \escape）──
-async def _pii_json_walk(obj, detector, credential_p2t, response_side):
-    """递归遍历 JSON 结构，仅对字符串节点做 PII 脱敏。"""
+async def _pii_json_walk(obj, detector, credential_p2t, response_side, _depth: int = 0):
+    """递归遍历 JSON 结构，仅对字符串节点做 PII 脱敏。
+
+    若叶字符串本身为 JSON 文本（lstrip BOM 后 strip 再判 { / [ 且可解析为
+    dict/list），则对内层同走 walk→detect→dumps，失败回退 plain。
+    """
+    if _depth > 5:
+        return (
+            await detector.detect_and_redact(obj, credential_p2t, response_side)
+            if isinstance(obj, str)
+            else obj
+        )
     if isinstance(obj, str):
+        inner_stripped = obj.lstrip('\ufeff').strip()
+        if inner_stripped.startswith(('{', '[')):
+            try:
+                inner = _json.loads(inner_stripped)
+                if isinstance(inner, (dict, list)):
+                    walked = await _pii_json_walk(
+                        inner, detector, credential_p2t, response_side, _depth + 1
+                    )
+                    return _json.dumps(
+                        walked, ensure_ascii=False, separators=(',', ':')
+                    )
+            except Exception:  # noqa: S110 - "{not json" 叶回退 plain
+                pass
         return await detector.detect_and_redact(obj, credential_p2t, response_side)
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
-            out[k] = await _pii_json_walk(v, detector, credential_p2t, response_side)
+            out[k] = await _pii_json_walk(
+                v, detector, credential_p2t, response_side, _depth
+            )
         return out
     if isinstance(obj, list):
         return [
-            await _pii_json_walk(x, detector, credential_p2t, response_side)
+            await _pii_json_walk(x, detector, credential_p2t, response_side, _depth)
             for x in obj
         ]
     return obj
@@ -795,11 +820,13 @@ class PiiMixin:
           调用 detect_and_redact，再 dumps(ensure_ascii=False) 回写；\n        - 非 JSON 或解析/序列化失败时回退到纯文本 pii_redact。\n"""
         if not self.pii_enabled or not text:
             return text
-        stripped = text.lstrip()
+        if len(text) > 1_048_576:
+            return await self.pii_redact(text, response_side)
+        stripped = text.lstrip('\ufeff').lstrip()
         if not (stripped.startswith(('{', '['))):
             return await self.pii_redact(text, response_side)
         try:
-            obj = _json.loads(text)
+            obj = _json.loads(text.lstrip('\ufeff'))
         except Exception:
             return await self.pii_redact(text, response_side)
         cred_p2t = getattr(self, 'pwd_to_token', None)
