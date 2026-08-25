@@ -1123,15 +1123,9 @@ class LlmMixin(AuditMixin):
         pii_scope = self._pii_scope_or_none()
         if not buf:
             return ''
-        if pii_scope is not None:
-            restored, restored_spans = self._pii_restore(buf, active_t2p, pii_scope)
-            restored = await self._pii_response_scan(
-                restored,
-                restored_spans,
-                pii_scope,
-            )
-        else:
-            restored = self._restore(buf, active_t2p)
+        # JSON-aware: 覆盖 partial_json 等 stringified JSON 场景（p@ss"quote/\u 等特殊字符），
+        # 增量片段为不完整 JSON 时 json.loads 失败自动回退 plain，行为等价
+        restored = await self._pii_response_process_json_aware(buf, active_t2p)
         if not keep_pending:
             restored = _strip_partials(restored)
             if not restored:
@@ -1376,7 +1370,12 @@ class LlmMixin(AuditMixin):
                 if kind == 'text'
                 else (reasoning_buf if kind == 'thinking' else arg_buf)
             )
-            restored = await self._pii_response_process(buf, active_t2p)
+            # arg_buf 为 partial_json（stringified JSON），需 JSON-aware 处理特殊字符；
+            # content/reasoning 为纯文本，json-aware 会自动回退 plain，等价
+            if kind == 'function_args':
+                restored = await self._pii_response_process_json_aware(buf, active_t2p)
+            else:
+                restored = await self._pii_response_process(buf, active_t2p)
             safe, pending = _split_safe_hold(
                 restored, active_t2p, self._pii_scope_or_none()
             )
@@ -1429,15 +1428,8 @@ class LlmMixin(AuditMixin):
         pii_scope = self._pii_scope_or_none()
         if not buf:
             return ''
-        if pii_scope is not None:
-            restored, restored_spans = self._pii_restore(buf, active_t2p, pii_scope)
-            restored = await self._pii_response_scan(
-                restored,
-                restored_spans,
-                pii_scope,
-            )
-        else:
-            restored = self._restore(buf, active_t2p)
+        # JSON-aware: 覆盖 function_call_arguments 等 stringified JSON（p@ss"quote/\u 等），不完整片段自动回退 plain
+        restored = await self._pii_response_process_json_aware(buf, active_t2p)
         if not keep_pending:
             restored = _strip_partials(restored)
             if not restored:
@@ -1624,7 +1616,11 @@ class LlmMixin(AuditMixin):
                 if kind == 'output_text'
                 else (reasoning_buf if kind == 'reasoning_text' else arg_buf)
             )
-            restored = await self._pii_response_process(buf, active_t2p)
+            # function_call_arguments 的 arg_buf 为 stringified JSON，需 JSON-aware；其他为纯文本回退
+            if kind == 'function_call_arguments':
+                restored = await self._pii_response_process_json_aware(buf, active_t2p)
+            else:
+                restored = await self._pii_response_process(buf, active_t2p)
             safe, pending = _split_safe_hold(
                 restored, active_t2p, self._pii_scope_or_none()
             )
