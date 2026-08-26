@@ -44,7 +44,6 @@ from _llm import (
     _strip_partials,
 )
 
-
 # ── 3.1 byte_buf WHATWG ────────────────────────────────────────────
 
 
