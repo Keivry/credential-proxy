@@ -45,6 +45,8 @@ ignore = [
     'ANN202', 'ANN201', 'ANN001', 'ANN002',
     # 盲捕获 Exception（历史遗留：debug 落盘/JSON 回退等处有意全捕获，0.16 后默认启用）
     'BLE001',
+    # ruff 0.16 新增默认规则中的历史遗留噪音（意图性 pass/多重 startswith）
+    'S110', 'S113', 'SIM115', 'PIE810', 'FURB122',
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -55,8 +57,9 @@ ignore = [
 "sse_stream_loop_test.py" = ["D", "ANN", "S", "E402"]
 "matrix_test.py" = ["D", "ANN", "S", "E402"]
 "pii_*.py" = ["D", "ANN", "S", "E402"]
+"scripts/sentinel_record.py" = ["D", "ANN", "S", "E402", "F841"]
 "vault_stable_test.py" = ["D", "ANN", "S", "E402", "E741"]
-"residual_hardening_test.py" = ["D", "ANN", "S", "E402", "E741"]
+"residual_hardening_test.py" = ["D", "ANN", "S", "E402", "E741", "RUF059", "F841"]
 "detection_hardening_test.py" = ["D", "ANN", "S", "E402", "E741"]
 
 [tool.ruff.format]
@@ -66,4 +69,5 @@ quote-style = "single"
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.4",
 ]

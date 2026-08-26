@@ -19,10 +19,12 @@ from collections import OrderedDict
 
 # ── utils/json_walk 共享导入（design D1，存在则复用）──
 try:
-    from utils.json_walk import json_walk as _shared_json_walk  # type: ignore
-    from utils.json_walk import json_walk_async as _shared_json_walk_async  # type: ignore
-    from utils.json_walk import _jloads as _shared_jloads  # type: ignore
     from utils.json_walk import _jdumps as _shared_jdumps  # type: ignore
+    from utils.json_walk import _jloads as _shared_jloads  # type: ignore
+    from utils.json_walk import json_walk as _shared_json_walk  # type: ignore
+    from utils.json_walk import (
+        json_walk_async as _shared_json_walk_async,  # type: ignore
+    )
 except ImportError:
     _shared_json_walk = None  # type: ignore
     _shared_json_walk_async = None  # type: ignore
@@ -41,7 +43,7 @@ except ImportError:  # pragma: no cover - 回退路径
     _USE_ORJSON = False
 
 
-def _jloads(s: str):  # noqa: D103
+def _jloads(s: str):
     if _shared_jloads is not None:  # type: ignore[truthy-function]
         return _shared_jloads(s)  # type: ignore
     if _USE_ORJSON:
@@ -49,7 +51,7 @@ def _jloads(s: str):  # noqa: D103
     return _json.loads(s)
 
 
-def _jdumps(obj) -> str:  # noqa: D103
+def _jdumps(obj) -> str:
     if _shared_jdumps is not None:  # type: ignore[truthy-function]
         return _shared_jdumps(obj)  # type: ignore
     if _USE_ORJSON:
@@ -105,8 +107,11 @@ PII_TOKEN_STR_RE_FUZZY = _re.compile(r'__PII_\d+_[0-9a-f]{8}__', _re.IGNORECASE)
 # 宽松形态大小写不敏感（fuzzy 分支审计用）
 PII_TOKEN_LOOSE_RE_FUZZY = _re.compile(r'__PII_\d+_[^_\s]{1,16}__', _re.IGNORECASE)
 
+
 def _is_pii_fuzzy_restore_enabled() -> bool:
     return _os.environ.get('PII_FUZZY_RESTORE', '0') == '1'
+
+
 # 宽松形态（restore 扫描用）：捕获格式不符/越界 token 以记审计事件
 PII_TOKEN_LOOSE_RE = _re.compile(r'__PII_\d+_[^_\s]{1,16}__')
 # 行尾完整 PII token 形态（流末清理模型幻觉的完整未知 token）
@@ -129,7 +134,9 @@ def _cred_json_walk(obj, redact_func, path: str = '$', _depth: int = 0):
     叶子级：仅当 redact 后值变化时做 _jdumps 校验，失败仅回退该叶子。
     """
     if _shared_json_walk is not None:  # type: ignore[truthy-function]
-        return _shared_json_walk(obj, redact_func, depth_limit=5, path=path, _depth=_depth)  # type: ignore
+        return _shared_json_walk(
+            obj, redact_func, depth_limit=5, path=path, _depth=_depth
+        )  # type: ignore
     if _depth > 5:
         if isinstance(obj, str):
             try:
@@ -139,7 +146,7 @@ def _cred_json_walk(obj, redact_func, path: str = '$', _depth: int = 0):
             if new_s != obj:
                 try:
                     _jdumps(new_s)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.warning(
                         'cred json leaf broke, fallback leaf: path=%s error=%s '
                         'leaf_preview=%r new_preview=%r',
@@ -162,7 +169,7 @@ def _cred_json_walk(obj, redact_func, path: str = '$', _depth: int = 0):
                         inner, redact_func, f'{path}→$.inner', _depth + 1
                     )
                     return _jdumps(walked)
-            except Exception:  # noqa: S110 - "{not json" 叶回退 plain
+            except Exception:
                 pass
         try:
             new_s = redact_func(obj)
@@ -171,7 +178,7 @@ def _cred_json_walk(obj, redact_func, path: str = '$', _depth: int = 0):
         if new_s != obj:
             try:
                 _jdumps(new_s)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     'cred json leaf broke, fallback leaf: path=%s error=%s '
                     'leaf_preview=%r new_preview=%r',
@@ -354,6 +361,7 @@ class GlobalPiiTokens:
             # fuzzy: 大小写不敏感匹配，命中记审计
             pii_lower = {k.lower(): (k, v) for k, v in pii_t2p_snapshot.items()}
             resp_lower = {k.lower(): (k, v) for k, v in resp_t2p_snapshot.items()}
+
             def _repl_fuzzy(m: _re.Match) -> str:
                 tok = m.group(0)
                 low = tok.lower()
@@ -373,7 +381,10 @@ class GlobalPiiTokens:
                             cnt = self._malformed_counts.get(cat, 0)
                             self._malformed_counts[cat] = cnt + 1
                             if cnt == 0:
-                                self._audit_cb('pii_restore_malformed', {'category': cat, 'token': tok})
+                                self._audit_cb(
+                                    'pii_restore_malformed',
+                                    {'category': cat, 'token': tok},
+                                )
                         except Exception:
                             pass
                     return plain
@@ -389,6 +400,7 @@ class GlobalPiiTokens:
                     return tok
                 self._audit_malformed(tok)
                 return tok
+
             restored = PII_TOKEN_STR_RE_FUZZY.sub(_repl_fuzzy, text)
         else:
             restored = PII_TOKEN_STR_RE.sub(_repl, text)

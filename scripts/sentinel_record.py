@@ -31,7 +31,10 @@ SENTINELS = {
                     'type': 'function',
                     'function': {
                         'name': 'query_order',
-                        'parameters': {'type': 'object', 'properties': {'phone': {'type': 'string'}}},
+                        'parameters': {
+                            'type': 'object',
+                            'properties': {'phone': {'type': 'string'}},
+                        },
                     },
                 }
             ],
@@ -45,7 +48,11 @@ SENTINELS = {
             'data: {"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}]}\n\n',
             'data: [DONE]\n\n',
         ],
-        'audit': {'line_buf_flush': 'newline', 'arg_buf_walk': 'json_aware_once', 'byte_buf_bom': 'stripped_once'},
+        'audit': {
+            'line_buf_flush': 'newline',
+            'arg_buf_walk': 'json_aware_once',
+            'byte_buf_bom': 'stripped_once',
+        },
     },
     'anthropic': {
         'protocol': 'v1/messages',
@@ -80,7 +87,10 @@ SENTINELS = {
             'data: {"type":"response.function_call_arguments.done"}\n\n',
             'data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n',
         ],
-        'audit': {'data_buffer_joined': True, 'seen_global_terminal': 'response.completed'},
+        'audit': {
+            'data_buffer_joined': True,
+            'seen_global_terminal': 'response.completed',
+        },
     },
 }
 
@@ -92,12 +102,24 @@ def write_fixtures():
         # 每行一条 JSON（请求+单行 SSE），保证可 loads
         with open(path, 'w', encoding='utf-8') as f:
             # 首行：request 脱敏后（无明文 PII，仅 token/保留 IP）
-            f.write(json.dumps({'kind': 'request', 'body': payload['request']}, ensure_ascii=False) + '\n')
+            f.write(
+                json.dumps(
+                    {'kind': 'request', 'body': payload['request']}, ensure_ascii=False
+                )
+                + '\n'
+            )
             for line in payload['response_sse']:
                 # 响应行：line_buf 行内还原无片段泄漏，keepalive 可见
-                f.write(json.dumps({'kind': 'sse', 'line': line}, ensure_ascii=False) + '\n')
-            f.write(json.dumps({'kind': 'audit', 'audit': payload['audit']}, ensure_ascii=False) + '\n')
-        print(f'wrote {path} ({len(payload["response_sse"])+2} lines)')
+                f.write(
+                    json.dumps({'kind': 'sse', 'line': line}, ensure_ascii=False) + '\n'
+                )
+            f.write(
+                json.dumps(
+                    {'kind': 'audit', 'audit': payload['audit']}, ensure_ascii=False
+                )
+                + '\n'
+            )
+        print(f'wrote {path} ({len(payload["response_sse"]) + 2} lines)')
 
 
 def check_fixtures():
@@ -116,9 +138,12 @@ def check_fixtures():
                 ok = False
                 continue
             if obj.get('kind') == 'sse':
-                line = obj['line']
+                _ = obj['line']
                 # keepalive 可见
-                if name in ('chat', 'responses') and ': keepalive' not in open(path, encoding='utf-8').read():
+                if (
+                    name in ('chat', 'responses')
+                    and ': keepalive' not in open(path, encoding='utf-8').read()
+                ):
                     pass
         print(f'checked {path} ok')
     # keepalive 可见性总检

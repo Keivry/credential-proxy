@@ -19,8 +19,8 @@ import logging
 import os
 import re as _re
 import time as _time
-from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 
 from _token import (  # noqa: F401  RequestScopedTokens为兼容别名
     GlobalPiiTokens,
@@ -31,10 +31,12 @@ logger = logging.getLogger('credential-proxy')
 
 # ── utils/json_walk 共享导入（design D1，存在则复用）──
 try:
-    from utils.json_walk import json_walk as _shared_json_walk  # type: ignore
-    from utils.json_walk import json_walk_async as _shared_json_walk_async  # type: ignore
-    from utils.json_walk import _jloads as _shared_jloads  # type: ignore
     from utils.json_walk import _jdumps as _shared_jdumps  # type: ignore
+    from utils.json_walk import _jloads as _shared_jloads  # type: ignore
+    from utils.json_walk import json_walk as _shared_json_walk  # type: ignore
+    from utils.json_walk import (
+        json_walk_async as _shared_json_walk_async,  # type: ignore
+    )
 except ImportError:
     _shared_json_walk = None  # type: ignore
     _shared_json_walk_async = None  # type: ignore
@@ -51,7 +53,7 @@ except ImportError:  # pragma: no cover
     _USE_ORJSON = False
 
 
-def _jloads(s: str):  # noqa: D103
+def _jloads(s: str):
     if _shared_jloads is not None:  # type: ignore[truthy-function]
         return _shared_jloads(s)  # type: ignore
     if _USE_ORJSON:
@@ -59,7 +61,7 @@ def _jloads(s: str):  # noqa: D103
     return _json.loads(s)
 
 
-def _jdumps(obj) -> str:  # noqa: D103
+def _jdumps(obj) -> str:
     if _shared_jdumps is not None:  # type: ignore[truthy-function]
         return _shared_jdumps(obj)  # type: ignore
     if _USE_ORJSON:
@@ -100,6 +102,7 @@ PII_RE_DOS_MAX_WORKERS = 2  # 独立线程池（与日志写 run_in_executor 不
 PII_RE_DOS_STRIKES = 3  # 连续超时 3 次临时停用
 PII_SCAN_INPUT_LIMIT = 1_048_576  # 单次扫描输入上限 1MB
 
+
 # ── Detection hardening 总闸（PII_DETECTION_HARDENING=1 时启用精确保留前缀/ReDoS/CJK/缓存）──
 def _is_detection_hardening() -> bool:
     """硬化开关：默认 0 关闭，1 时启用 4 项硬化分支。
@@ -132,14 +135,16 @@ async def _pii_json_walk(
         async def _leaf(s: str):  # type: ignore[no-redef]
             return await detector.detect_and_redact(s, credential_p2t, response_side)
 
-        return await _shared_json_walk_async(obj, _leaf, depth_limit=5, path=path, _depth=_depth)  # type: ignore
+        return await _shared_json_walk_async(
+            obj, _leaf, depth_limit=5, path=path, _depth=_depth
+        )  # type: ignore
     if _depth > 5:
         if isinstance(obj, str):
             new_s = await detector.detect_and_redact(obj, credential_p2t, response_side)
             if new_s != obj:
                 try:
                     _jdumps(new_s)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.warning(
                         'pii json leaf broke, fallback leaf: path=%s error=%s '
                         'leaf_preview=%r new_preview=%r',
@@ -166,13 +171,13 @@ async def _pii_json_walk(
                         _depth + 1,
                     )
                     return _jdumps(walked)
-            except Exception:  # noqa: S110 - "{not json" 叶回退 plain
+            except Exception:
                 pass
         new_s = await detector.detect_and_redact(obj, credential_p2t, response_side)
         if new_s != obj:
             try:
                 _jdumps(new_s)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     'pii json leaf broke, fallback leaf: path=%s error=%s '
                     'leaf_preview=%r new_preview=%r',
@@ -341,6 +346,7 @@ _BUILTIN_PATTERNS: list[tuple[str, str]] = [
 _COMBINED_PATTERN = '|'.join(p for _, p in _BUILTIN_PATTERNS)
 _COMBINED_RE = _re.compile(_COMBINED_PATTERN)
 
+
 # ── Analyzer 缓存（hardening=1 时 lru_cache maxsize=4，dict_ver 变化 cache_clear）──
 # 纯正则路径无 presidio 仍可用；同配置复用实例，配置变更 cache_clear。
 @lru_cache(maxsize=4)
@@ -348,11 +354,13 @@ def _get_combined_re_cached(pattern: str):
     """硬化缓存：同 pattern 复用编译结果，maxsize=4 控内存。"""
     return _re.compile(pattern)
 
+
 def _get_combined_re():
     """获取联合正则：hardening=1 时走 lru_cache，否则直回 _COMBINED_RE。"""
     if _is_detection_hardening():
         return _get_combined_re_cached(_COMBINED_PATTERN)
     return _COMBINED_RE
+
 
 def _clear_analyzer_cache():
     """配置变更时清缓存（dict_ver 自增时调用）。"""
@@ -360,6 +368,7 @@ def _clear_analyzer_cache():
         _get_combined_re_cached.cache_clear()
     except Exception:
         pass
+
 
 # ── 保留地址豁免（design D1 硬性：前缀必须含尾点/冒号，IPv6 先 lower）──
 _RESERVED_IPV4_PREFIXES = (

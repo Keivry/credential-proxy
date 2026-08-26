@@ -30,12 +30,17 @@ TRUNCATED_MESSAGE = '上游流式响应被截断（未收到终止事件），�
 
 # ── utils/json_walk 共享导入（design D1，存在则复用）──
 try:
-    from utils.json_walk import json_walk as _shared_json_walk  # type: ignore
-    from utils.json_walk import json_walk_async as _shared_json_walk_async  # type: ignore
-    from utils.json_walk import _jloads as _shared_jloads  # type: ignore
     from utils.json_walk import _jdumps as _shared_jdumps  # type: ignore
+    from utils.json_walk import _jloads as _shared_jloads  # type: ignore
     from utils.json_walk import _strip_bom as _shared_strip_bom  # type: ignore
-    from utils.json_walk import _validate_json_roundtrip as _shared_validate  # type: ignore
+    from utils.json_walk import (
+        _validate_json_roundtrip as _shared_validate,  # type: ignore
+    )
+    from utils.json_walk import json_walk as _shared_json_walk  # type: ignore
+    from utils.json_walk import (
+        json_walk_async as _shared_json_walk_async,  # type: ignore
+    )
+
     _SHARED_WALK_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _shared_json_walk = None  # type: ignore
@@ -56,7 +61,7 @@ except ImportError:  # pragma: no cover
     _USE_ORJSON = False
 
 
-def _jloads(s: str):  # noqa: D103
+def _jloads(s: str):
     if _shared_jloads is not None:  # type: ignore[truthy-function]
         return _shared_jloads(s)  # type: ignore
     if _USE_ORJSON:
@@ -64,7 +69,7 @@ def _jloads(s: str):  # noqa: D103
     return json.loads(s)
 
 
-def _jdumps(obj) -> str:  # noqa: D103
+def _jdumps(obj) -> str:
     if _shared_jdumps is not None:  # type: ignore[truthy-function]
         return _shared_jdumps(obj)  # type: ignore
     if _USE_ORJSON:
@@ -480,7 +485,7 @@ def _strip_token_forms_json_aware(content: str) -> str:
                 if new_s != node:
                     try:
                         _jdumps(new_s)
-                    except Exception as exc:  # noqa: BLE001
+                    except Exception as exc:
                         logger.warning(
                             'strip leaf broke, fallback leaf: path=%s error=%s leaf_preview=%r',
                             path,
@@ -498,13 +503,13 @@ def _strip_token_forms_json_aware(content: str) -> str:
                     if isinstance(inner, (dict, list)):
                         walked = _walk(inner, f'{path}→$.inner', _depth + 1)
                         return _jdumps(walked)
-                except Exception:  # noqa: S110 - "{not json" 叶回退 plain
+                except Exception:
                     pass
             new_s = _strip_token_forms(node)
             if new_s != node:
                 try:
                     _jdumps(new_s)
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     logger.warning(
                         'strip leaf broke, fallback leaf: path=%s error=%s leaf_preview=%r',
                         path,
@@ -1219,11 +1224,13 @@ class LlmMixin(AuditMixin):
         scope = self._pii_scope_or_none()
         # ── D1 thin wrapper: 优先复用共享 walk（utils/json_walk）──
         if _shared_json_walk_async is not None and isinstance(obj, (dict, list)):  # type: ignore[truthy-function]
+
             async def _shared_leaf(s: str) -> str:  # type: ignore[no-redef]
                 if scope is None:
                     return self._restore(s, active_t2p)
                 restored, spans = self._pii_restore(s, active_t2p, scope)
                 return await self._pii_response_scan(restored, spans, scope)
+
             try:
                 walked = await _shared_json_walk_async(obj, _shared_leaf, depth_limit=5)  # type: ignore
                 return _jdumps(walked)
@@ -1241,7 +1248,7 @@ class LlmMixin(AuditMixin):
                     if new_s != node:
                         try:
                             _jdumps(new_s)
-                        except Exception as exc:  # noqa: BLE001
+                        except Exception as exc:
                             logger.warning(
                                 'llm response leaf broke, fallback leaf: path=%s error=%s leaf_preview=%r new_preview=%r',
                                 path,
@@ -1261,7 +1268,7 @@ class LlmMixin(AuditMixin):
                         if isinstance(inner, (dict, list)):
                             walked = await _walk(inner, f'{path}→$.inner', _depth + 1)
                             return _jdumps(walked)
-                    except Exception:  # noqa: S110 - "{not json" 叶回退 plain
+                    except Exception:
                         pass
                 if scope is None:
                     # 无 PII：仅凭据还原
@@ -1272,7 +1279,7 @@ class LlmMixin(AuditMixin):
                 if new_s != node:
                     try:
                         _jdumps(new_s)
-                    except Exception as exc:  # noqa: BLE001
+                    except Exception as exc:
                         logger.warning(
                             'llm response leaf broke, fallback leaf: path=%s error=%s leaf_preview=%r new_preview=%r',
                             path,
@@ -3187,9 +3194,7 @@ class LlmMixin(AuditMixin):
                             fast_seen_terminal = (
                                 False  # 是否已收到终止事件（fast 路径）
                             )
-                            fast_seen_global_terminal = (
-                                False  # 全局终止（fast）
-                            )
+                            fast_seen_global_terminal = False  # 全局终止（fast）
 
                             async def _tracked_write(data: bytes):
                                 nonlocal fast_bytes_written
