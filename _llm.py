@@ -26,6 +26,8 @@ from _token import (
 
 logger = logging.getLogger('credential-proxy')
 
+TRUNCATED_MESSAGE = '上游流式响应被截断（未收到终止事件），请重试。'
+
 # ── orjson 加速封装（与 _token/_pii 同口径）──
 try:
     import orjson as _orjson  # type: ignore
@@ -1054,6 +1056,90 @@ class LlmMixin(AuditMixin):
         )
         return ''.join(lines)
 
+    def _build_truncated_event(self) -> str:
+        """构造 chat/completions 截断合成终止事件（避免空体 JSONDecodeError）。"""
+        payload = {
+            'choices': [
+                {
+                    'index': 0,
+                    'delta': {'role': 'assistant', 'content': TRUNCATED_MESSAGE},
+                    'finish_reason': 'stop',
+                }
+            ]
+        }
+        return (
+            f'data: {json.dumps(payload, ensure_ascii=False)}\n\n' + 'data: [DONE]\n\n'
+        )
+
+    def _build_truncated_event_anthropic(self) -> str:
+        """构造 Anthropic 截断合成终止事件（text_delta + message_stop）。"""
+        lines = []
+        lines.append(
+            'data: '
+            + json.dumps(
+                {
+                    'type': 'content_block_delta',
+                    'index': 0,
+                    'delta': {'type': 'text_delta', 'text': TRUNCATED_MESSAGE},
+                },
+                ensure_ascii=False,
+            )
+            + '\n\n'
+        )
+        lines.append(
+            'data: '
+            + json.dumps(
+                {
+                    'type': 'message_delta',
+                    'delta': {'stop_reason': 'end_turn'},
+                    'usage': {'output_tokens': 1},
+                },
+                ensure_ascii=False,
+            )
+            + '\n\n'
+        )
+        lines.append(
+            'data: ' + json.dumps({'type': 'message_stop'}, ensure_ascii=False) + '\n\n'
+        )
+        return ''.join(lines)
+
+    def _build_truncated_event_responses(self) -> str:
+        """构造 Responses 截断合成终止事件（failed 避免下游空体）。"""
+        lines = []
+        lines.append(
+            'data: '
+            + json.dumps(
+                {
+                    'type': 'response.output_text.delta',
+                    'item_id': 'truncated',
+                    'output_index': 0,
+                    'content_index': 0,
+                    'delta': TRUNCATED_MESSAGE,
+                },
+                ensure_ascii=False,
+            )
+            + '\n\n'
+        )
+        lines.append(
+            'data: '
+            + json.dumps(
+                {
+                    'type': 'response.failed',
+                    'response': {
+                        'id': 'truncated',
+                        'status': 'failed',
+                        'error': {
+                            'message': 'stream truncated: missing terminal event',
+                            'type': 'server_error',
+                        },
+                    },
+                },
+                ensure_ascii=False,
+            )
+            + '\n\n'
+        )
+        return ''.join(lines)
+
     async def _pii_response_process(
         self,
         text: str,
@@ -2014,6 +2100,7 @@ class LlmMixin(AuditMixin):
                             bytes_written = (
                                 0  # D3：实际写入字节数守门（仅成功 write 计数）
                             )
+                            seen_terminal = False  # 是否已收到终止事件（responses: completed/failed/incomplete, chat: [DONE]）
 
                             async def _tracked_write(data: bytes):
                                 nonlocal bytes_written
@@ -2220,6 +2307,7 @@ class LlmMixin(AuditMixin):
                                                     c=content_buf,
                                                     rc=reasoning_buf,
                                                 )
+                                            seen_terminal = True
                                             await _tracked_write(
                                                 b'data: [DONE]\n',
                                             )
@@ -2294,6 +2382,12 @@ class LlmMixin(AuditMixin):
                                             # ── Responses API 事件（/v1/responses SSE）──
                                             if _responses_event(parsed) is not None:
                                                 is_responses_stream = True
+                                                if parsed.get('type') in (
+                                                    'response.completed',
+                                                    'response.failed',
+                                                    'response.incomplete',
+                                                ):
+                                                    seen_terminal = True
                                                 (
                                                     content_buf,
                                                     reasoning_buf,
@@ -2327,12 +2421,17 @@ class LlmMixin(AuditMixin):
                                                 )
                                                 continue
 
+                                            if parsed.get('type') == 'message_stop':
+                                                seen_terminal = True
+
                                             choices = parsed.get('choices', [])
                                             choice = choices[0] if choices else {}
                                             delta = choice.get('delta', {})
                                             finish_reason = choice.get(
                                                 'finish_reason',
                                             )
+                                            if finish_reason is not None:
+                                                seen_terminal = True
 
                                             # ── OpenAI tool_calls 分片累积 ──
                                             # 全程缓冲至审计 verdict 前不 flush
@@ -2552,6 +2651,12 @@ class LlmMixin(AuditMixin):
                                                 # ── Responses API 事件（续行重建路径）──
                                                 if _responses_event(parsed) is not None:
                                                     is_responses_stream = True
+                                                    if parsed.get('type') in (
+                                                        'response.completed',
+                                                        'response.failed',
+                                                        'response.incomplete',
+                                                    ):
+                                                        seen_terminal = True
                                                     (
                                                         content_buf,
                                                         reasoning_buf,
@@ -2569,6 +2674,11 @@ class LlmMixin(AuditMixin):
                                                 # ── Anthropic Messages API 事件（续行重建路径）──
                                                 if _anthropic_event(parsed) is not None:
                                                     is_anthropic_stream = True
+                                                    if (
+                                                        parsed.get('type')
+                                                        == 'message_stop'
+                                                    ):
+                                                        seen_terminal = True
                                                     (
                                                         content_buf,
                                                         reasoning_buf,
@@ -2583,6 +2693,8 @@ class LlmMixin(AuditMixin):
                                                         arg_buf,
                                                     )
                                                     continue
+                                                if parsed.get('type') == 'message_stop':
+                                                    seen_terminal = True
                                                 choices = parsed.get(
                                                     'choices',
                                                     [],
@@ -2593,6 +2705,8 @@ class LlmMixin(AuditMixin):
                                                 finish_reason = choice.get(
                                                     'finish_reason',
                                                 )
+                                                if finish_reason is not None:
+                                                    seen_terminal = True
 
                                                 # reasoning_content 独立处理
                                                 rc_val = delta.get('reasoning_content')
@@ -2845,46 +2959,53 @@ class LlmMixin(AuditMixin):
                                         )
                                     except SSE_CLIENT_GONE:
                                         logger.debug('SSE 残余写入失败')
+                            # ── 截断检测：byte_buf 残留或未收到终止事件则告警并合成 ──
+                            _truncated = False
                             if byte_buf:
+                                _truncated = True
+                                _preview = byte_buf[:200].decode(
+                                    'utf-8', errors='replace'
+                                )
+                                logger.warning(
+                                    'LLM 流截断: bytes_buf_len=%d sse_events=%d bytes_written=%d req_id=%s tail=%s preview=%r',
+                                    len(byte_buf),
+                                    sse_event_count,
+                                    bytes_written,
+                                    req_id,
+                                    tail,
+                                    _preview,
+                                )
+                                # 丢弃破损残余，不直接转发避免下游 JSONDecodeError
+                            if (
+                                not seen_terminal
+                                and bytes_written > 0
+                                and sse_event_count > 0
+                            ):
+                                if not _truncated:
+                                    logger.warning(
+                                        'LLM 流未收到终止事件: sse_events=%d bytes_written=%d req_id=%s tail=%s is_responses=%s is_anthropic=%s',
+                                        sse_event_count,
+                                        bytes_written,
+                                        req_id,
+                                        tail,
+                                        is_responses_stream,
+                                        is_anthropic_stream,
+                                    )
+                                _truncated = True
+                            if _truncated:
                                 try:
-                                    residual = byte_buf.decode(
-                                        'utf-8',
-                                        errors='replace',
-                                    )
-                                    # JSON-aware: 残余可能为半行 SSE (data: {JSON}) 或
-                                    # 裸 JSON 片段；data: 前缀走 SSE 行级 json-aware，
-                                    # 否则走 payload 级 json-aware，避免 \u/p@ss"quote 破坏。
-                                    _residual_stripped = residual.lstrip()
-                                    if _residual_stripped.startswith('data:'):
-                                        restored = await self._pii_process_sse_line(
-                                            residual, active_t2p
-                                        )
-                                    elif hasattr(
-                                        self, '_pii_response_process_json_aware'
-                                    ):
-                                        restored = (
-                                            await self._pii_response_process_json_aware(
-                                                residual, active_t2p
-                                            )
-                                        )
+                                    if is_responses_stream:
+                                        _fb = self._build_truncated_event_responses()
+                                    elif is_anthropic_stream:
+                                        _fb = self._build_truncated_event_anthropic()
                                     else:
-                                        restored = await self._pii_response_process(
-                                            residual, active_t2p
-                                        )
-                                    # 流末残余清理（Round 17 R4 收尾）：残余字节可能
-                                    # 含分片切断的 token 前缀（__VG_C…/__PII_…），
-                                    # _pii_response_process 不清理，这里统一剥除防泄漏。
-                                    try:
-                                        restored = _strip_token_forms_json_aware(
-                                            restored
-                                        )
-                                    except NameError:
-                                        restored = _strip_partials(restored)
-                                    await _tracked_write(
-                                        restored.encode('utf-8'),
-                                    )
+                                        _fb = self._build_truncated_event()
+                                    await _tracked_write(_fb.encode('utf-8'))
+                                    seen_terminal = True
                                 except SSE_CLIENT_GONE:
-                                    logger.debug('SSE 残余写入失败')
+                                    logger.debug('SSE 截断合成写入失败，客户端已断连')
+                                except Exception:
+                                    logger.exception('SSE 截断合成异常')
                             # D3: 流末 hold 悬挂兜底：若 audit_hold 仍 active，强制拒绝再走守门
                             if getattr(self, '_audit_hold_active', False):
                                 try:
@@ -2993,6 +3114,8 @@ class LlmMixin(AuditMixin):
                                             'audit_block_injected': audit_block_injected,
                                             'tool_calls_blocked': tool_calls_blocked,
                                             'bytes_buf_len': len(byte_buf),
+                                            'seen_terminal': seen_terminal,
+                                            'truncated': _truncated,
                                         },
                                     )
                                 except Exception as exc:
@@ -3003,6 +3126,9 @@ class LlmMixin(AuditMixin):
                             resp_log_path = None
                             fast_sse_event_count = 0
                             fast_bytes_written = 0  # D3 fast路径同样按字节守门
+                            fast_seen_terminal = (
+                                False  # 是否已收到终止事件（fast 路径）
+                            )
 
                             async def _tracked_write(data: bytes):
                                 nonlocal fast_bytes_written
@@ -3049,6 +3175,15 @@ class LlmMixin(AuditMixin):
                                                 continue
 
                                             fast_sse_event_count += 1
+                                            if (
+                                                payload.strip() == '[DONE]'
+                                                or '"response.completed"' in payload
+                                                or '"response.failed"' in payload
+                                                or '"response.incomplete"' in payload
+                                                or '"message_stop"' in payload
+                                                or '"finish_reason"' in payload
+                                            ):
+                                                fast_seen_terminal = True
                                             if _debug_save_eligible:
                                                 try:
                                                     await _debug_append_line(
@@ -3143,44 +3278,53 @@ class LlmMixin(AuditMixin):
                                             byte_buf = bytearray()
                             except SSE_CLIENT_GONE as e:
                                 logger.debug('SSE 客户端断连: %s', e)
-                            # 残余字节 + EOF
+                            # ── fast 截断检测 ──
+                            _fast_truncated = False
                             if byte_buf:
+                                _fast_truncated = True
+                                _preview = byte_buf[:200].decode(
+                                    'utf-8', errors='replace'
+                                )
+                                logger.warning(
+                                    'LLM 流截断(fast): bytes_buf_len=%d sse_events=%d bytes_written=%d req_id=%s tail=%s preview=%r',
+                                    len(byte_buf),
+                                    fast_sse_event_count,
+                                    fast_bytes_written,
+                                    req_id,
+                                    tail,
+                                    _preview,
+                                )
+                            if (
+                                not fast_seen_terminal
+                                and fast_bytes_written > 0
+                                and fast_sse_event_count > 0
+                            ):
+                                if not _fast_truncated:
+                                    logger.warning(
+                                        'LLM 流未收到终止事件(fast): sse_events=%d bytes_written=%d req_id=%s tail=%s',
+                                        fast_sse_event_count,
+                                        fast_bytes_written,
+                                        req_id,
+                                        tail,
+                                    )
+                                _fast_truncated = True
+                            if _fast_truncated:
                                 try:
-                                    residual = byte_buf.decode(
-                                        'utf-8',
-                                        errors='replace',
-                                    )
-                                    _residual_stripped = residual.lstrip()
-                                    if _residual_stripped.startswith('data:'):
-                                        restored = await self._pii_process_sse_line(
-                                            residual, active_t2p
-                                        )
-                                    elif hasattr(
-                                        self, '_pii_response_process_json_aware'
-                                    ):
-                                        restored = (
-                                            await self._pii_response_process_json_aware(
-                                                residual, active_t2p
-                                            )
-                                        )
+                                    _tail_norm = tail.rstrip('/')
+                                    if _tail_norm.endswith('v1/responses'):
+                                        _fb = self._build_truncated_event_responses()
+                                    elif _tail_norm.endswith('v1/messages'):
+                                        _fb = self._build_truncated_event_anthropic()
                                     else:
-                                        restored = await self._pii_response_process(
-                                            residual, active_t2p
-                                        )
-                                    # 流末残余清理（Round 17 R4 收尾）：残余字节可能
-                                    # 含分片切断的 token 前缀（__VG_C…/__PII_…），
-                                    # _pii_response_process 不清理，这里统一剥除防泄漏。
-                                    try:
-                                        restored = _strip_token_forms_json_aware(
-                                            restored
-                                        )
-                                    except NameError:
-                                        restored = _strip_partials(restored)
-                                    await _tracked_write(
-                                        restored.encode('utf-8'),
-                                    )
+                                        _fb = self._build_truncated_event()
+                                    await _tracked_write(_fb.encode('utf-8'))
+                                    fast_seen_terminal = True
                                 except SSE_CLIENT_GONE:
-                                    logger.debug('SSE 残余写入失败')
+                                    logger.debug(
+                                        'SSE 截断合成写入失败(fast)，客户端已断连'
+                                    )
+                                except Exception:
+                                    logger.exception('SSE 截断合成异常(fast)')
                             if fast_bytes_written == 0 and upstream_resp.status == 200:
                                 # fast path 无审计：上游真空流，注入最小拒绝消息避免空体
                                 try:
@@ -3236,6 +3380,9 @@ class LlmMixin(AuditMixin):
                                             'bytes_written': fast_bytes_written,
                                             'tail': tail,
                                             'target_url': target_url,
+                                            'bytes_buf_len': len(byte_buf),
+                                            'seen_terminal': fast_seen_terminal,
+                                            'truncated': _fast_truncated,
                                         },
                                     )
                                 except Exception as exc:

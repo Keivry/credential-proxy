@@ -1,5 +1,7 @@
 # Changelog
 
+- **v0.9.16** — 流式截断检测+合成终止：`byte_buf` 残留或 `!seen_terminal`（`bytes_written>0 && sse_events>0`）时 `warning`（含 `bytes_buf_len/sse_events/bytes_written/req_id/tail/preview`）并丢弃破损残余，注入协议对应合成终止（`chat→[DONE]` / `anthropic→message_stop` / `responses→response.failed`）避免下游 `JSONDecodeError: char 0`；slow/fast 双路径 `seen_terminal` 追踪（`[DONE]`/`response.completed/failed/incomplete`/`message_stop`/`finish_reason`，fast 含字符串启发式及续行重建路径补标记），`stream_meta.json` 新增 `seen_terminal/truncated/bytes_buf_len`；新增 `TRUNCATED_MESSAGE` 中文提示“请重试”
+
 - **v0.9.15** — C 方案 orjson 全量 json-aware + 叶子级最小回退：移除三处 `len>1M → plain`（`_token._redact/_restore`、`_pii.pii_redact_json_aware`、`_llm._strip_token_forms_json_aware`），大包亦走 `loads→walk→dumps`（`orjson 2-3ms` vs `stdlib 12ms`，`orjson>=3.9` 可选依赖，无则回退 `stdlib`）；`walk` 透传 `path`（`$.a[0].b` / `→$.inner`），叶子级仅 `new_s!=s` 时 `jdumps` 校验失败回退该叶子并 `warning(path)`，其他叶子保留脱敏/还原，泄漏最小；外层二次校验仅 `has_cred/has_pii` / `active_t2p` 非空时触发，`happy path 0 额外 loads`；SSE 按行隔离；新增 `test_orjson_leaf_fallback` 4 场景
 
 - **v0.9.14** — 移除 `>1M` 纯文本回退：`_llm._pii_response_process_json_aware` 与 `_pii_process_sse_line` 及 `_token._restore_json_aware` 的 `len>1M` 守门改走 JSON-aware（大负载仍 `loads→walk→dumps(ensure_ascii=False)` 正确转义 `p@ss"quote`/`\u`/`\`/`\n`/`emoji`），修复 `>1M` 裸 JSON 经 `plain str.replace` 未转义导致 `Expecting ',' delimiter / Invalid \escape` 的 P0 潜伏；`_strip_token_forms_json_aware` 剥离为空安全保留 1M 守卫
