@@ -189,6 +189,8 @@ get revoke --name "check-mail"
 | `PII_HOLD_MAX` | 审计 hold 缓冲尾部持有上限（字符，仅审计挂起用；流式正文行缓冲由 `LINE_BUF_FLUSH=16KB`/`LINE_BUF_MAX_AGE=30s` 控制，见下方流式阈值） | `64` |
 | `PII_FUZZY_RESTORE` | 模糊还原（大小写不敏感，仅 `re.IGNORECASE`，默认精确匹配，不含编辑距离） | `0` |
 | `PII_DETECTION_HARDENING` | 检测侧硬化总闸（`1` 时启用：保留地址精确前缀 `fc:/fd:`/`10.` 等含尾点/冒号+`lower()`+`ip_network` 兜底 / ReDoS `ThreadPool(2)+timeout 0.1s` / 字典 CJK 边界 `(?<![\\w\\u4e00-\\u9fff])` / `@lru_cache(4)`，默认关闭不改变既有行为） | `0` |
+| `PII_PLACEHOLDER_PROMPT` | 脱敏占位符说明注入开关：PII 脱敏实际产生占位符时向上游注入说明提示词（告知 `__PII_*__`/`__VG_CRED_*__` 为脱敏占位符、原样保留勿改写）。`0`/`false`/`no` 关闭（应急开关，不建议长期关闭——关闭后格式敏感占位符可能被上游改写导致还原失配） | `1`（默认开启） |
+| `PII_PLACEHOLDER_PROMPT_TEXT` | 自定义占位符说明文案；未设置/空/全空白用内置默认（中文）；上限 4KB（超限截断并告警）；含合法形态占位符（`__PII_<seq>_<hex8>__`/`__VG_CRED_<digits>__`，大小写不敏感）时回退内置默认文案。⚠️ **信任边界：与 `SYSTEM_PROMPT` 同特权（注入直达上游 system 指令），仅运维可写，不可接受非可信用户输入** | 空（内置默认） |
 | `PII_VAULT_GAP_AWARE` | 内置稳态下标（非开关，`next_available_index` 空洞跳过，`__PII_<seq>_<rand8>__` 其中 `rand8=secrets.token_hex(4)`） | —（内置） |
 
 > **Vault 稳态与保留前缀**：`__PII_<seq>_<rand8>__`（`seq` 为 `next_available_index` 空洞跳过递增，`rand8=secrets.token_hex(4)` CSPRNG）与 `__VG_CRED_NNNNNN__` 为保留前缀，完整形态原样保留不剥离；`resp_p2t`（响应期注册）不还原为明文（仅请求期 `pii_t2p` 可还原），响应侧命中仅提升 LRU 不泄漏；并发 `register` 全程持 `asyncio.Lock` 原子覆盖 `used set` 快照与 `token` 写入，`asyncio.gather` 100 并发无下标冲突。

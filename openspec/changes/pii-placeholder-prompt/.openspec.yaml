@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-08-27
+goal: 当请求实际发生 PII/凭据脱敏时，向上游 LLM 的 messages 注入一条说明：__PII_*__ 与 __VG_CRED_*__
+  是脱敏占位符，请原样保留、勿校验格式、勿改写补全

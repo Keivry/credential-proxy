@@ -102,6 +102,27 @@ PII_RE_DOS_MAX_WORKERS = 2  # 独立线程池（与日志写 run_in_executor 不
 PII_RE_DOS_STRIKES = 3  # 连续超时 3 次临时停用
 PII_SCAN_INPUT_LIMIT = 1_048_576  # 单次扫描输入上限 1MB
 
+# ── 占位符说明提示词（pii-placeholder-prompt）──
+# 注入给上游 LLM 的默认说明文案：告知 __PII_*__ / __VG_CRED_*__ 是脱敏占位符。
+# 安全不变量（design D5）：
+#   - 静态文本，不含真实 PII 值、不含占位符序号
+#   - 用 `*` 通配形态描述（非合法 hex8/数字），不命中 PII/凭据真实形态
+#     （__PII_<seq>_<hex8>__ / __VG_CRED_<digits>__），不被检测引擎误伤
+#   - 明确「不要校验格式」覆盖 IP 192.168.1.100 → __PII_...__ 被改写成 0.0.0.0 的格式敏感风险
+#   - 明确「不要推断或补全」防模型幻觉补全占位符内容
+#   - 点名 tool_calls/function 参数（工具参数 JSON Schema 校验比 content 更严格）
+PII_PLACEHOLDER_PROMPT_DEFAULT = (
+    '说明：消息中形如 __PII_*__ 和 __VG_CRED_*__ 的标记是安全网关的敏感信息脱敏占位符，'
+    '代表被替换的原始值（如手机号、IP 地址、银行卡号、密钥等）。请原样保留这些占位符'
+    '（包括 content 与 tool calls/function 参数中的）：不要修改格式、不要校验其合法性、'
+    '不要推断或补全内容，也不要视为输入错误。它们不是格式问题，直接使用即可。'
+)
+PII_PLACEHOLDER_PROMPT_MAX_LEN = 4096  # 自定义文案长度上限 4KB（超限截断并告警）
+# 合法形态占位符：自定义文案含此形态时回退内置（防说明文本被脱敏/还原链误匹配）
+_PII_PLACEHOLDER_FORBIDDEN_RE = _re.compile(
+    r'__PII_\d+_[0-9a-fA-F]{8}__|__VG_CRED_\d+__'
+)
+
 
 # ── Detection hardening 总闸（PII_DETECTION_HARDENING=1 时启用精确保留前缀/ReDoS/CJK/缓存）──
 def _is_detection_hardening() -> bool:
@@ -271,12 +292,39 @@ def parse_pii_env_config() -> dict:
         errors.append(f'PII_DETECTION_HARDENING 非法值(仅 0/1): {raw_hardening!r}')
         detection_hardening = False
 
+    # PII_PLACEHOLDER_PROMPT: 占位符说明注入开关（默认 1 启用，0/false/no 关闭）
+    _pp_raw = os.environ.get('PII_PLACEHOLDER_PROMPT', '').strip().lower()
+    placeholder_prompt_enabled = _pp_raw not in ('0', 'false', 'no')
+    # PII_PLACEHOLDER_PROMPT_TEXT: 自定义文案（未设置/空/全空白 → 内置默认文案）
+    # 开关关闭时（spec R3/design D4）：SHALL NOT 解析/校验/告警，零副作用短路
+    placeholder_prompt_text = ''
+    if placeholder_prompt_enabled:
+        raw_text = os.environ.get('PII_PLACEHOLDER_PROMPT_TEXT', '')
+        if raw_text and raw_text.strip():
+            # 先校验禁词再截断（防超长文案中 4096 之后的合法占位符形态被截掉逃逸）
+            if _PII_PLACEHOLDER_FORBIDDEN_RE.search(raw_text):
+                # 含合法形态占位符：回退内置文案（防说明文本被脱敏/还原链误匹配）
+                logger.warning(
+                    'PII_PLACEHOLDER_PROMPT_TEXT 含合法形态占位符，回退内置默认文案'
+                )
+            else:
+                if len(raw_text) > PII_PLACEHOLDER_PROMPT_MAX_LEN:
+                    logger.warning(
+                        'PII_PLACEHOLDER_PROMPT_TEXT 超长(%d>%d)，截断到上限',
+                        len(raw_text),
+                        PII_PLACEHOLDER_PROMPT_MAX_LEN,
+                    )
+                    raw_text = raw_text[:PII_PLACEHOLDER_PROMPT_MAX_LEN]
+                placeholder_prompt_text = raw_text
+
     return {
         'enabled': enabled,
         'response_side': response_side,
         'hold_max': hold_max,
         'fuzzy_restore': fuzzy_restore,
         'detection_hardening': detection_hardening,
+        'placeholder_prompt_enabled': placeholder_prompt_enabled,
+        'placeholder_prompt_text': placeholder_prompt_text,
         'errors': errors,
     }
 
@@ -926,6 +974,9 @@ class PiiMixin:
         self.pii_enabled = False
         self.pii_response_side = True
         self.pii_hold_max = PII_HOLD_MAX_DEFAULT
+        # 占位符说明提示词（pii-placeholder-prompt）：默认启用，文案默认内置
+        self.pii_placeholder_prompt_enabled = True
+        self.pii_placeholder_prompt_text = ''
         self._pii_scope = self._global_pii_scope  # 兼容旧路径：默认指向全局单例
 
     def _pii_request_scope(self):
@@ -1080,3 +1131,109 @@ class PiiMixin:
         except Exception:
             logger.debug('pii_redact_json_aware 回退到纯文本路径', exc_info=True)
             return await self.pii_redact(text, response_side)
+
+    # ── 占位符说明提示词注入（pii-placeholder-prompt）──
+
+    def _pii_placeholder_text(self) -> str:
+        """当前生效的说明文案：自定义非空用自定义，否则内置默认。"""
+        custom = getattr(self, 'pii_placeholder_prompt_text', '') or ''
+        return custom.strip() or PII_PLACEHOLDER_PROMPT_DEFAULT
+
+    @staticmethod
+    def _pii_placeholder_inject_obj(obj, prompt: str, protocol: str = 'openai'):
+        """在已解析的消息对象中注入说明提示词（原地修改并返回）。
+
+        协议分支（design D2），协议以路由 path 判定（由调用方传入）：
+        - 'anthropic'：顶层 system 字段（字符串或数组）存在 → 追加；
+          不存在 → 新建顶层 system 字符串（Anthropic 不用 messages 内 system 角色）。
+        - 'responses'：input[] 数组；input[0].role == "system" → 追加 content；
+          否则新建 system 消息插入头部；空 input → 唯一 system 消息。
+        - 'openai'：messages[] 数组；同 responses 逻辑。
+
+        content/system 为数组时：向数组末尾追加 text block；若最后一个元素已是
+        text，追加到其末尾。多条 system 仅追加第一条。非 JSON 结构（无法定位
+        messages/input/system）→ 返回 False 表示不注入。
+        """
+
+        def _append_text(field):
+            if isinstance(field, str):
+                if not field:
+                    return prompt  # 空 system/content：直接替换，不留前导换行
+                return field + '\n\n' + prompt
+            if isinstance(field, list):
+                if field and isinstance(field[-1], dict):
+                    last = field[-1]
+                    if last.get('type') == 'text' and isinstance(last.get('text'), str):
+                        last['text'] = last['text'] + '\n\n' + prompt
+                        return field
+                field.append({'type': 'text', 'text': prompt})
+                return field
+            return field  # 未知类型：不注入（安全透传）
+
+        # Anthropic：顶层 system 字段（字符串或数组）
+        if protocol == 'anthropic':
+            if isinstance(obj, dict) and obj.get('system') is not None:
+                sys_field = obj['system']
+                if isinstance(sys_field, (str, list)):
+                    obj['system'] = _append_text(sys_field)
+                    return True
+                return False  # 未知类型：不注入（安全透传）
+            if isinstance(obj, dict):
+                obj['system'] = prompt
+                return True
+            return False
+
+        # OpenAI / Responses：messages/input 数组
+        msgs = obj.get('messages') if isinstance(obj, dict) else None
+        if protocol == 'responses':
+            msgs = obj.get('input') if isinstance(obj, dict) else None
+        if isinstance(msgs, list):
+            if not msgs:
+                msgs.append({'role': 'system', 'content': prompt})
+                return True
+            first = msgs[0]
+            if isinstance(first, dict) and first.get('role') == 'system':
+                if isinstance(first.get('content'), (str, list)):
+                    first['content'] = _append_text(first['content'])
+                    return True
+                # content 缺失/未知类型：仍追加为字符串（保守）
+                first['content'] = _append_text(first.get('content') or '')
+                return True
+            msgs.insert(0, {'role': 'system', 'content': prompt})
+            return True
+
+        # 无法定位可注入结构：不注入
+        return False
+
+    def inject_placeholder_prompt(self, body_text: str, protocol: str = 'openai'):
+        """向脱敏后的请求 body 注入占位符说明提示词（同步纯函数）。
+
+        protocol 由调用方按路由 path 判定（'openai'/'anthropic'/'responses'）。
+
+        错误路径（design D6）：body 非合法 JSON / 非对象 → 透传原 body 不注入、
+        不抛异常（与 _llm.py 现有「JSON 解析失败回退原文」模式一致）。
+        注入为请求作用域纯函数：无共享可变状态、无需锁、不读写
+        pii_t2p/used_tokens，与脱敏/还原映射无冲突。
+        """
+        if not body_text or not getattr(self, 'pii_placeholder_prompt_enabled', True):
+            return body_text
+        stripped = body_text.lstrip('\ufeff').lstrip()
+        if not (stripped.startswith(('{', '['))):
+            return body_text  # 非 JSON：透传不注入
+        try:
+            obj = _jloads(body_text.lstrip('\ufeff'))
+        except Exception:
+            logger.debug(
+                'inject_placeholder_prompt 解析失败，透传原 body', exc_info=True
+            )
+            return body_text
+        if not isinstance(obj, dict):
+            return body_text  # 非对象：透传不注入
+        prompt = self._pii_placeholder_text()
+        try:
+            if self._pii_placeholder_inject_obj(obj, prompt, protocol):
+                return _jdumps(obj)
+        except Exception:
+            logger.exception('inject_placeholder_prompt 注入异常，透传原 body')
+            return body_text
+        return body_text

@@ -221,6 +221,10 @@ class CredentialProxy(
         self.pii_hold_max = pii_cfg['hold_max']
         self.pii_fuzzy_restore = pii_cfg.get('fuzzy_restore', False)
         self.pii_detection_hardening = pii_cfg.get('detection_hardening', False)
+        self.pii_placeholder_prompt_enabled = pii_cfg.get(
+            'placeholder_prompt_enabled', True
+        )
+        self.pii_placeholder_prompt_text = pii_cfg.get('placeholder_prompt_text', '')
 
         audit_cfg = parse_audit_env_config(require_whitelist=True)
         self._audit_startup_errors = audit_cfg['errors']

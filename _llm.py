@@ -2241,6 +2241,35 @@ class LlmMixin(AuditMixin):
                 active_t2p = {}
                 pii_scope = None
 
+            # ── 占位符说明提示词注入（pii-placeholder-prompt）──
+            # 触发条件（D1/D3/D4，三者同时满足才注入）：
+            #   (a) is_dialog_tail 且 pii_enabled（脱敏路径）
+            #   (b) pii_placeholder_prompt_enabled（开关）
+            #   (c) 脱敏后 body 含 __PII_ 或 __VG_CRED_ 占位符（OR 语义，任一命中）
+            # 零脱敏零注入：无占位符时不注入，不污染 prompt、不消耗 token。
+            # 注入在 pii_redact_json_aware 之后、转发上游之前；禁止注入后二次
+            # PII 扫描（design D6，防说明文本自身被脱敏）。
+            if (
+                is_dialog_tail
+                and getattr(self, 'pii_enabled', False)
+                and getattr(self, 'pii_placeholder_prompt_enabled', True)
+                and (b'__PII_' in out_body or b'__VG_CRED_' in out_body)
+            ):
+                try:
+                    # 协议以路由 path 判定（design D2 协议判定 path 为主）
+                    if tail.rstrip('/').endswith('v1/messages'):
+                        _pp_protocol = 'anthropic'
+                    elif tail.rstrip('/').endswith('v1/responses'):
+                        _pp_protocol = 'responses'
+                    else:
+                        _pp_protocol = 'openai'
+                    out_body = self.inject_placeholder_prompt(
+                        out_body.decode('utf-8', errors='replace'),
+                        protocol=_pp_protocol,
+                    ).encode('utf-8')
+                except Exception:
+                    logger.exception('注入占位符说明提示词失败，透传原 body')
+
             # === DEBUG: 脱敏后请求落盘（与原版对比） ===
             if _debug_save_eligible:
                 try:
