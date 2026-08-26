@@ -25,6 +25,11 @@
 - **WHEN** JSON 嵌套深度 >5 的叶字符串
 - **THEN** 不再对内层 `loads→walk→dumps`，仅对该叶执行 `leaf_fn`，不回退整包
 
+#### Scenario: 裸嵌套深度炸弹不崩溃
+
+- **WHEN** `dict`/`list` 裸嵌套（`{"a":{"a":...}}`）深度 >5 或极端（3000 层）
+- **THEN** 深度守卫对裸嵌套同样生效：`depth>5` 的内层不再递归 `loads→walk`；极端深度不抛 `RecursionError`（walk 入口兜底返回原对象），不崩溃请求
+
 #### Scenario: original 合法而 output 非法回退原串
 
 - **WHEN** 某叶 `leaf_fn` 替换后 `_validate_json_roundtrip` 判定 `output` 非法 JSON

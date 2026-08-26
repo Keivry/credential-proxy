@@ -10,12 +10,18 @@ from _token import PII_MAX_ENTRIES, GlobalPiiTokens
 
 @pytest.mark.asyncio
 async def test_nonstream_empty_after_strip_returns_502_shape():
-    """非流式：上游仅含幻觉 token，经 _strip_token_forms 后空白 → 应转 502 application/json"""
-    # 构造仅含幻觉 token 的上游返回（未注册，_strip_token_forms 应剥离）
-    hallucinated = '__PII_7_ab12cd34__ __VG_CRED_000007__'
+    """非流式：上游仅含幻觉 token，经 _strip_token_forms 后清理。
+
+    8.2 修复：完整 PII token（__PII_<seq>_<rand8>__）保留——它可能是
+    响应期新注册 token（vault-stable-mapping spec「响应期新 token 不被
+    还原、原样保留」）；幻觉完整 PII token 保留为随机 token 不泄漏明文。
+    凭据 token（__VG_CRED_*）仍剥离；两者都清理后才空白 → 502。
+    """
+    # 构造仅含幻觉 token 的上游返回（未注册）
+    hallucinated = '__VG_CRED_000007__'
     # 模拟 handler 非流式分支逻辑
     out_text = _strip_token_forms(hallucinated)
-    # 剥离后应为空白
+    # 凭据 token 剥离后应为空白
     assert not out_text.strip(), f'剥离后应为空白，实际: {out_text!r}'
     # 模拟 502 构造
     body = json.dumps({'error': {'message': 'empty after strip'}}).encode()
@@ -27,6 +33,12 @@ async def test_nonstream_empty_after_strip_returns_502_shape():
     for status in [401, 429, 502]:
         should_inject = (not out_text.strip()) and status == 200
         assert not should_inject, f'status={status} 不应注入'
+
+
+def test_nonstream_pii_token_kept_after_strip():
+    """8.2：完整 PII token 在非流式出口保留（响应期新 token 语义）。"""
+    out_text = _strip_token_forms('__PII_7_ab12cd34__')
+    assert '__PII_7_ab12cd34__' in out_text
 
 
 @pytest.mark.asyncio

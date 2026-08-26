@@ -117,8 +117,17 @@ PII_TOKEN_LOOSE_RE = _re.compile(r'__PII_\d+_[^_\s]{1,16}__')
 # 行尾完整 PII token 形态（流末清理模型幻觉的完整未知 token）
 FULL_PII_TOKEN_RE = _re.compile(r'__PII_\d+_[0-9a-f]{8}__$')
 # 行尾残缺 PII token 前缀（分片边界清理）——仿照 _PARTIAL_TOKEN_RE 语义，
-# 但独立常量，不得 import/共用凭据正则（design D2 硬性）
-_PII_PARTIAL_TOKEN_RE = _re.compile(r'__PI(?:I(?:_(?:\d+_)?[0-9a-fA-F]*)?)?_*$')
+# 但独立常量，不得 import/共用凭据正则（design D2 硬性）。
+# 8.2 修复：在 `__PI` 后负向前瞻 (?!I_\d+_[0-9a-f]{8}__) 排除完整形态
+# `__PII_<seq>_<rand8>__`，使完整 token 不被误剥（响应期新 token 保留语义）。
+# 8.9 修复（F-10）：结尾 `(?:$|(?=\s|[^\w]))` 覆盖行中残缺形态——
+# 残缺前缀后跟空白/标点/汉字等非单词字符时同样剥离；后跟 `_`/hex（可能是
+# 不完整 token 待续）保留。
+# 注意：前瞻必须置于 `__PI` 之后（而非 hex 段之后），否则 `[0-9a-fA-F]*`
+# 回溯可绕过前瞻重新匹配完整形态。
+_PII_PARTIAL_TOKEN_RE = _re.compile(
+    r'__PI(?!I_\d+_[0-9a-f]{8}__)(?:I(?:_(?:\d+_)?[0-9a-fA-F]*)?)?(?:_*$|(?=\s|[^\w]))'
+)
 
 
 PII_MAX_ENTRIES = (

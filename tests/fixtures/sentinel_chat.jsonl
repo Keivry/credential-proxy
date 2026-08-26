@@ -2,7 +2,7 @@
 {"kind": "sse", "line": "data: {\"choices\":[{\"delta\":{\"content\":\"订单\"},\"index\":0}]}\n\n"}
 {"kind": "sse", "line": "data: {\"choices\":[{\"delta\":{\"content\":\"查询中\"},\"index\":0}]}\n\n"}
 {"kind": "sse", "line": ": keepalive\n\n"}
-{"kind": "sse", "line": "data: {\"choices\":[{\"delta\":{\"content\":\"第一路\"},\"index\":0},{\"delta\":{\"content\":\"13800138000\"},\"index\":1}]}\n\n"}
+{"kind": "sse", "line": "data: {\"choices\":[{\"delta\":{\"content\":\"第一路\"},\"index\":0},{\"delta\":{\"content\":\"__PII_1_ab12cd34__\"},\"index\":1}]}\n\n"}
 {"kind": "sse", "line": "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"query_order\",\"arguments\":\"{\\\"phone\\\":\\\"__PII_1_ab12cd34__\\\"}\"}}]},\"index\":0}]}\n\n"}
 {"kind": "sse", "line": "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\",\"index\":0}]}\n\n"}
 {"kind": "sse", "line": "data: [DONE]\n\n"}

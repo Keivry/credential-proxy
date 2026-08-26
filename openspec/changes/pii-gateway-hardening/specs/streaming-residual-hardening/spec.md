@@ -62,6 +62,18 @@
 - **WHEN** 上游 chunk 边界切在 `\r`|`\n` 之间（前 chunk 末尾孤立 `\r`，后 chunk 首 `\n`）
 - **THEN** 不将孤立 `\r` 立即转为 `\n` 触发空行 `dispatch`，待下 chunk 到达后整体按 `CRLF` 一次归一
 
+#### Scenario: CR-only 行流末正常 dispatch
+- **WHEN** 上游以 `data: {"a":1}\r`（CR-only 行，无 LF）直接断流，`pending_cr=True` 且 `byte_buf` 残留 `\r`
+- **THEN** EOF 时 `pending_cr` 视为行终止符立即 dispatch 该行，不残留 `\r`、不误判截断合成
+
+#### Scenario: 无空行分隔的多 data 行不泄漏
+- **WHEN** 同一事件内 `data: {"a":1}` 与 `data: {"b":2}` 两行之间无空行分隔（非法但可能出现的上游），`data_buffer` join 后 `loads` 抛 `JSONDecodeError: Extra data`
+- **THEN** 聚合失败时逐行独立 `_pii_response_process` 保底脱敏后转发，不抛异常、不转发未脱敏原始 payload
+
+#### Scenario: 快链同样具备 WHATWG 帧完整性
+- **WHEN** 快链（PII 检测启用但无请求期 token，`active_t2p` 为空）遇到 BOM、CRLF、`: comment`、CR-only 行或跨 `data:` 行切断的 PII 片段（`user@exa`+`mple.com`）
+- **THEN** 快链复用慢链 `data_buffer`/BOM/`pending_cr` 帧状态机与 `line_buf` 合并语义（仅跳过 json_aware walk 保留 text-level 还原），不旁路泄漏片段
+
 #### Scenario: BOM 跨 chunk 仍剥离
 - **WHEN** 流首 `0xEF 0xBB 0xBF` 被分片为 `EF`|`BB BF` 两 chunk
 - **THEN** 累积 ≥3 字节后仍单次剥离，不因分片残留 `EF` 导致首行解析失败

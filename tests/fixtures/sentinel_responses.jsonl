@@ -2,7 +2,9 @@
 {"kind": "sse", "line": "data: {\"type\":\"response.output_text.delta\",\"delta\":\"张三\"}\n\n"}
 {"kind": "sse", "line": ": keepalive\n\n"}
 {"kind": "sse", "line": "data: {\"type\":\"response.output_text.delta\",\"delta\":\"的订单\"}\n\n"}
+{"kind": "sse", "line": "data: {\"type\":\"response.refusal.delta\",\"delta\":\"拒绝提供 13800138000\"}\n\n"}
+{"kind": "sse", "line": "data: {\"type\":\"response.audio.transcript.delta\",\"delta\":\"13800138000 的订单\"}\n\n"}
 {"kind": "sse", "line": "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"name\\\":\\\"张三\\\"}\"}\n\n"}
 {"kind": "sse", "line": "data: {\"type\":\"response.function_call_arguments.done\"}\n\n"}
 {"kind": "sse", "line": "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n"}
-{"kind": "audit", "audit": {"data_buffer_joined": true, "seen_global_terminal": "response.completed"}}
+{"kind": "audit", "audit": {"data_buffer_joined": true, "seen_global_terminal": "response.completed", "refusal_line_buffered": true, "audio_transcript_line_buffered": true}}

@@ -106,7 +106,6 @@ def _llm_validate_json_roundtrip(original: str, output: str, label: str) -> str:
 
 # ── Per-request ContextVars for concurrency isolation (D2) ──
 _pii_scope_var = contextvars.ContextVar('_pii_scope_var', default=None)
-_audit_arg_accum_var = contextvars.ContextVar('_audit_arg_accum_var', default='')
 _audit_hold_active_var = contextvars.ContextVar('_audit_hold_active_var', default=False)
 _audit_hold_buf_var = contextvars.ContextVar('_audit_hold_buf_var', default=None)
 _audit_hold_bytes_var = contextvars.ContextVar('_audit_hold_bytes_var', default=0)
@@ -142,7 +141,10 @@ LINE_BUF_MAX_AGE = 30  # 持有超长阈值 (30s)
 KEEPALIVE_INTERVAL = 10  # 保活间隔 (10s, `: keepalive\\n\\n` comment)
 # 流末清理：匹配 token 前缀/残缺形态（含完整但未还原的幻觉 token）。
 # 真实 token 会被 _restore 先行还原为明文，不会落此正则。
-_PARTIAL_TOKEN_RE = _re.compile(r'__VG_C(?:R(?:E(?:D(?:_?\d*)?)?)?)?_*$')
+# 8.9 修复（F-10）：结尾 `(?:$|(?=\s|[^\w]))` 覆盖行中残缺形态。
+_PARTIAL_TOKEN_RE = _re.compile(
+    r'__VG_C(?:R(?:E(?:D(?:_?\d*)?)?)?)?(?:_*$|(?=\s|[^\w]))'
+)
 # 完整 token 形态（行尾）：__VG_CRED_NNNNNN__
 _FULL_TOKEN_RE = _re.compile(r'__VG_CRED_\d+__$')
 # ── 6.5 超长强制候选感知：检测行尾是否可能为 PII 前缀（IP/邮箱/fe80::）──
@@ -477,16 +479,18 @@ def _mk_anthropic_flush_event(parsed: dict, text: str, field: str) -> str:
 def _strip_token_forms(content: str) -> str:
     """剥离凭据 + PII token 形态（safe 输出前清理残留 token 字符串）。
 
-    - 凭据 token（TOKEN_STR_RE）完整形态剥离
-    - PII token（PII_TOKEN_STR_RE）完整形态剥离——响应期注册的 token
-      在还原时被保留（resp_t2p 形态匹配不还原），safe 输出前必须剥离
-      防止把 token 字符串发给客户端
+    - 凭据 token（TOKEN_STR_RE）完整形态剥离——凭据无响应期注册场景，
+      幻觉/未知句柄必须清理
+    - PII token（PII_TOKEN_STR_RE）完整形态**保留**——响应期注册的 token
+      在还原时被保留（resp_t2p 形态匹配不还原），safe 输出前必须保留
+      （8.2 修复：vault-stable-mapping spec「响应期新 token 不被还原、
+      原样保留」；幻觉完整 token 由 _split_safe_hold 的 FULL_PII_TOKEN_RE
+      先行 hold 分离，不会到达此函数泄漏）
     - 残缺形态（流分片边界切断的 __VG_/__PII_ 前缀）由 _strip_partials
       兜底——任何 safe 输出出口都经此函数，统一获得残缺清理
       （Round 17 R4：mid-stream safe flush / 流末残余字节全覆盖）
     """
     out = TOKEN_STR_RE.sub('', content)
-    out = PII_TOKEN_STR_RE.sub('', out)
     return _strip_partials(out)
 
 
@@ -750,14 +754,6 @@ class LlmMixin(AuditMixin):
         _pii_scope_var.set(value)
 
     @property
-    def _audit_arg_accum(self):
-        return _audit_arg_accum_var.get()
-
-    @_audit_arg_accum.setter
-    def _audit_arg_accum(self, value):
-        _audit_arg_accum_var.set(value)
-
-    @property
     def _audit_hold_active(self):
         return _audit_hold_active_var.get()
 
@@ -1003,10 +999,25 @@ class LlmMixin(AuditMixin):
             'event': evt,
         }
         self._audit_approval_pending[req_id] = entry
-        msg_id = await self._ask(
-            f'⚠️ 工具调用待审批: {name}\n参数摘要: {summary}\n'
-            f'点 ✅ 批准 或 ❎ 拒绝（{timeout}s 超时默认拒绝）',
-        )
+        try:
+            msg_id = await self._ask(
+                f'⚠️ 工具调用待审批: {name}\n参数摘要: {summary}\n'
+                f'点 ✅ 批准 或 ❎ 拒绝（{timeout}s 超时默认拒绝）',
+            )
+        except Exception as exc:
+            # 8.3 修复（F-03）：_ask 抛异常（非返回 None）时统一清理，
+            # 防孤儿 pending 条目与 created_ids 残留（跨请求错误关联）
+            logger.error(
+                '审计审批发送异常: %s req_id=%s → failed: %s',
+                name,
+                req_id,
+                exc,
+            )
+            self._audit_approval_pending.pop(req_id, None)
+            _created = _audit_created_ids_var.get()
+            if isinstance(_created, list) and req_id in _created:
+                _created.remove(req_id)
+            return 'failed'
         logger.info(
             '审计审批已发送: %s req_id=%s msg_id=%s timeout=%ds 摘要=%.80s',
             name,
@@ -1019,6 +1030,9 @@ class LlmMixin(AuditMixin):
             # 发送失败 → 立即按 rejected 处置 + 清理 pending
             logger.error('审计审批发送失败: %s req_id=%s → failed', name, req_id)
             self._audit_approval_pending.pop(req_id, None)
+            _created = _audit_created_ids_var.get()
+            if isinstance(_created, list) and req_id in _created:
+                _created.remove(req_id)
             return 'failed'
         self._audit_approval_msgs[msg_id] = req_id
         logger.info('审计审批等待中: %s req_id=%s msg_id=%s', name, req_id, msg_id)
@@ -1030,10 +1044,25 @@ class LlmMixin(AuditMixin):
             )
             self._audit_approval_pending.pop(req_id, None)
             self._audit_approval_msgs.pop(msg_id, None)
+            _created = _audit_created_ids_var.get()
+            if isinstance(_created, list) and req_id in _created:
+                _created.remove(req_id)
             return 'expired'
+        except Exception:
+            # 8.3：等待期间异常（event 被异常置位等）同样清理
+            logger.exception('审计审批等待异常: %s req_id=%s', name, req_id)
+            self._audit_approval_pending.pop(req_id, None)
+            self._audit_approval_msgs.pop(msg_id, None)
+            _created = _audit_created_ids_var.get()
+            if isinstance(_created, list) and req_id in _created:
+                _created.remove(req_id)
+            return 'failed'
         # reaction 已到达
         ap = self._audit_approval_pending.pop(req_id, None)
         self._audit_approval_msgs.pop(msg_id, None)
+        _created = _audit_created_ids_var.get()
+        if isinstance(_created, list) and req_id in _created:
+            _created.remove(req_id)
         if ap and ap.get('approved') is True:
             logger.info('审计审批结果: %s req_id=%s → approved', name, req_id)
             return 'approved'
@@ -1234,6 +1263,7 @@ class LlmMixin(AuditMixin):
         self,
         text: str,
         active_t2p: dict,
+        parsed_obj=None,
     ) -> str:
         """JSON 感知的响应侧处理：仅对字符串节点做还原+检测，避免破坏 \\u 转义。
 
@@ -1244,14 +1274,19 @@ class LlmMixin(AuditMixin):
           则对内层同 walk 后 dumps，失败回退 plain；
         - 叶子级：仅当还原后值变化时校验，失败仅回退该叶子（C+A 方案）。
         - C 方案：不再按 len 回退 plain。
+        - 8.10 优化（F-11）：`parsed_obj` 传入调用方已解析的对象（主循环
+          `json.loads(payload)` 的结果），跳过首层二次 loads。
         """
         stripped = text.lstrip('\ufeff').lstrip()
         if not (stripped.startswith(('{', '['))):
             return await self._pii_response_process(text, active_t2p)
-        try:
-            obj = _jloads(text.lstrip('\ufeff'))
-        except Exception:
-            return await self._pii_response_process(text, active_t2p)
+        if parsed_obj is None:
+            try:
+                obj = _jloads(text.lstrip('\ufeff'))
+            except Exception:
+                return await self._pii_response_process(text, active_t2p)
+        else:
+            obj = parsed_obj
         scope = self._pii_scope_or_none()
         # ── D1 thin wrapper: 优先复用共享 walk（utils/json_walk）──
         if _shared_json_walk_async is not None and isinstance(obj, (dict, list)):  # type: ignore[truthy-function]
@@ -1338,7 +1373,9 @@ class LlmMixin(AuditMixin):
             logger.debug('_pii_response_process_json_aware 回退', exc_info=True)
             return await self._pii_response_process(text, active_t2p)
 
-    async def _pii_process_sse_line(self, line: str, active_t2p: dict) -> str:
+    async def _pii_process_sse_line(
+        self, line: str, active_t2p: dict, parsed_obj=None
+    ) -> str:
         """SSE 行的 JSON-aware 处理：剥离 data: 前缀后对 payload 做 JSON-aware。
 
         - 对 data: {JSON} 形态：payload = split(":",1)[1].lstrip(" \t") 后，
@@ -1347,6 +1384,8 @@ class LlmMixin(AuditMixin):
           _pii_response_process_json_aware（含嵌套与 BOM）。
         - fast path（active_t2p==0 且无 PII/审计）由调用方守门，本 helper
           不再二次守门；对非 data: 前缀行直接回退 plain。
+        - 8.10 优化（F-11）：`parsed_obj` 传调用方已 `json.loads` 的结果，
+          跳过二次 loads（慢链主循环复用）。
         """
         if not line.startswith('data:'):
             return await self._pii_response_process(line, active_t2p)
@@ -1362,7 +1401,7 @@ class LlmMixin(AuditMixin):
             return await self._pii_response_process(line, active_t2p)
         try:
             payload_aware = await self._pii_response_process_json_aware(
-                payload, active_t2p
+                payload, active_t2p, parsed_obj=parsed_obj
             )
             return 'data: ' + payload_aware
         except Exception:
@@ -1435,7 +1474,7 @@ class LlmMixin(AuditMixin):
         - deny + block 模式 → 注入拒绝 + 终止事件，缓冲丢弃
         """
         name = self._last_anthropic_tool_name or ''
-        args = getattr(self, '_audit_arg_accum', '')
+        args = arg_buf
         verdict = await self.audit_tool_call(name, args)
         if verdict == 'allow':
             # 预检误判：完整审计通过 → 恢复续传（缓冲行 + block_stop 放行）
@@ -1452,7 +1491,6 @@ class LlmMixin(AuditMixin):
         self._audit_hold_active = False
         self._audit_hold_buf = []
         self._audit_hold_bytes = 0
-        self._audit_arg_accum = ''
         self._last_anthropic_tool_name = None
 
     async def _release_hold(
@@ -1493,7 +1531,6 @@ class LlmMixin(AuditMixin):
         self._audit_hold_buf = []
         self._audit_hold_bytes = 0
         self._audit_hold_active = False
-        self._audit_arg_accum = ''
         self._last_anthropic_tool_name = None
         try:
             await write(self._build_block_event_anthropic().encode('utf-8'))
@@ -1544,9 +1581,6 @@ class LlmMixin(AuditMixin):
             # 挂起期间参数 delta 仍须累积（block_stop 审计读完整参数）
             if kind == 'function_args' and delta_text is not None:
                 arg_buf += delta_text
-                self._audit_arg_accum = (
-                    getattr(self, '_audit_arg_accum', '') + delta_text
-                )
             # 缓冲超限 → fail-closed（design D4：超限按 rejected 处置）
             if (
                 len(line.encode('utf-8')) + getattr(self, '_audit_hold_bytes', 0)
@@ -1564,8 +1598,22 @@ class LlmMixin(AuditMixin):
             # 工具调用块结束：arg_buf 中未完成的 token 前缀不可能再有
             # 后续分片（token 不会跨两个 tool_use block），清空防伪还原
             # （content/reasoning 保留 pending，由流末统一清理）
-            # 审计触发点：读取掩码前原始完整参数累积器（design D3 审计对抗性）
+            # 审计触发点：读取掩码前原始完整参数（design D3 审计对抗性）
             # 6.6 攒整段刷新：单次 json_aware walk
+            # F-12 合并：arg_buf 即原始参数累积器（与旧 _audit_arg_accum 同源），
+            # 审计必须发生在 json_aware 还原/清空之前
+            if arg_buf and self.audit_enabled():
+                name = self._last_anthropic_tool_name or ''
+                verdict = await self.audit_tool_call(name, arg_buf)
+                if verdict == 'deny':
+                    if self.audit_mode == 'approve':
+                        # 审批模式：发起 Matrix 审批；approved → 放行（不注入拒绝）
+                        result = await self._request_audit_approval(name, arg_buf)
+                        if result == 'approved':
+                            verdict = 'allow'
+                    if verdict == 'deny':
+                        # 阻断：注入拒绝消息 + block_stop 终止事件（design D4 防 dangling）
+                        await write(self._build_block_event_anthropic().encode('utf-8'))
             if arg_buf:
                 try:
                     restored_arg = await self._pii_response_process_json_aware(
@@ -1581,24 +1629,6 @@ class LlmMixin(AuditMixin):
                 except Exception:
                     pass
                 arg_buf = ''
-            if getattr(self, '_audit_arg_accum', '') and self.audit_enabled():
-                name = self._last_anthropic_tool_name or ''
-                verdict = await self.audit_tool_call(
-                    name, getattr(self, '_audit_arg_accum', '')
-                )
-                if verdict == 'deny':
-                    if self.audit_mode == 'approve':
-                        # 审批模式：发起 Matrix 审批；approved → 放行（不注入拒绝）
-                        result = await self._request_audit_approval(
-                            name, getattr(self, '_audit_arg_accum', '')
-                        )
-                        if result == 'approved':
-                            verdict = 'allow'
-                    if verdict == 'deny':
-                        # 阻断：注入拒绝消息 + block_stop 终止事件（design D4 防 dangling）
-                        await write(self._build_block_event_anthropic().encode('utf-8'))
-            if hasattr(self, '_audit_arg_accum'):
-                self._audit_arg_accum = ''
             self._last_anthropic_tool_name = None
             await write(
                 (await self._pii_process_sse_line(line, active_t2p) + '\n').encode(
@@ -1625,15 +1655,12 @@ class LlmMixin(AuditMixin):
             if kind == 'function_args':
                 # 6.6 攒整段：仅累积，不每 delta 即 json_aware/切片（防跨行泄漏）
                 arg_buf += delta_text
-                self._audit_arg_accum = (
-                    getattr(self, '_audit_arg_accum', '') + delta_text
-                )
                 if (
                     self.audit_enabled()
                     and not getattr(self, '_audit_hold_active', False)
                     and self.audit_precheck(
                         self._last_anthropic_tool_name or '',
-                        self._audit_arg_accum,
+                        arg_buf,
                     )
                 ):
                     self._audit_hold_active = True
@@ -1757,7 +1784,7 @@ class LlmMixin(AuditMixin):
     ) -> None:
         """挂起结束（item_done 到达）：完整审计 + 审批处置（同 Anthropic）。"""
         name = self._last_responses_tool_name or ''
-        args = getattr(self, '_audit_arg_accum', '')
+        args = arg_buf
         verdict = await self.audit_tool_call(name, args)
         if verdict == 'allow':
             await self._release_hold(write, active_t2p, extra_line=line)
@@ -1773,7 +1800,6 @@ class LlmMixin(AuditMixin):
         self._audit_hold_active = False
         self._audit_hold_buf = []
         self._audit_hold_bytes = 0
-        self._audit_arg_accum = ''
         self._last_responses_tool_name = None
 
     async def _reject_responses_hold(self, write, active_t2p: dict) -> None:
@@ -1781,7 +1807,6 @@ class LlmMixin(AuditMixin):
         self._audit_hold_buf = []
         self._audit_hold_bytes = 0
         self._audit_hold_active = False
-        self._audit_arg_accum = ''
         self._last_responses_tool_name = None
         try:
             await write(self._build_block_event_responses().encode('utf-8'))
@@ -1830,9 +1855,6 @@ class LlmMixin(AuditMixin):
             # 挂起期间参数 delta 仍须累积（item_done 审计读完整参数）
             if kind == 'function_call_arguments' and delta_text is not None:
                 arg_buf += delta_text
-                self._audit_arg_accum = (
-                    getattr(self, '_audit_arg_accum', '') + delta_text
-                )
             # 缓冲超限 → fail-closed
             if (
                 len(line.encode('utf-8')) + getattr(self, '_audit_hold_bytes', 0)
@@ -1850,6 +1872,21 @@ class LlmMixin(AuditMixin):
             # item 结束：arg_buf 中未完成的 token 前缀不可能再有后续分片
             # （function call 参数不会跨 item 续写），清空防跨 item 伪还原
             # （content/reasoning 保留 pending，由流末统一清理）
+            # 审计触发点：读取掩码前原始完整参数（design D3 审计对抗性）
+            # F-12 合并：arg_buf 即原始参数累积器（与旧 _audit_arg_accum 同源），
+            # 审计必须发生在 json_aware 还原/清空之前
+            if arg_buf and self.audit_enabled():
+                name = self._last_responses_tool_name or ''
+                verdict = await self.audit_tool_call(name, arg_buf)
+                if verdict == 'deny':
+                    if self.audit_mode == 'approve':
+                        # 审批模式：发起 Matrix 审批；approved → 放行（不注入拒绝）
+                        result = await self._request_audit_approval(name, arg_buf)
+                        if result == 'approved':
+                            verdict = 'allow'
+                    if verdict == 'deny':
+                        # 阻断：注入拒绝消息 + item_done 终止事件（design D4 防 dangling）
+                        await write(self._build_block_event_responses().encode('utf-8'))
             # 6.6 攒整段刷新
             if arg_buf:
                 try:
@@ -1866,25 +1903,6 @@ class LlmMixin(AuditMixin):
                 except Exception:
                     pass
                 arg_buf = ''
-            # 审计触发点：读取掩码前原始完整参数累积器（design D3 审计对抗性）
-            if getattr(self, '_audit_arg_accum', '') and self.audit_enabled():
-                name = self._last_responses_tool_name or ''
-                verdict = await self.audit_tool_call(
-                    name, getattr(self, '_audit_arg_accum', '')
-                )
-                if verdict == 'deny':
-                    if self.audit_mode == 'approve':
-                        # 审批模式：发起 Matrix 审批；approved → 放行（不注入拒绝）
-                        result = await self._request_audit_approval(
-                            name, getattr(self, '_audit_arg_accum', '')
-                        )
-                        if result == 'approved':
-                            verdict = 'allow'
-                    if verdict == 'deny':
-                        # 阻断：注入拒绝消息 + item_done 终止事件（design D4 防 dangling）
-                        await write(self._build_block_event_responses().encode('utf-8'))
-            if hasattr(self, '_audit_arg_accum'):
-                self._audit_arg_accum = ''
             self._last_responses_tool_name = None
             await write(
                 (await self._pii_process_sse_line(line, active_t2p) + '\n').encode(
@@ -1899,15 +1917,12 @@ class LlmMixin(AuditMixin):
             if kind == 'function_call_arguments':
                 # 6.6 攒整段：仅累积，不每 delta 即 json_aware
                 arg_buf += delta_text
-                self._audit_arg_accum = (
-                    getattr(self, '_audit_arg_accum', '') + delta_text
-                )
                 if (
                     self.audit_enabled()
                     and not getattr(self, '_audit_hold_active', False)
                     and self.audit_precheck(
                         self._last_responses_tool_name or '',
-                        self._audit_arg_accum,
+                        arg_buf,
                     )
                 ):
                     self._audit_hold_active = True
@@ -2005,7 +2020,6 @@ class LlmMixin(AuditMixin):
             # 请求级 ContextVar 隔离（D2）：捕获 Token 以便 finally reset
             # _pii_scope 全局持久化：set(get()) 仅捕获 Token 供 reset，值保持全局单例（D1）
             _cv_pii_scope_tok = _pii_scope_var.set(_pii_scope_var.get())
-            _cv_audit_arg_accum_tok = _audit_arg_accum_var.set('')
             _cv_audit_hold_active_tok = _audit_hold_active_var.set(False)
             _cv_audit_hold_buf_tok = _audit_hold_buf_var.set([])  # type: ignore[arg-type]
             _cv_audit_hold_bytes_tok = _audit_hold_bytes_var.set(0)
@@ -2535,7 +2549,9 @@ class LlmMixin(AuditMixin):
                                                         await _tracked_write(
                                                             (
                                                                 await self._pii_process_sse_line(
-                                                                    line, active_t2p
+                                                                    line,
+                                                                    active_t2p,
+                                                                    parsed_obj=parsed,
                                                                 )
                                                                 + '\n'
                                                             ).encode('utf-8'),
@@ -3162,19 +3178,26 @@ class LlmMixin(AuditMixin):
                                                             )
                                                     else:
                                                         # pos 已越过续行，不回退（续行已在 byte_buf 中被消费）
+                                                        # 8.4 修复（F-04）：多 data 行无空行分隔时聚合 payload
+                                                        # 解析失败且续行重建失败 → 逐行独立脱敏后转发，
+                                                        # 不转发未脱敏原始行（防明文泄漏）
                                                         logger.warning(
                                                             'SSE JSON 解析失败，'
-                                                            '续行重建失败，转发原始行: %s...',
+                                                            '续行重建失败，逐行脱敏转发: %s...',
                                                             payload[:80],
                                                         )
-                                                        await _tracked_write(
-                                                            (
-                                                                await self._pii_process_sse_line(
-                                                                    line, active_t2p
-                                                                )
-                                                                + '\n'
-                                                            ).encode('utf-8'),
-                                                        )
+                                                        for _sub in payload.split('\n'):
+                                                            if not _sub.strip():
+                                                                continue
+                                                            await _tracked_write(
+                                                                (
+                                                                    await self._pii_process_sse_line(
+                                                                        'data: ' + _sub,
+                                                                        active_t2p,
+                                                                    )
+                                                                    + '\n'
+                                                                ).encode('utf-8'),
+                                                            )
                                                 except (
                                                     KeyError,
                                                     IndexError,
@@ -3325,8 +3348,10 @@ class LlmMixin(AuditMixin):
                             # 流末：Anthropic/Responses 未完成 tool call 兜底
                             # （design D4 硬性：正常结束但无 block_stop/item_done
                             # 终止事件 → 不完整参数不得 flush，fail-closed 丢弃）
+                            # F-12 合并：arg_buf 即原始参数累积器（主循环闭包持有，
+                            # 流末仍保留未消费参数；旧 _audit_arg_accum 已删除）
                             if (
-                                getattr(self, '_audit_arg_accum', '')
+                                arg_buf
                                 and self.audit_enabled()
                                 and (is_anthropic_stream or is_responses_stream)
                             ):
@@ -3335,7 +3360,7 @@ class LlmMixin(AuditMixin):
                                     if is_anthropic_stream
                                     else self._last_responses_tool_name
                                 ) or ''
-                                _args = getattr(self, '_audit_arg_accum', '')
+                                _args = arg_buf
                                 _verdict = await self.audit_tool_call(_name, _args)
                                 if _verdict == 'deny' and self.audit_mode == 'approve':
                                     _result = await self._request_audit_approval(
@@ -3355,9 +3380,39 @@ class LlmMixin(AuditMixin):
                                         audit_block_injected = True
                                     except SSE_CLIENT_GONE:
                                         pass
-                                self._audit_arg_accum = ''
                                 self._last_anthropic_tool_name = None
                                 self._last_responses_tool_name = None
+
+                            # ── 8.5 修复（F-05）：流末 pending_cr 视为行终止符 ──
+                            # CR-only 行（无 LF）在流末残留 \r：pending_cr=True 且
+                            # byte_buf 以 \r 结尾 → 立即 dispatch 该行，
+                            # 不残留 \r 触发截断误报、不丢该行数据
+                            if pending_cr and byte_buf and byte_buf.endswith(b'\r'):
+                                _cr_line = bytes(byte_buf[:-1]).decode(
+                                    'utf-8', errors='replace'
+                                )
+                                byte_buf.clear()
+                                pending_cr = False
+                                if _cr_line:
+                                    if _cr_line.startswith(':'):
+                                        await _tracked_write(
+                                            (_cr_line + '\n').encode('utf-8')
+                                        )
+                                    elif _cr_line.startswith('data:'):
+                                        _pl = _cr_line[5:].removeprefix(' ')
+                                        if _pl.strip() and _pl.strip() != '[DONE]':
+                                            data_buffer.append(_pl)
+                                        # 不在此处 dispatch —— 交由下方统一
+                                        # 流末 flush/截断检测按 data_buffer 处理
+                                    else:
+                                        await _tracked_write(
+                                            (
+                                                await self._pii_process_sse_line(
+                                                    _cr_line, active_t2p
+                                                )
+                                                + '\n'
+                                            ).encode('utf-8')
+                                        )
 
                             # 流结束：flush 残留（含 partial token 前缀清理）
                             if is_responses_stream:
@@ -3637,6 +3692,10 @@ class LlmMixin(AuditMixin):
                                 False  # 是否已收到终止事件（fast 路径）
                             )
                             fast_seen_global_terminal = False  # 全局终止（fast）
+                            # ── 8.8 修复（F-09）：快链复用 WHATWG 帧状态机 ──
+                            fast_pending_cr = False  # 上 chunk 末孤立 \r 跨块粘合
+                            fast_bom_seen = False  # 流首 BOM 单次剥离
+                            fast_data_buffer: list[str] = []  # 同事件多 data: 行聚合
 
                             async def _tracked_write(data: bytes):
                                 nonlocal fast_bytes_written
@@ -3656,11 +3715,123 @@ class LlmMixin(AuditMixin):
                                             '保存下游恢复日志失败(fast): %s', exc
                                         )
 
+                            # ── 8.8 _fast_emit_data：聚合后统一 emit（含 json-aware 还原）──
+                            async def _fast_emit_data(_payload: str):
+                                nonlocal fast_seen_terminal, fast_seen_global_terminal
+                                nonlocal resp_log_path, _debug_saved
+                                # 终止判定（结构化解析，7.3 语义）
+                                try:
+                                    _fast_parsed = (
+                                        json.loads(_payload.strip())
+                                        if _payload.strip().startswith(('{', '['))
+                                        else {}
+                                    )
+                                    _ft = (
+                                        _fast_parsed.get('type')
+                                        if isinstance(_fast_parsed, dict)
+                                        else None
+                                    )
+                                    if _ft in (
+                                        'response.completed',
+                                        'response.failed',
+                                        'response.incomplete',
+                                        'message_stop',
+                                    ):
+                                        fast_seen_terminal = True
+                                        fast_seen_global_terminal = True
+                                    else:
+                                        for _c in (
+                                            _fast_parsed.get('choices', [])
+                                            if isinstance(_fast_parsed, dict)
+                                            else []
+                                        ) or []:
+                                            if (
+                                                isinstance(_c, dict)
+                                                and _c.get('finish_reason') is not None
+                                            ):
+                                                fast_seen_terminal = True
+                                                fast_seen_global_terminal = True
+                                                break
+                                except Exception:
+                                    pass
+                                if _debug_save_eligible:
+                                    try:
+                                        await _debug_append_line(
+                                            req_id,
+                                            'response_original.jsonl',
+                                            _payload,
+                                        )
+                                    except Exception as exc:
+                                        logger.debug(
+                                            '保存上游原版日志失败(fast): %s', exc
+                                        )
+                                if resp_log_path:
+                                    await _save_response_line(resp_log_path, _payload)
+                                # 首次 data 事件提取 conversation ID 保存原始请求
+                                if _debug_save_eligible and not _debug_saved:
+                                    try:
+                                        _parsed = json.loads(_payload)
+                                        _cid = _extract_conv_id(_parsed)
+                                        if _cid:
+                                            _save_request_body(_cid, out_body)
+                                            _debug_link_conv_id(req_id, _cid, out_body)
+                                            _debug_saved = True
+                                            resp_log_path = os.path.join(
+                                                _DEBUG_DIR,
+                                                _cid,
+                                                'response.jsonl',
+                                            )
+                                            await _save_response_line(
+                                                resp_log_path,
+                                                _payload,
+                                            )
+                                    except json.JSONDecodeError:
+                                        pass
+                                # JSON-aware: data 载荷为 JSON 时走 loads→walk→dumps
+                                # 7.4: 非对话尾透传不 walk
+                                if not is_dialog_tail:
+                                    _restored_payload = _payload
+                                elif hasattr(self, '_pii_response_process_json_aware'):
+                                    _restored_payload = (
+                                        await self._pii_response_process_json_aware(
+                                            _payload, active_t2p
+                                        )
+                                    )
+                                else:
+                                    _restored_payload = (
+                                        await self._pii_response_process(
+                                            _payload, active_t2p
+                                        )
+                                    )
+                                await _tracked_write(
+                                    ('data: ' + _restored_payload + '\n').encode(
+                                        'utf-8'
+                                    ),
+                                )
+
                             try:
                                 async for chunk in upstream_resp.content.iter_chunked(
                                     SSE_CHUNK_SIZE,
                                 ):
                                     byte_buf.extend(chunk)
+                                    # ── 8.8 BOM 单次剥离（同慢链 6.2）──
+                                    if not fast_bom_seen:
+                                        if len(byte_buf) >= 3:
+                                            if byte_buf[:3] == b'\xef\xbb\xbf':
+                                                del byte_buf[:3]
+                                            fast_bom_seen = True
+                                        else:
+                                            if byte_buf.startswith(
+                                                b'\xef'
+                                            ) or byte_buf.startswith(b'\xef\xbb'):
+                                                continue
+                                            else:
+                                                fast_bom_seen = True
+                                    # ── 8.8 pending_cr 粘合（同慢链）──
+                                    if fast_pending_cr:
+                                        if byte_buf.startswith(b'\n'):
+                                            del byte_buf[0]
+                                        fast_pending_cr = False
                                     # 先处理完整行，再检查缓冲区（防截断丢数据）
                                     pos = 0
                                     while (
@@ -3675,145 +3846,45 @@ class LlmMixin(AuditMixin):
                                             'utf-8',
                                             errors='replace',
                                         ).rstrip('\r')
+                                        if line == '':
+                                            # 空行：dispatch 聚合的 data_buffer
+                                            if fast_data_buffer:
+                                                _fast_payload = '\n'.join(
+                                                    fast_data_buffer
+                                                )
+                                                fast_data_buffer.clear()
+                                                # 空 data 行不计为有效事件
+                                                if not _fast_payload.strip():
+                                                    continue
+                                                fast_sse_event_count += 1
+                                                if _fast_payload.strip() == '[DONE]':
+                                                    fast_seen_terminal = True
+                                                    fast_seen_global_terminal = True
+                                                await _fast_emit_data(_fast_payload)
+                                            continue
+                                        if line.startswith(':'):
+                                            # 注释透传（`: keepalive` 等），不解析
+                                            await _tracked_write(
+                                                (line + '\n').encode('utf-8')
+                                            )
+                                            continue
                                         if line.startswith('data:'):
                                             payload = line[5:]
                                             payload = payload.removeprefix(' ')
-                                            # 空 data 行不计为有效事件，避免下游 JSONDecodeError
+                                            # 空 data 行不计为有效事件
                                             if not payload.strip():
                                                 continue
-
-                                            fast_sse_event_count += 1
-                                            if payload.strip() == '[DONE]':
-                                                fast_seen_terminal = True
-                                                fast_seen_global_terminal = True
-                                            else:
-                                                try:
-                                                    _fast_parsed = (
-                                                        json.loads(payload.strip())
-                                                        if payload.strip().startswith(
-                                                            ('{', '[')
-                                                        )
-                                                        else {}
-                                                    )
-                                                    _ft = (
-                                                        _fast_parsed.get('type')
-                                                        if isinstance(
-                                                            _fast_parsed, dict
-                                                        )
-                                                        else None
-                                                    )
-                                                    if _ft in (
-                                                        'response.completed',
-                                                        'response.failed',
-                                                        'response.incomplete',
-                                                        'message_stop',
-                                                    ):
-                                                        fast_seen_terminal = True
-                                                        fast_seen_global_terminal = True
-                                                    else:
-                                                        for _c in (
-                                                            _fast_parsed.get(
-                                                                'choices', []
-                                                            )
-                                                            if isinstance(
-                                                                _fast_parsed, dict
-                                                            )
-                                                            else []
-                                                        ) or []:
-                                                            if (
-                                                                isinstance(_c, dict)
-                                                                and _c.get(
-                                                                    'finish_reason'
-                                                                )
-                                                                is not None
-                                                            ):
-                                                                fast_seen_terminal = (
-                                                                    True
-                                                                )
-                                                                fast_seen_global_terminal = True
-                                                                break
-                                                except Exception:
-                                                    pass
-                                            if _debug_save_eligible:
-                                                try:
-                                                    await _debug_append_line(
-                                                        req_id,
-                                                        'response_original.jsonl',
-                                                        payload,
-                                                    )
-                                                except Exception as exc:
-                                                    logger.debug(
-                                                        '保存上游原版日志失败(fast): %s',
-                                                        exc,
-                                                    )
-
-                                            if resp_log_path:
-                                                # 后续 event 保存 response 行
-                                                await _save_response_line(
-                                                    resp_log_path,
-                                                    payload,
-                                                )
-
-                                            # 首次 data 事件提取 conversation ID 保存原始请求
-                                            if (
-                                                _debug_save_eligible
-                                                and not _debug_saved
-                                            ):
-                                                try:
-                                                    _parsed = json.loads(payload)
-                                                    _cid = _extract_conv_id(_parsed)
-                                                    if _cid:
-                                                        _save_request_body(
-                                                            _cid, out_body
-                                                        )
-                                                        _debug_link_conv_id(
-                                                            req_id, _cid, out_body
-                                                        )
-                                                        _debug_saved = True
-                                                        resp_log_path = os.path.join(
-                                                            _DEBUG_DIR,
-                                                            _cid,
-                                                            'response.jsonl',
-                                                        )
-                                                        # 首个 event 单独保存（此时 resp_log_path 刚设好）
-                                                        # 上面的 generic save 因 resp_log_path=None 已跳过
-                                                        await _save_response_line(
-                                                            resp_log_path,
-                                                            payload,
-                                                        )
-                                                except json.JSONDecodeError:
-                                                    pass
-
-                                            # JSON-aware: data 载荷为 JSON 时走 loads→walk→dumps，避免 p@ss"quote/\u 破坏
-                                            # 7.4: 非对话尾透传不 walk
-                                            if not is_dialog_tail:
-                                                _restored_payload = payload
-                                            elif hasattr(
-                                                self, '_pii_response_process_json_aware'
-                                            ):
-                                                _restored_payload = await self._pii_response_process_json_aware(
-                                                    payload, active_t2p
-                                                )
-                                            else:
-                                                _restored_payload = (
-                                                    await self._pii_response_process(
-                                                        payload, active_t2p
-                                                    )
-                                                )
-                                            restored = 'data: ' + _restored_payload
-                                            await _tracked_write(
-                                                (restored + '\n').encode('utf-8'),
+                                            fast_data_buffer.append(payload)
+                                            continue
+                                        # 非 data 行（event:/id:）走 SSE 行 JSON-aware
+                                        restored_line = (
+                                            await self._pii_process_sse_line(
+                                                line, active_t2p
                                             )
-                                        else:
-                                            # 非 data 行（event:/id:）走 SSE 行 JSON-aware
-                                            restored_line = (
-                                                await self._pii_process_sse_line(
-                                                    line, active_t2p
-                                                )
-                                            )
-                                            await _tracked_write(
-                                                (restored_line + '\n').encode('utf-8'),
-                                            )
+                                        )
+                                        await _tracked_write(
+                                            (restored_line + '\n').encode('utf-8'),
+                                        )
                                     # Trim processed portion
                                     if pos > 0:
                                         del byte_buf[:pos]
@@ -3832,6 +3903,28 @@ class LlmMixin(AuditMixin):
                                         # 7.5: fast 无 data_buffer（直接按行处理），仅保 byte_buf 截断一致性为 rfind
                             except SSE_CLIENT_GONE as e:
                                 logger.debug('SSE 客户端断连: %s', e)
+                            # ── 8.8 EOF 残留处理（同慢链 8.5）──
+                            # CR-only 行流末：byte_buf 以 \r 结尾 → 视为行终止符
+                            if byte_buf.endswith(b'\r'):
+                                _cr_line = bytes(byte_buf[:-1]).decode(
+                                    'utf-8', errors='replace'
+                                )
+                                byte_buf.clear()
+                                fast_pending_cr = False
+                                if _cr_line.startswith('data:'):
+                                    _pl = _cr_line[5:].removeprefix(' ')
+                                    if _pl.strip() and _pl.strip() != '[DONE]':
+                                        fast_data_buffer.append(_pl)
+                            # data_buffer 残留 → dispatch
+                            if fast_data_buffer:
+                                _fast_payload = '\n'.join(fast_data_buffer)
+                                fast_data_buffer.clear()
+                                if _fast_payload.strip():
+                                    fast_sse_event_count += 1
+                                    if _fast_payload.strip() == '[DONE]':
+                                        fast_seen_terminal = True
+                                        fast_seen_global_terminal = True
+                                    await _fast_emit_data(_fast_payload)
                             # ── fast 截断检测 ──
                             _fast_truncated = False
                             if byte_buf:
@@ -4294,8 +4387,6 @@ class LlmMixin(AuditMixin):
                 # D2 reset：按 token 恢复，避免跨请求/子任务泄露
                 with contextlib.suppress(LookupError, ValueError):
                     _pii_scope_var.reset(_cv_pii_scope_tok)
-                with contextlib.suppress(LookupError, ValueError):
-                    _audit_arg_accum_var.reset(_cv_audit_arg_accum_tok)
                 with contextlib.suppress(LookupError, ValueError):
                     _audit_hold_active_var.reset(_cv_audit_hold_active_tok)
                 with contextlib.suppress(LookupError, ValueError):

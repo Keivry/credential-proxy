@@ -64,9 +64,33 @@ def _validate_json_roundtrip(
 
 
 def json_walk(obj, leaf_fn, depth_limit: int = 5, path: str = '$', _depth: int = 0):
-    """同步 walk：对 dict/list 递归，str 叶调 leaf_fn，叶子级最小回退。"""
-    if _depth > depth_limit:
-        if isinstance(obj, str):
+    """同步 walk：对 dict/list 递归，str 叶调 leaf_fn，叶子级最小回退。
+
+    外层包装兜底 RecursionError（深度炸弹防护）：内部递归走 `_json_walk_impl`
+    （不重复 try/except），极端深度只在此处捕获一次，返回原对象不崩溃。
+    """
+    try:
+        return _json_walk_impl(obj, leaf_fn, depth_limit, path, _depth)
+    except RecursionError:
+        logger.warning(
+            'json_walk RecursionError (depth bomb) at path=%s depth=%d, '
+            'returning original object',
+            path,
+            _depth,
+        )
+        return obj
+
+
+def _json_walk_impl(
+    obj, leaf_fn, depth_limit: int = 5, path: str = '$', _depth: int = 0
+):
+    """深度语义（8.1 修正）：`_depth` 仅统计 `str→inner` 嵌套 JSON 递归层数
+    （防 JSON 字符串炸弹 `{"a":"{"a":...}"}`）；dict/list 裸递归不增加
+    `_depth`（业务 JSON 如 7 层工具参数必须正常遍历并识别嵌套字符串），
+    极端裸嵌套由外层 `json_walk` 的 RecursionError 兜底防崩溃。
+    """
+    if isinstance(obj, str):
+        if _depth > depth_limit:
             try:
                 new_s = leaf_fn(obj)
             except Exception:
@@ -84,24 +108,12 @@ def json_walk(obj, leaf_fn, depth_limit: int = 5, path: str = '$', _depth: int =
                     )
                     return obj
             return new_s
-        if isinstance(obj, dict):
-            return {
-                k: json_walk(v, leaf_fn, depth_limit, f'{path}.{k}', _depth + 1)
-                for k, v in obj.items()
-            }
-        if isinstance(obj, list):
-            return [
-                json_walk(x, leaf_fn, depth_limit, f'{path}[{i}]', _depth + 1)
-                for i, x in enumerate(obj)
-            ]
-        return obj
-    if isinstance(obj, str):
         inner_stripped = obj.lstrip('\ufeff').strip()
         if inner_stripped.startswith(('{', '[')):
             try:
                 inner = _jloads(inner_stripped)
                 if isinstance(inner, (dict, list)):
-                    walked = json_walk(
+                    walked = _json_walk_impl(
                         inner, leaf_fn, depth_limit, f'{path}->$.inner', _depth + 1
                     )
                     out = _jdumps(walked)
@@ -128,12 +140,12 @@ def json_walk(obj, leaf_fn, depth_limit: int = 5, path: str = '$', _depth: int =
         return new_s
     if isinstance(obj, dict):
         return {
-            k: json_walk(v, leaf_fn, depth_limit, f'{path}.{k}', _depth)
+            k: _json_walk_impl(v, leaf_fn, depth_limit, f'{path}.{k}', _depth)
             for k, v in obj.items()
         }
     if isinstance(obj, list):
         return [
-            json_walk(x, leaf_fn, depth_limit, f'{path}[{i}]', _depth)
+            _json_walk_impl(x, leaf_fn, depth_limit, f'{path}[{i}]', _depth)
             for i, x in enumerate(obj)
         ]
     return obj
@@ -142,9 +154,29 @@ def json_walk(obj, leaf_fn, depth_limit: int = 5, path: str = '$', _depth: int =
 async def json_walk_async(
     obj, leaf_fn, depth_limit: int = 5, path: str = '$', _depth: int = 0
 ):
-    """异步 walk：leaf_fn 可为 async，await 调用。"""
-    if _depth > depth_limit:
-        if isinstance(obj, str):
+    """异步 walk：leaf_fn 可为 async，await 调用。
+
+    外层包装兜底 RecursionError（深度炸弹防护），内部递归走 `_json_walk_async_impl`。
+    """
+    try:
+        return await _json_walk_async_impl(obj, leaf_fn, depth_limit, path, _depth)
+    except RecursionError:
+        logger.warning(
+            'json_walk_async RecursionError (depth bomb) at path=%s depth=%d, '
+            'returning original object',
+            path,
+            _depth,
+        )
+        return obj
+
+
+async def _json_walk_async_impl(
+    obj, leaf_fn, depth_limit: int = 5, path: str = '$', _depth: int = 0
+):
+    """深度语义同 sync：depth_limit 仅限制 `str→inner` 嵌套 JSON 递归；
+    dict/list 裸递归不受限，极端深度由外层 RecursionError 兜底。"""
+    if isinstance(obj, str):
+        if _depth > depth_limit:
             try:
                 tmp = leaf_fn(obj)
                 if _inspect.isawaitable(tmp):
@@ -166,30 +198,12 @@ async def json_walk_async(
                     )
                     return obj
             return new_s
-        if isinstance(obj, dict):
-            out = {}
-            for k, v in obj.items():
-                out[k] = await json_walk_async(
-                    v, leaf_fn, depth_limit, f'{path}.{k}', _depth + 1
-                )
-            return out
-        if isinstance(obj, list):
-            res = []
-            for i, x in enumerate(obj):
-                res.append(
-                    await json_walk_async(
-                        x, leaf_fn, depth_limit, f'{path}[{i}]', _depth
-                    )
-                )
-            return res
-        return obj
-    if isinstance(obj, str):
         inner_stripped = obj.lstrip('\ufeff').strip()
         if inner_stripped.startswith(('{', '[')):
             try:
                 inner = _jloads(inner_stripped)
                 if isinstance(inner, (dict, list)):
-                    walked = await json_walk_async(
+                    walked = await _json_walk_async_impl(
                         inner, leaf_fn, depth_limit, f'{path}->$.inner', _depth + 1
                     )
                     out = _jdumps(walked)
@@ -222,7 +236,7 @@ async def json_walk_async(
     if isinstance(obj, dict):
         out = {}
         for k, v in obj.items():
-            out[k] = await json_walk_async(
+            out[k] = await _json_walk_async_impl(
                 v, leaf_fn, depth_limit, f'{path}.{k}', _depth
             )
         return out
@@ -230,7 +244,9 @@ async def json_walk_async(
         res = []
         for i, x in enumerate(obj):
             res.append(
-                await json_walk_async(x, leaf_fn, depth_limit, f'{path}[{i}]', _depth)
+                await _json_walk_async_impl(
+                    x, leaf_fn, depth_limit, f'{path}[{i}]', _depth
+                )
             )
         return res
     return obj

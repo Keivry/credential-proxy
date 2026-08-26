@@ -85,37 +85,30 @@ async def test_concurrency_contextvar_audit_hold_isolation():
             self._audit_hold_active = False
             self._audit_hold_buf = []
             self._audit_hold_bytes = 0
-            self._audit_arg_accum = ''
 
     # 模拟两并发 handler 任务，各自设置 ContextVar
 
-    from _llm import _audit_arg_accum_var, _audit_hold_active_var, _audit_hold_buf_var
+    from _llm import _audit_hold_active_var, _audit_hold_buf_var
 
     async def task_a():
         # 模拟 handler A 进入 hold
         tok_a = _audit_hold_active_var.set(True)
         buf_a = _audit_hold_buf_var.set(['event_a'])
-        acc_a = _audit_arg_accum_var.set('{"cmd":"rm -rf /"}')
         await asyncio.sleep(0.05)
         # 检查自己的 ContextVar 未被 B 覆盖
         assert _audit_hold_active_var.get() is True
         assert _audit_hold_buf_var.get() == ['event_a']
-        assert _audit_arg_accum_var.get() == '{"cmd":"rm -rf /"}'
         _audit_hold_active_var.reset(tok_a)
         _audit_hold_buf_var.reset(buf_a)
-        _audit_arg_accum_var.reset(acc_a)
 
     async def task_b():
         await asyncio.sleep(0.01)
         tok_b = _audit_hold_active_var.set(False)
         buf_b = _audit_hold_buf_var.set(['event_b'])
-        acc_b = _audit_arg_accum_var.set('{"cmd":"echo safe"}')
         await asyncio.sleep(0.05)
         assert _audit_hold_active_var.get() is False
         assert _audit_hold_buf_var.get() == ['event_b']
-        assert _audit_arg_accum_var.get() == '{"cmd":"echo safe"}'
         _audit_hold_active_var.reset(tok_b)
         _audit_hold_buf_var.reset(buf_b)
-        _audit_arg_accum_var.reset(acc_b)
 
     await asyncio.gather(task_a(), task_b())

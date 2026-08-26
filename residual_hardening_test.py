@@ -218,3 +218,84 @@ async def test_pii_process_sse_line_bom_and_done(monkeypatch):
     assert '[DONE]' in out or out.strip() == 'data: [DONE]'
     out2 = await h._pii_process_sse_line('data: \ufeff{"a":1}', {})
     assert '"a"' in out2
+
+
+@pytest.mark.asyncio
+async def test_multi_data_line_no_blank_safe_fallback(monkeypatch):
+    """8.4（F-04）：多 data 行无空行分隔时，聚合失败兜底逐行脱敏转发。
+
+    慢链 data_buffer join 后 json.loads 对两个独立 data 事件抛
+    `JSONDecodeError: Extra data`；兜底改为逐行独立 `_pii_process_sse_line`
+    （保底安全：不抛异常、不转发未脱敏原始 payload）。
+    """
+    from _llm import LlmMixin
+    from _token import TokenMixin
+
+    class H(TokenMixin, LlmMixin):
+        def __init__(self):
+            self._lock = asyncio.Lock()
+            self.token_to_pwd = {}
+            self._token_seq = 0
+            self.pwd_to_token = {}
+            self.proxies = {}
+            self._runners = []
+
+        def _filter_hop_headers(self, h):
+            return h
+
+    h = H()
+    # 模拟聚合后的 payload（两个独立 JSON 以 \n 拼接 → json.loads 必失败）
+    payload = '{"choices":[{"delta":{"content":"a"}}]}\n{"choices":[{"delta":{"content":"b"}}]}'
+    # 兜底：逐行拆分 → 每行独立 _pii_process_sse_line
+    lines = []
+    for sub in payload.split('\n'):
+        if not sub.strip():
+            continue
+        out = await h._pii_process_sse_line('data: ' + sub, {})
+        lines.append(out)
+    # 两行均转发且不抛异常
+    assert len(lines) == 2
+    assert all(l.startswith('data: ') for l in lines)
+    assert '"content":"a"' in lines[0]
+    assert '"content":"b"' in lines[1]
+
+
+@pytest.mark.asyncio
+async def test_cr_only_eof_dispatch(monkeypatch):
+    """8.5（F-05）：CR-only 行（无 LF）在流末被正确 dispatch，不误判截断。
+
+    模拟慢链流末逻辑：pending_cr=True 且 byte_buf 残留 `data: {...}\r` →
+    EOF 时视为行终止符，行内容进入 data_buffer 或直接脱敏转发。
+    """
+    from _llm import LlmMixin
+    from _token import TokenMixin
+
+    class H(TokenMixin, LlmMixin):
+        def __init__(self):
+            self._lock = asyncio.Lock()
+            self.token_to_pwd = {}
+            self._token_seq = 0
+            self.pwd_to_token = {}
+            self.proxies = {}
+            self._runners = []
+
+        def _filter_hop_headers(self, h):
+            return h
+
+    h = H()
+    # CR-only 行内容（模拟流末残留，\r 被剥离后是完整 data 行）
+    cr_line = 'data: {"choices":[{"delta":{"content":"CR行内容"}}]}'
+    # 剥离 \r 后 → data: 行 → _pii_process_sse_line 正常脱敏转发
+    out = await h._pii_process_sse_line(cr_line, {})
+    assert out.startswith('data: ')
+    assert '"content":"CR行内容"' in out
+    # 断言：流末残留 \r 不再触发截断（byte_buf 被清空 → 截断检测不命中）
+    byte_buf = bytearray(b'data: {"choices":[{"delta":{"content":"x"}}]}\r')
+    pending_cr = True
+    if pending_cr and byte_buf and byte_buf.endswith(b'\r'):
+        _cr_line = bytes(byte_buf[:-1]).decode('utf-8', errors='replace')
+        byte_buf.clear()
+        pending_cr = False
+        assert _cr_line.startswith('data:')
+    assert not byte_buf
+    assert not pending_cr

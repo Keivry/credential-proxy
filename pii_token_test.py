@@ -207,9 +207,12 @@ def test_pii_partial_token_re_prefixes():
     ]
     for c in cases:
         assert _PII_PARTIAL_TOKEN_RE.search(c), f'{c} 应命中残缺正则'
-    # 完整 token 可被匹配（对齐原版语义：完整 token 已被 _restore 还原为明文，
-    # 到此处的完整 token 必是模型幻觉，剥离正确）
-    assert _PII_PARTIAL_TOKEN_RE.search('__PII_1_ab12cd34__')
+    # 8.2 修复：完整 token（__PII_<seq>_<rand8>__）不再命中残缺正则
+    # （响应期新 token 不被还原、原样保留；幻觉完整 token 由
+    # _split_safe_hold 的 FULL_PII_TOKEN_RE 先行 hold 分离）
+    assert not _PII_PARTIAL_TOKEN_RE.search('__PII_1_ab12cd34__')
+    # 差一个 hex + 下划线的形态（残缺）仍命中
+    assert _PII_PARTIAL_TOKEN_RE.search('__PII_1_ab12cd34_')
     # 凭据 token 形态不受影响
     assert not _PII_PARTIAL_TOKEN_RE.search('__VG_CRED_000001__')
     # 普通文本不误伤
@@ -217,11 +220,18 @@ def test_pii_partial_token_re_prefixes():
 
 
 def test_pii_partial_re_with_trailing_punct():
-    """尾部标点形态：__PII_0001_ab, 的 suffix 含逗号不再是完整 token 前缀。"""
-    # 残缺后缀剥离发生在 strip 标点之后；此处验证正则不会把带标点的
-    # 完整 token 误判为残缺（流末清理只剥离真正的残缺前缀）
+    """尾部标点形态：__PII_0001_ab, 的残缺前缀后跟逗号 → 剥离（8.9 F-10）。
+
+    8.9 修复：残缺前缀后跟空白/标点等非单词字符时同样剥离（`(?=[^\\w])`），
+    不再要求仅行尾锚定。
+    """
     assert _PII_PARTIAL_TOKEN_RE.search('__PII_0001_')
-    assert not _PII_PARTIAL_TOKEN_RE.search('__PII_0001_ab,')
+    # 残缺 + 逗号 → 命中（剥离）
+    assert _PII_PARTIAL_TOKEN_RE.search('__PII_0001_ab,')
+    # 完整 token + 逗号 → 不命中（保留）
+    assert not _PII_PARTIAL_TOKEN_RE.search('__PII_1_ab12cd34__,')
+    # 完整 token 后跟单词字符（如 _y）→ 不命中（保留）
+    assert not _PII_PARTIAL_TOKEN_RE.search('__PII_1_ab12cd34__y')
 
 
 def test_pii_regex_independent_of_cred_regex():

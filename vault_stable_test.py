@@ -86,6 +86,9 @@ def test_strip_partials_keeps_full():
 
     full = '__PII_1_ab12cd34__'
     assert _strip_partials(f'前缀{full}后缀') == f'前缀{full}后缀'
+    # 8.2：行尾完整 token 同样保留（负向前瞻排除完整形态，_*$ 不误剥收尾 __）
+    assert _strip_partials(f'新号码 {full}') == f'新号码 {full}'
+    assert _strip_partials(full) == full
 
 
 def test_strip_partials_removes_incomplete():
@@ -95,9 +98,16 @@ def test_strip_partials_removes_incomplete():
     assert _strip_partials('__PII_1_') == ''
     assert _strip_partials('__PII_1_ab') == ''
     assert _strip_partials('__VG_CRED') == ''
-    # 仅尾部残缺被剥离，行中非尾部不误剥（WHATWG 持留语义）
+    # 行尾残缺剥离
     assert _strip_partials('hello __VG_CRED_') == 'hello '
-    assert _strip_partials('hello __VG_CRED_  world') == 'hello __VG_CRED_  world'
+    # 8.9（F-10）：行中残缺前缀（后跟空白/标点）同样剥离
+    assert _strip_partials('hello __VG_CRED_  world') == 'hello   world'
+    assert _strip_partials('x__PII_1_ab y') == 'x y'
+    assert _strip_partials('x__PII_1_ab, y') == 'x, y'
+    assert _strip_partials('x__VG_CRED_12 y') == 'x y'
+    # 行中完整 token 保留
+    assert _strip_partials('x__PII_1_ab12cd34__ y') == 'x__PII_1_ab12cd34__ y'
+    assert _strip_partials('x__PII_1_ab12cd34__y') == 'x__PII_1_ab12cd34__y'
 
 
 def test_strip_partials_reverse_equivalence():
@@ -222,3 +232,59 @@ def test_validate_roundtrip_original_legal_output_illegal_fallback():
     assert _validate_json_roundtrip(orig, bad) == orig
     # original 非 JSON → 直接返回 output
     assert _validate_json_roundtrip('plain', bad) == bad
+
+
+def test_json_walk_depth_bomb_native_nested():
+    """8.1 裸嵌套深度炸弹：depth_limit 对裸嵌套生效，极端深度不崩溃。"""
+    # 3000 层裸嵌套不再 RecursionError（外层兜底返回原对象）
+    deep = cur = {}
+    for _ in range(3000):
+        cur['a'] = {}
+        cur = cur['a']
+    cur['x'] = 'leaf'
+
+    out = json_walk(deep, lambda s: s)
+    assert isinstance(out, dict)
+
+    # depth_limit 对裸嵌套生效：depth>5 的内层不再递归 loads→walk，
+    # 但 leaf_fn 仍执行（外层叶）
+    calls = []
+
+    def counting_leaf(s):
+        calls.append(s)
+        return s
+
+    nested = {'a': {'b': {'c': {'d': {'e': {'f': {'g': 'x'}}}}}}}
+    json_walk(nested, counting_leaf)
+    assert len(calls) >= 1
+    # depth>5 的叶仍执行 leaf_fn，但不会递归内层（leaf 数 <= 嵌套层数）
+    assert len(calls) <= 6
+
+
+@pytest.mark.asyncio
+async def test_json_walk_async_depth_bomb_native_nested():
+    """8.1 async 裸嵌套深度炸弹同样不崩溃。"""
+    deep = cur = {}
+    for _ in range(3000):
+        cur['a'] = {}
+        cur = cur['a']
+    cur['x'] = 'leaf'
+
+    out = await json_walk_async(deep, lambda s: s)
+    assert isinstance(out, dict)
+
+    # 7 层 JSON 字符串叶：depth>5 时内层不再递归
+    import json as _json
+
+    deep3 = 'x'
+    for _ in range(7):
+        deep3 = _json.dumps({'inner': deep3})
+    calls = []
+
+    async def aleaf(s):
+        calls.append(s)
+        return s
+
+    await json_walk_async(deep3, aleaf)
+    assert len(calls) >= 1
+    assert len(calls) <= 6

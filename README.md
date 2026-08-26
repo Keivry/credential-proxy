@@ -186,7 +186,7 @@ get revoke --name "check-mail"
 | `LLM_<PORT>` | LLM 脱敏代理端口 → 上游 URL | — |
 | `PII_REDACTION_ENABLED` | 启用 PII 脱敏（请求/响应检测） | `0`（默认关闭） |
 | `PII_RESPONSE_SIDE` | 启用响应侧 PII 检测（还原后新明文掩码） | `1` |
-| `PII_HOLD_MAX` | 流式响应尾部持有上限（字符） | `64` |
+| `PII_HOLD_MAX` | 审计 hold 缓冲尾部持有上限（字符，仅审计挂起用；流式正文行缓冲由 `LINE_BUF_FLUSH=16KB`/`LINE_BUF_MAX_AGE=30s` 控制，见下方流式阈值） | `64` |
 | `PII_FUZZY_RESTORE` | 模糊还原（大小写不敏感，仅 `re.IGNORECASE`，默认精确匹配，不含编辑距离） | `0` |
 | `PII_DETECTION_HARDENING` | 检测侧硬化总闸（`1` 时启用：保留地址精确前缀 `fc:/fd:`/`10.` 等含尾点/冒号+`lower()`+`ip_network` 兜底 / ReDoS `ThreadPool(2)+timeout 0.1s` / 字典 CJK 边界 `(?<![\\w\\u4e00-\\u9fff])` / `@lru_cache(4)`，默认关闭不改变既有行为） | `0` |
 | `PII_VAULT_GAP_AWARE` | 内置稳态下标（非开关，`next_available_index` 空洞跳过，`__PII_<seq>_<rand8>__` 其中 `rand8=secrets.token_hex(4)`） | —（内置） |

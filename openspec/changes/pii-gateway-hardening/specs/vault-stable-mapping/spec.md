@@ -24,6 +24,10 @@
 - **WHEN** 响应侧新检测 PII 注册为响应期 token
 - **THEN** `_restore` 原样保留该形态，不还原为明文
 
+#### Scenario: 响应期 token 行中间与行尾均保留
+- **WHEN** 响应侧新检测 PII 的完整 token（`__PII_<seq>_<rand8>__`）出现在文本行中间或行尾（如 `'新号码 13912345678'` 扫描后行尾 `__PII_1_<rand8>__`）
+- **THEN** `_strip_partials` 在行中间与行尾均原样保留完整 token（负向前瞻排除完整形态，`_*$` 不误剥收尾 `__`），工具参数 `{"phone":"__PII_1_..."}` 的 phone 值不被清空
+
 ### Requirement: 统一残缺清理与倒序替换
 
 系统 SHALL 提供 `_strip_partials(text)` 合并凭据与 PII 两套残缺形态（完整 `__PII_<seq>_<rand8>__` 保留、残缺前缀 `__PII`/`__VG_CRED`/`__PII_<digits>`/`__PII_<seq>_<hex>` 剥离），`safe` 侧倒序语义（`TextReplaceBuilder` 逆序替换）避免重叠错位，`hold` 侧阈值 `<64` 持有。
@@ -31,6 +35,10 @@
 #### Scenario: 残缺前缀不泄漏
 - **WHEN** 流式 `safe` 含 `__PII_1_ab` 残缺前缀
 - **THEN** `_strip_partials` 将其剥离，不转发给客户端
+
+#### Scenario: 行中残缺前缀同样剥离
+- **WHEN** 文本行中间含残缺前缀 `__PII_1_ab`（如 `'x__PII_1_ab y'`）
+- **THEN** `_strip_partials` 用负向前瞻/词边界覆盖行中残缺形态，将其剥离，完整 token 不受影响
 
 #### Scenario: 完整 token 保留
 - **WHEN** `safe` 含完整 `__PII_1_ab12cd34__`

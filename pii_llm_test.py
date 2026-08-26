@@ -210,14 +210,23 @@ class TestSplitSafeHoldPii:
 
     @pytest.mark.asyncio
     async def test_pii_token_stripped_from_safe(self):
-        """safe 输出前 PII token 形态剥离（响应期 token 不泄漏）。"""
+        """safe 输出前 PII token 形态保留（响应期新 token 不被还原、原样保留）。
+
+        8.2 修复：`_strip_token_forms` 不再无条件剥离完整 PII token——
+        响应期注册的 token 保留（vault-stable-mapping spec「响应期新 token
+        不被还原」）；幻觉完整 token 由 `_split_safe_hold` 的
+        `FULL_PII_TOKEN_RE` 先行 hold 分离（见 test_pii_full_token_hold）。
+        """
         scope = RequestScopedTokens()
         await scope.register('13800138000', response_side=True)
         token = next(iter(scope.resp_t2p))
-        # 完整 token 在 safe 区（非 hold 场景）→ 被 _strip_token_forms 剥离
+        # 完整 token 在 safe 区（非 hold 场景）→ 保留（响应期 token）
         safe, _hold = _split_safe_hold(f'hello {token} world', {}, scope)
-        assert token not in safe
+        assert token in safe
         assert 'hello' in safe
+        # 残缺形态仍被剥离
+        safe2, _ = _split_safe_hold('hello __PII_9_ab', {}, scope)
+        assert '__PII_9_ab' not in safe2
 
     @pytest.mark.asyncio
     async def test_safe_output_strips_partial_forms(self):
@@ -230,6 +239,7 @@ class TestSplitSafeHoldPii:
 
         注：`_PII_PARTIAL_TOKEN_RE` 行尾锚定（`$`）——残缺只在
         流分片边界（行尾）出现，行中形态是正常文本不清除。
+        8.2：行中残缺由 8.9 负向前瞻扩展覆盖。
         """
         scope = RequestScopedTokens()
         await scope.register('13800138000', response_side=True)
@@ -246,15 +256,15 @@ class TestSplitSafeHoldPii:
 
     def test_non_streaming_out_strips_full_and_partial(self):
         """Round 17 审查补充回归：非流式整包出口用 `_strip_token_forms`
-        （残缺 + 完整幻觉 token 一并清理，与流式 `_split_safe_hold` 语义
-        对齐；旧实现只调 `_strip_partials` 清残缺，完整幻觉 token
-        `__VG_CRED_000042__` 直出）。"""
+        （残缺清理；完整凭据幻觉 token 清理，完整 PII token 保留——
+        8.2 修复：响应期新 token 不被还原、原样保留，vault-stable-mapping spec）。"""
         from _llm import _strip_token_forms
 
         out = 'answer __VG_CRED_000042__ done __PII_7_a1b2c3d4__ tail __PII_9_ab'
         cleaned = _strip_token_forms(out)
         assert '__VG_CRED_000042__' not in cleaned
-        assert '__PII_7_a1b2c3d4__' not in cleaned
+        # 8.2：完整 PII token 保留（响应期 token 语义）
+        assert '__PII_7_a1b2c3d4__' in cleaned
         assert '__PII_9_ab' not in cleaned
         assert 'answer' in cleaned and 'done' in cleaned and 'tail' in cleaned
 
@@ -506,6 +516,8 @@ def test_strip_partials_removes_pii_partial_forms():
 
     回归 F-02：此前所有 flush 路径只用凭据版 _PARTIAL_TOKEN_RE，
     `__PII_1_ab` 等残缺随 safe 输出泄漏。_strip_partials 统一两套正则。
+    8.2：完整 token（`__PII_<seq>_<rand8>__`）在行尾与行中均保留
+    （响应期新 token 不被还原、原样保留，vault-stable-mapping spec）。
     """
     cases = [
         ('text __PII', 'text '),
@@ -513,7 +525,12 @@ def test_strip_partials_removes_pii_partial_forms():
         ('text __PII_0001', 'text '),
         ('text __PII_0001_', 'text '),
         ('text __PII_0001_ab', 'text '),
-        ('text __PII_1_ab12cd34__', 'text '),  # 幻觉完整 token 也剥离
+        # 8.2 修复：完整 token 行尾保留（不再被 _*$ 误剥）
+        ('text __PII_1_ab12cd34__', 'text __PII_1_ab12cd34__'),
+        # 行中完整 token 保留
+        ('x__PII_1_ab12cd34__y', 'x__PII_1_ab12cd34__y'),
+        # 差一个 hex + 下划线（残缺形态）仍剥离
+        ('text __PII_1_ab12cd34_', 'text '),
     ]
     for inp, expected in cases:
         assert _strip_partials(inp) == expected, f'{inp!r} -> {_strip_partials(inp)!r}'
@@ -525,8 +542,9 @@ def test_strip_partials_keeps_cred_partials_and_plain():
     assert _strip_partials('x __VG_CRED_0001') == 'x '
     # 普通文本（__ 开头但不是 token 前缀）
     assert _strip_partials('__Python__ 和 __PIIX') == '__Python__ 和 __PIIX'
-    # 带尾部标点的完整 token（流末清理只剥离真正残缺前缀）
-    assert _strip_partials('__PII_0001_ab,') == '__PII_0001_ab,'
+    # 8.9（F-10）：带尾部标点的残缺前缀同样剥离（`(?=[^\w])` 匹配逗号）
+    assert _strip_partials('__PII_0001_ab,') == ','
+    assert _strip_partials('__PII_0001_ab。') == '。'
     # 空输入
     assert _strip_partials('') == ''
 

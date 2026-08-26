@@ -215,7 +215,8 @@ def parse_pii_env_config() -> dict:
 
     - PII_REDACTION_ENABLED（1/true/True/yes → 启用，默认关）
     - PII_RESPONSE_SIDE（1/true/True/yes → 响应侧检测启用，默认开）
-    - PII_HOLD_MAX（尾部持有上限，默认 64，取值 ≥1 正整数）
+    - PII_HOLD_MAX（审计 hold 尾部持有上限，默认 64，取值 ≥1 正整数；
+      流式正文行缓冲由 LINE_BUF_FLUSH=16KB / LINE_BUF_MAX_AGE=30s 控制）
     - PII_FUZZY_RESTORE（0/1，默认 0）
     - PII_DETECTION_HARDENING（0/1，默认 0，硬化特性总闸）
 

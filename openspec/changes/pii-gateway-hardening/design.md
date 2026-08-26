@@ -39,7 +39,7 @@
 - 选用：正文本 `content/reasoning/refusal`（含 Anthropic `text`/`thinking` 的 `text_delta`/`thinking_delta`（`signature_delta` 仅签名不进 `line_buf` 透传）、Responses `output_text`/`reasoning_text`/`refusal`/`reasoning_summary_text`/`audio.transcript` 的 `delta` 以及 `code_interpreter_call_code.delta`/`shell_call_command.delta` 等文本载荷；`audio.delta` 音频字节不进 `line_buf`/`arg_buf`）走 `line_buf` 逻辑行缓冲（应急食品讨论收敛）：`delta_text.replace('\r\n','\n').replace('\r','\n')` 归一后 `line_buf += delta_text; while '\n' in line_buf: line,line_buf = split('\n',1); line+='\n'; restore(line)→_strip_partials→_mk_*_event` 立刻发；无 `\n` 时整行持有，不做 `_split_safe_hold` 前缀判断。`choices` 维度遍历全量；字节层 `byte_buf` 按 WHATWG 先聚合同一事件内多 `data:` 行（`data_buffer` 以 `\n` 拼接）再单次 `loads`。备选：按 token 前缀 `rfind('__')` 切分 → 代码复杂且 `8.8.` 易切断（原 D4 已证）；行缓冲以 TTFT（平均 +80-150 字符延迟，延迟不敏感可接受）换简洁。
 - 工具参数（`chat: tool_calls[].function.arguments` / `function_call.arguments`（deprecated） / Anthropic `partial_json` / Responses `function_call_arguments.delta`/`mcp_call_arguments.delta`/`custom_tool_call_input.delta`/`code_interpreter_call_code.delta`/`shell_call_command.delta` 等 stringified JSON/参数）为字符串载荷，无 `\n`，保持 `arg_buf += delta` 攒到 `finish_reason in (tool_calls,function_call,stop,length,content_filter)` / Anthropic `content_block_stop` / Responses `response.output_item.done`/`response.content_part.done`/`response.output_text.done`/`response.function_call_arguments.done`/`response.mcp_call_arguments.done`/`response.custom_tool_call_input.done`/`response.code_interpreter_call_code.done`/`item_done` 才 `json_aware walk` + 审计 hold，再一次性 flush，不按 `\n` 切分；`choices` 维度遍历全量而非仅 `choices[0]`。
 - 兜底与保活：单行累积超 16KB 或持有超 30s 即使无 `\n` 也按 `_split_safe_hold(_has_partial_pii_candidate)` 前缀兜底强制 flush（候选正则：`\b\d{1,3}\.(?:\d{1,3}\.){0,2}$` / `[A-Za-z0-9._%+-]+@$` / `fe80::[0-9a-f:]*$`），防无换行长流憋死；持有期间每 10s 发 SSE 注释保活 `: keepalive\n\n`（WHATWG `comment` 行，客户端按空操作忽略，非 `data:` 事件），避免 hermes `inactivity 120s` 断连；每次真数据 `_tracked_write` 后重置保活计时。
-- 字节窗口 64B 已由行缓冲吸收，仅在超长强制路径保留 `PII_HOLD_MAX` 语义；阈值 `16KB(=16384)`/`30s`/`10s`/`1MB` 为硬编码常量（`LINE_BUF_FLUSH`/`LINE_BUF_MAX_AGE`/`KEEPALIVE_INTERVAL`/`SSE_MAX_BUF`）非环境变量，与 spec 量化一致。
+- 字节窗口 64B 已由行缓冲吸收，流式超长强制统一由 `LINE_BUF_FLUSH=16KB`/`LINE_BUF_MAX_AGE=30s` 控制；`PII_HOLD_MAX` 仅用于审计 hold 缓冲（`AUDIT_HOLD_MAX_BYTES`），不再参与流式正文行缓冲语义。阈值 `16KB(=16384)`/`30s`/`10s`/`1MB` 为硬编码常量（`LINE_BUF_FLUSH`/`LINE_BUF_MAX_AGE`/`KEEPALIVE_INTERVAL`/`SSE_MAX_BUF`）非环境变量，与 spec 量化一致。
 
 **D5 检测侧加固：`lru_cache` Analyzer + 保留地址精确前缀（含尾点/冒号）+ ReDoS 线程池守卫 + 字典独立扫描**
 
@@ -57,6 +57,21 @@
 - 选用 7.5：`SSE_MAX_BUF` 快链 `find` 改 `rfind` 与慢链一致，快链截断后 `data_buffer.clear(); event_fields.clear()` 防残留串事件。备选：保留 `find` → 1MB 截断丢尾行可解析前缀。
 - 选用 7.6：检测侧 `scan(hardening=_is_detection_hardening())` 对齐 spec，`_dict_boundary_ok` 非 hardening 分支简化 `(?<!\w)` 形成差异化，超长输入按 `1M` 分块迭代而非 `text[:1M]` 截断（`_scan_custom` 仍 `hardening or timeout` 使 ReDoS 常开）。备选：保留截断 → 尾部 PII 丢检。
 - 选用 7.7：Vault `register` 已持 `asyncio.Lock` 覆盖 `used set` 快照与 `token` 写入全程，确认原子性；文档补 `resp_p2t 不还原` 与 `__PII_/__VG_CRED_` 保留前缀（`vault-stable-mapping` 已声明 token 形态，本文档化）。
+
+**D7 终审补漏（2026-08-26 全量审查闭环，§8 对应）**
+
+- 选用 8.1（F-01 🔴）：`json_walk`/`json_walk_async` 正常分支 `dict`/`list` 递归统一传 `_depth+1`，使 `depth_limit=5` 对裸嵌套生效（§7.2 修复不彻底：仅越限分支 +1，3000 层裸嵌套实测 `RecursionError`）；walk 入口加 `RecursionError` 兜底返回原对象（防深度炸弹崩溃）。备选：依赖 `depth_limit` 单层防护 → 裸嵌套可绕过直接崩溃。
+- 选用 8.2（F-02 🔴 + F-08 🟡）：`_PII_PARTIAL_TOKEN_RE` 行尾锚定 `_*$` 误剥完整 token 收尾 `__`（行尾完整 token 值消失，工具参数 `phone` 被清空），`_strip_token_forms` 对行中完整形态也剥离。改正则加负向前瞻排除完整形态 `(?![0-9a-fA-F]{8}__)`，`_strip_token_forms` 保留响应期新注册 token 仅清理幻觉残缺，行为对齐 `vault-stable-mapping`「响应期新 token 不被还原、原样保留」。备选：响应期 token 一律剥离 → 保守但破坏语义（spec 违背）。
+- 选用 8.3（F-03 🔴）：`_request_audit_approval` 的 `_audit_approval_msgs` 在 `_ask` 失败时不清理 → 同 msg_id reaction 错误关联新请求。`finally` 统一清理。备选：依赖 `_ask` 成功返回 → 发送失败残留映射。
+- 选用 8.4（F-04 🟡）：`data_buffer` join 后 `json.loads` 对多独立 data 行必然 `JSONDecodeError: Extra data`，续行重建不覆盖多 data 行场景 → 可能转发未脱敏原始行。聚合后先试 `loads`，失败逐行独立 `_pii_response_process` 保底安全。备选：依赖续行重建 → 多 data 行场景泄漏明文。
+- 选用 8.5（F-05 🟡）：流末 `pending_cr=True` 且 `byte_buf` 残留 `\r` → 判截断误报合成。EOF 时 `pending_cr` 视为行终止符立即 dispatch。备选：残留 `\r` 判截断 → 正常流误报截断合成。
+- 选用 8.6（F-06 🟡）：design D3「仅在超长强制路径保留 PII_HOLD_MAX 语义」措辞误导——实现流式超长全用 `LINE_BUF_FLUSH=16KB`/`LINE_BUF_MAX_AGE=30s`，`pii_hold_max` 仅审计 hold 用。文档明确「流式超长由 `LINE_BUF_FLUSH`/`LINE_BUF_MAX_AGE` 控制，`PII_HOLD_MAX` 仅审计 hold 用」，README/proxy.py 注释同步。
+- 选用 8.7（F-07 🟡）：`residual_hardening_test.py` 多数测试自我模拟（重写 line_buf 逻辑/断言字面量），无一驱动真实 handler。新增 3 个集成测试（mock 上游流驱动真实 `_handle_openai_sse`/`_handle_anthropic_event`/`_handle_responses_event`）断言真实输出字节。备选：保留自我模拟 → 覆盖假象。
+- 选用 8.8（F-09 🟡）：快链 `byte_buf.find(b"\n")` + `rstrip("\r")` 无 `data_buffer` 聚合/BOM/注释/CR-only 处理，且无 `line_buf` 跨 delta 合并 → PII 检测启用无请求 token 时跨行片段漏检。快链复用慢链 WHATWG 帧状态机（仅跳过 json_aware walk），`line_buf` 合并逻辑抽公共函数。备选：保留快链简化 → 帧完整性缺口。
+- 选用 8.9（F-10 🟢）：`_strip_partials` 正则 `$` 锚定只覆盖行尾，行中残缺 `__PII_1_ab` 不剥离。负向前瞻/词边界覆盖行中残缺形态。备选：保留行尾锚定 → 行中残缺泄漏。
+- 选用 8.10（F-11 🟢）：慢链主循环 `json.loads(payload)` 后 `_pii_process_sse_line` 再 `_jloads` 一次（双重解析）。`_pii_response_process_json_aware` 加 `parsed_obj` 参数跳过首层 loads，纯文本快速通道直接透传。备选：保留双重解析 → 高 RPS 每行 2-3 次 loads。
+- 选用 8.11（F-12 🟢）：`_audit_arg_accum` 与 `arg_buf` 双累积器语义相同易不同步。合并为单一原始累积器（`arg_buf` 保持原始），审计读原始、flush 时复制 json_aware 掩码。备选：保留双累积器 → 维护负担。
+- 选用 8.12（F-13 🟢）：sentinel 录制对齐 spec 场景（`choices[1]` 改 token、补 `refusal`/`audio.transcript`）。备选：保留明文录制 → 场景不对齐。
 
 ## Risks / Trade-offs
 
