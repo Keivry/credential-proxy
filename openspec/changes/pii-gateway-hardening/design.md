@@ -71,7 +71,24 @@
 - 选用 8.9（F-10 🟢）：`_strip_partials` 正则 `$` 锚定只覆盖行尾，行中残缺 `__PII_1_ab` 不剥离。负向前瞻/词边界覆盖行中残缺形态。备选：保留行尾锚定 → 行中残缺泄漏。
 - 选用 8.10（F-11 🟢）：慢链主循环 `json.loads(payload)` 后 `_pii_process_sse_line` 再 `_jloads` 一次（双重解析）。`_pii_response_process_json_aware` 加 `parsed_obj` 参数跳过首层 loads，纯文本快速通道直接透传。备选：保留双重解析 → 高 RPS 每行 2-3 次 loads。
 - 选用 8.11（F-12 🟢）：`_audit_arg_accum` 与 `arg_buf` 双累积器语义相同易不同步。合并为单一原始累积器（`arg_buf` 保持原始），审计读原始、flush 时复制 json_aware 掩码。备选：保留双累积器 → 维护负担。
-- 选用 8.12（F-13 🟢）：sentinel 录制对齐 spec 场景（`choices[1]` 改 token、补 `refusal`/`audio.transcript`）。备选：保留明文录制 → 场景不对齐。
+- 选用 8.13（F-13 🟢）：sentinel 录制对齐 spec 场景（`choices[1]` 改 token、补 `refusal`/`audio.transcript`）。备选：保留明文录制 → 场景不对齐。
+
+**D8 传输层终审闭环（2026-08-26 主代理实测 + 3 子任务并行审查，§9 对应）**
+
+- 选用 9.1（F-01 🔴🔴🔴）：慢链 `del byte_buf[:pos]` 在 §7 重构（c4750dc）时被误缩进进 `while True` 循环体内（缩进 40/44，AST + git blame 双重证实），体内 5 分支全 `continue/break` → 不可达死代码，`byte_buf` 单调增长致正常流误判截断 + 合成重复 `[DONE]`。修复：回移至 indent36 紧贴 while 后（与快链 3889 对称），补 `test_byte_buf_trim`。备选：依赖既有 `rfind` 截断 → 正常流恒被污染。
+- 选用 9.2（F-02 🔴）：截断判定 `if byte_buf or data_buffer...`（3492）过敏感 + 合成事件自带 `data: [DONE]`（1172）与透传重复。修复：仅 `!seen_global_terminal` 且确有未消费 data 内容时合成；合成前检查已发 `[DONE]` 去重；合成事件不再自带 `[DONE]`。备选：保留现状 → 正常流误报截断。
+- 选用 9.3（F-03 🔴）：慢链 `choices[0]` 只取首路（2677/3094），`n=2` 第二路内容/PII/finish_reason 全丢。修复：`for choice in parsed.get('choices',[])` 全量 + `finish_reason = next(...)`。备选：仅首路 → 旁路泄漏。
+- 选用 9.4（F-04 🔴）：慢链 CR-only 行 append 到 `data_buffer` 后从不 dispatch（3532 直接 clear 丢弃），快链正确、双链不对称。修复：流末 CR-only 行立即正常分发。备选：依赖截断合成兜底 → 内容丢失。
+- 选用 9.5（F-05 🟡）：快链 `_fast_emit_data@3790` 缺 line_buf 行缓冲，跨 `data:` 分片切断 `user@exa`+`mple.com` 前段提前 safe 发出致邮箱片段泄漏；tasks 8.8 声称「line_buf 抽公共函数供快链复用」未兑现。修复：抽公共行缓冲函数（`_emit_line_buf`）供快慢链复用，或退化 tasks 措辞并评估泄漏接受度。备选：保留快链简化 → 片段泄漏。
+- 选用 9.6（F-06 🟡）：共享 walk 路径（1302）与 fallback（1371）未包装 `_shared_validate`，叶级非法 JSON 不回退原串；tasks 6.1 声称三处统一但 `_llm` 响应侧漏接（对比 `_token`/`_pii` 已正确）。修复：共享路径 `out=_jdumps(walked); return _shared_validate(text,out)` 包装。备选：保留裸 `_jdumps` → 违反 spec「output 非法回退原串」。
+- 选用 9.7（F-07 🟡）：慢链每行 `restore→scan` 全链 + `active_t2p` 每行重编 `re`（`_restore_cache_pat` 仅缓存全局）。修复：`_restore_cache` 分 `global_ver`/`active_id` 两级缓存 + scan 批量化。备选：保留每行重编 → 高 RPS 性能债。
+- 选用 9.8（F-08 🟡）：`_pii_response_scan` 用 `norm_value == re_sub_seps(plain)` 值级等价（896-901）不看位置，模型独立输出同值明文被误跳过掩码，与 docstring 矛盾。修复：改位置区间重叠比较。备选：保留值级 → 语义违背。
+- 选用 9.9（F-09 🟡）：`_strip_token_forms_json_aware`（497-567）为第四处独立 walk，与共享语义漂移。修复：改薄包装 `json_walk`。备选：保留第四处 → 维护漂移。
+- 选用 9.10（F-11 🟡）：Anthropic/Responses 超长条件缺 `now-line_buf_ts>30`（LINE_BUF_MAX_AGE），三协议不一致。修复：两 handler 补 30s age 分支。备选：保留 chat 独有 → 语义分裂。
+- 选用 9.11（F-12 🟡）：`parsed_obj` 仅非 dict 分支传递（2548），主 dict 路径/续行/快链仍二次 loads。修复：主路径传 `parsed_obj=parsed`。备选：保留双重解析 → 30% CPU 浪费。
+- 选用 9.12（F-14 🟡）：`_ka` 闭包在审批挂起（`_request_audit_approval` await 90s）期间不可见 → 不保活临界 hermes inactivity 120s。修复：`_ka` 检查 `_audit_approval_pending` 非空即保活。备选：保留现状 → 审计挂起可能断连。
+- 选用 9.13（F-13/F-15/F-16/F-17/F-18）：文档/测试对齐——tasks 勾选不实标注、sentinel 入测试、集成断言补强（`raw.count('data: [DONE]')==1`/`'truncated' not in raw`）、自模拟用例改造为真实 handler 驱动。备选：保留空心断言 → 回归无法捕获。
+- 选用 9.14：门禁与文档收尾——三门禁 + design D8 + CHANGELOG v0.9.19。
 
 ## Risks / Trade-offs
 

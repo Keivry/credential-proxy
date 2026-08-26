@@ -99,6 +99,25 @@ async def make_upstream():
                 ).encode()
             )
             await resp.write(b'data: {"type":"response.completed"}\n\n')
+        elif case == 'sentinel_chat':
+            # 9.13 (F-13): sentinel fixture 回放——choices n=2 第二路、
+            # tool_calls arguments、finish_reason、[DONE] 全场景。
+            # fixture 内硬编码 __PII_1_ab12cd34__ 替换为代理实际注册 token
+            # （_extract_pii_token 从脱敏请求 body 提取），否则还原不命中。
+            import json as _json
+            import pathlib
+
+            _fixture = (
+                pathlib.Path(__file__).parent / 'fixtures' / 'sentinel_chat.jsonl'
+            )
+            for _ln in _fixture.read_text(encoding='utf-8').splitlines():
+                _entry = _json.loads(_ln)
+                if _entry.get('kind') == 'sse':
+                    await resp.write(
+                        _entry['line'].replace('__PII_1_ab12cd34__', tok).encode()
+                    )
+            await resp.write_eof()
+            return resp
         elif case == 'truncated_no_terminal':
             # 截断：上游无终止直接断流（0 终止事件）
             await resp.write(
@@ -114,6 +133,24 @@ async def make_upstream():
                 ).encode()
             )
             await resp.write(b'data: [DONE]\n\n')
+        elif case == 'cr_only_eof':
+            # 9.4 (F-04): CR-only 行（无 LF）在流末正确 dispatch——
+            # 末行以 \r 结尾且带 finish_reason=stop（终止事件），EOF 时
+            # 该行立即 dispatch，不残留、不丢内容、不误判截断
+            await resp.write(
+                (
+                    'data: {"choices":[{"index":0,"delta":{"content":"第一行"}}]}\n\n'
+                ).encode()
+            )
+            await resp.write(
+                (
+                    'data: {"choices":[{"index":0,"delta":{"content":"CR尾行'
+                    + tok
+                    + '"}, "finish_reason":"stop"}]}\r'
+                ).encode()
+            )
+            await resp.write_eof()
+            return resp
         await resp.write_eof()
         return resp
 
@@ -176,7 +213,9 @@ async def test_integration_chat_stream_real_handler():
         # （中文可能被 ensure_ascii 转义为 \uXXXX，检查明文手机号即可）
         assert '13800138000' in raw
         assert '__PII_' not in raw
-        assert 'data: [DONE]' in raw
+        # 9.13 (F-11): 正常流不合成截断——[DONE] 恰 1 个、无 TRUNCATED_MESSAGE
+        assert 'TRUNCATED_MESSAGE' not in raw and '被截断' not in raw
+        assert raw.count('data: [DONE]') == 1, f'[DONE] 数量异常: {raw!r}'
 
 
 @pytest.mark.asyncio
@@ -196,6 +235,8 @@ async def test_integration_anthropic_real_handler():
         assert '__PII_' not in raw
         assert '13800138000' in raw
         assert 'message_stop' in raw
+        # 9.13 (F-11): 正常流不合成截断
+        assert 'TRUNCATED_MESSAGE' not in raw and '被截断' not in raw
 
 
 @pytest.mark.asyncio
@@ -214,6 +255,8 @@ async def test_integration_responses_real_handler():
         assert '__PII_' not in raw
         assert '13800138000' in raw
         assert 'response.completed' in raw
+        # 9.13 (F-11): 正常流不合成截断
+        assert 'TRUNCATED_MESSAGE' not in raw and '被截断' not in raw
 
 
 @pytest.mark.asyncio
@@ -294,6 +337,133 @@ async def test_fast_chain_whatwg_bom_and_comment():
             assert ': keepalive' in raw
             assert '第一行' in raw
             assert '第二行' in raw
+        finally:
+            for r in proxy._runners:
+                await r.cleanup()
+            if proxy._shared_session:
+                await proxy._shared_session.close()
+    finally:
+        await up_runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_sentinel_chat_fixture_choices_n2_and_tool_calls():
+    """9.13 (F-13): sentinel_chat.jsonl 真实 handler 回放——choices n=2 第二路
+    不丢、tool_calls arguments 还原、正常流不合成截断（[DONE] 恰 1 个）。
+
+    该 fixture 含：n=2 第二路 __PII token 回显（9.3 全量遍历）、
+    tool_calls arguments 内嵌 token（还原）、finish_reason=tool_calls。
+    请求 body 必须包含 13812345678 使代理注册 token，且请求带 tools 定义。
+    """
+    async with env(), ClientSession() as s:
+        body = json.dumps(
+            {
+                'case': 'sentinel_chat',
+                'messages': [{'role': 'user', 'content': '查询 13812345678 的订单'}],
+                'tools': [
+                    {
+                        'type': 'function',
+                        'function': {
+                            'name': 'query_order',
+                            'parameters': {
+                                'type': 'object',
+                                'properties': {'phone': {'type': 'string'}},
+                            },
+                        },
+                    }
+                ],
+            }
+        )
+        async with s.post(CHAT_BASE, headers=HEADERS, data=body) as r:
+            assert r.status == 200
+            raw = await r.text()
+        # 9.3: choices n=2 第二路 __PII token 还原为明文（不丢第二路）
+        assert '13812345678' in raw, f'第二路 token 未还原: {raw!r}'
+        # 工具调用 arguments 还原
+        assert 'query_order' in raw
+        # 正常流不合成截断：无 TRUNCATED_MESSAGE，[DONE] 恰 1 个
+        assert 'TRUNCATED_MESSAGE' not in raw and '被截断' not in raw
+        assert raw.count('data: [DONE]') == 1, f'[DONE] 数量异常: {raw!r}'
+
+
+@pytest.mark.asyncio
+async def test_integration_cr_only_eof_dispatch():
+    """9.13 (F-12 改造): CR-only 行（无 LF）流末真实 handler dispatch——
+    替代 residual_hardening 自模拟：上游末行以 \r 结尾断流，代理应
+    立即分发该行（还原 token），不残留、不误判截断、[DONE] 恰 1 个。
+    """
+    async with env(), ClientSession() as s:
+        body = json.dumps(
+            {
+                'case': 'cr_only_eof',
+                'messages': [{'role': 'user', 'content': '我的号码是 13800138000'}],
+            }
+        )
+        async with s.post(CHAT_BASE, headers=HEADERS, data=body) as r:
+            assert r.status == 200
+            raw = await r.text()
+        # CR 尾行内容已分发：第一行+CR 行合并后内容存在
+        assert '第一行' in raw or '\\u7b2c\\u4e00\\u884c' in raw
+        # CR 尾行 token 还原为明文
+        assert '13800138000' in raw, f'CR 尾行 token 未还原: {raw!r}'
+        # 无合成截断（[DONE] 恰 1 个）
+        assert 'TRUNCATED_MESSAGE' not in raw and '被截断' not in raw
+        assert raw.count('data: [DONE]') == 1, f'[DONE] 数量异常: {raw!r}'
+
+
+@pytest.mark.asyncio
+async def test_fast_chain_line_buf_cross_data():
+    """9.5 (F-05)：快链跨 data 行切断 PII 片段（user@exa + mple.com）合并后统一处理。
+
+    快链（active_t2p 为空但有 PII 检测）line_buf 行缓冲：跨 data: 事件切断的
+    邮箱片段不透漏，合并后整体还原。
+    """
+
+    async def _make_stream_handler():
+        async def handler(request):
+            resp = web.StreamResponse(headers={'Content-Type': 'text/event-stream'})
+            await resp.prepare(request)
+            # 两 data 行各含半截邮箱（跨事件切断）
+            await resp.write(
+                b'data: {"choices":[{"index":0,"delta":{"content":"user@exa"}}]}\n\n'
+            )
+            await resp.write(
+                b'data: {"choices":[{"index":0,"delta":{"content":"mple.com"}}]}\n\n'
+            )
+            await resp.write(
+                b'data: {"choices":[{"index":0,"delta":{"content":" OK"}}]}\n\n'
+            )
+            await resp.write(b'data: [DONE]\n\n')
+            await resp.write_eof()
+            return resp
+
+        app = web.Application()
+        app.router.add_route('*', '/{tail:.*}', handler)
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        await web.TCPSite(runner, '127.0.0.1', UPSTREAM_PORT).start()
+        return runner
+
+    up_runner = await _make_stream_handler()
+    try:
+        proxy = await make_proxy()
+        try:
+            async with ClientSession() as s:
+                body = json.dumps(
+                    {'case': 'x', 'messages': [{'role': 'user', 'content': 'hi'}]}
+                )
+                async with s.post(CHAT_BASE, headers=HEADERS, data=body) as r:
+                    assert r.status == 200
+                    raw = await r.text()
+            # 片段不透漏：半截邮箱不孤立出现（完整邮箱或掩码形态允许）
+            # 检查：user@exa 后不紧跟行结束/JSON 边界（即不是孤立片段）
+            import re as _re
+
+            assert not _re.search(r'user@exa(?!mple)', raw), f'孤立片段泄漏: {raw!r}'
+            # 合并后完整输出（完整邮箱或 PII 掩码，非半截）
+            assert 'user@example.com' in raw or 'user@exa' not in raw
+            # 无合成截断（[DONE] 恰 1 个）
+            assert raw.count('data: [DONE]') == 1
         finally:
             for r in proxy._runners:
                 await r.cleanup()

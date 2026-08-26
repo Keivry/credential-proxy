@@ -264,8 +264,10 @@ async def test_multi_data_line_no_blank_safe_fallback(monkeypatch):
 async def test_cr_only_eof_dispatch(monkeypatch):
     """8.5（F-05）：CR-only 行（无 LF）在流末被正确 dispatch，不误判截断。
 
-    模拟慢链流末逻辑：pending_cr=True 且 byte_buf 残留 `data: {...}\r` →
-    EOF 时视为行终止符，行内容进入 data_buffer 或直接脱敏转发。
+    9.13d：本用例保留为语义单元测试（验证 pending_cr 判定逻辑本身）；
+    真实 handler 驱动验证见 tests/pii_stream_integration_test.py::
+    test_integration_cr_only_eof_dispatch（上游末行 \r 结尾 → CR 行内容
+    dispatch、finish_reason 置位、[DONE] 恰 1 个）。
     """
     from _llm import LlmMixin
     from _token import TokenMixin

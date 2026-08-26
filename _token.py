@@ -591,11 +591,20 @@ class TokenMixin:
         mapping = token_to_pwd if token_to_pwd is not None else self.token_to_pwd
         if not mapping:
             return text
-        # 显式 mapping：每次构建（active_t2p 通常 <10 项，开销可忽略）
+        # 显式 mapping：请求级两级缓存（9.7 F-07）——同一 active_t2p dict
+        # 贯穿整个流（内容几乎不变），仅首行重编 pat，后续行直接复用。
+        # 键 = (id(mapping), len(mapping), items 指纹)，mapping 内容变化即失效重编。
         if token_to_pwd is not None:
-            items = sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True)
-            pat = _re.compile('|'.join(_re.escape(tok) for tok, _ in items))
-            return pat.sub(lambda m: mapping.get(m.group(0), m.group(0)), text)
+            _cache = getattr(self, '_restore_active_cache', None)
+            _key = (id(mapping), len(mapping), tuple(sorted(mapping.items())))
+            if _cache is None or _cache[0] != _key:
+                items = sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True)
+                pat = _re.compile('|'.join(_re.escape(tok) for tok, _ in items))
+                repl = dict(mapping)
+                _cache = (_key, pat, repl)
+                self._restore_active_cache = _cache
+            _pat, _repl = _cache[1], _cache[2]
+            return _pat.sub(lambda m: _repl.get(m.group(0), m.group(0)), text)
         # 全集：使用版本缓存
         if getattr(self, '_restore_cache_ver', -1) != self._token_seq:
             items = sorted(mapping.items(), key=lambda x: len(x[0]), reverse=True)

@@ -35,6 +35,11 @@
 - **WHEN** 某叶 `leaf_fn` 替换后 `_validate_json_roundtrip` 判定 `output` 非法 JSON
 - **THEN** 仅该叶回退原串，不影响其他叶，且不抛异常
 
+#### Scenario: 响应侧共享 walk 外层出口同样校验
+
+- **WHEN** `_llm._pii_response_process_json_aware` 走共享 walk 或 fallback 路径产出 `_jdumps` 结果
+- **THEN** 外层出口同样经 `_shared_validate` 校验（`original` 合法而 `output` 非法时回退原串），与 `_token`/`_pii` 三处包装出口一致（tasks 6.1 声称统一但 `_llm` 响应侧漏接）
+
 #### Scenario: 叶异常仅该叶回退
 
 - **WHEN** 某叶 `leaf_fn` 抛异常

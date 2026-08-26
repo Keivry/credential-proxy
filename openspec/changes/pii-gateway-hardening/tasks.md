@@ -74,7 +74,7 @@
 - [x] 6.3 `line_buf` 逻辑行缓冲落地（HIGH H4，`spec:streaming-residual-hardening` 核心语义悬空）：现 **无 `line_buf` 变量**，`2595 content_buf+=delta → _pii_response_process → _split_safe_hold(rfind("__"))` 按 token 前缀切分使 `user@exa`+`mple.com` 跨 delta 提前泄漏。新增 `line_buf: str + line_buf_ts: float`，三协议文本 `delta`（`content/reasoning/refusal` 含 Anthropic `text_delta`/`thinking_delta`（`signature_delta` 豁免）、Responses `output_text`/`reasoning_text`/`refusal`/`reasoning_summary_text`/`audio.transcript`/`code_interpreter_call_code`/`shell_call_command` 等，`audio.delta` 不进缓冲）统一 `delta.replace("\r\n","\n").replace("\r","\n")` 后 `line_buf+=delta`，`while "\n" in line_buf: line,line_buf=split("\n",1); line+="\n"; restored=await _pii_response_process(line); safe=_strip_partials(restored); _tracked_write(_mk_event(safe)) 立刻发`，无 `\n` 时持有不 `_split_safe_hold`，除非命中 6.5 超长阈值。遍历 `choices[]` 全量（见 6.4）。
   - 验收：`specs/streaming-residual-hardening/spec.md` 的 跨分片 token 同行还原/无换行短答持有/邮箱 IP 行内不泄漏 三场景行缓冲版全绿；`test_token_split_across_deltas` 行缓冲版通过，`n=2` 第二路 PII 不旁路
 
-- [x] 6.4 `choices[]` 全量遍历（HIGH H6，旁路泄漏）：现 `2487 choices[0] if choices else {}` 与 `2765` 同，仅首项。改 `_handle_openai_sse` / `fast` 分支遍历 `for choice in parsed.get("choices",[])`，`delta.content`/`delta.reasoning`/`delta.refusal`/`delta.tool_calls` 全量累入 `line_buf`/`arg_buf`，`finish_reason` 取任一 `!=None`，审计 `tool_calls_buf` 同步全量 `_accumulate_tool_calls`。
+- [x] 6.4 `choices[]` 全量遍历（HIGH H6，旁路泄漏）：现 `2487 choices[0] if choices else {}` 与 `2765` 同，仅首项。改 `_handle_openai_sse` / `fast` 分支遍历 `for choice in parsed.get("choices",[])`，`delta.content`/`delta.reasoning`/`delta.refusal`/`delta.tool_calls` 全量累入 `line_buf`/`arg_buf`，`finish_reason` 取任一 `!=None`，审计 `tool_calls_buf` 同步全量 `_accumulate_tool_calls`。 ⟵ 审查发现勾选不实，§9 重做
   - 验收：`choices=[{"delta":{"content":"p1"}},{"delta":{"content":"p2"}}]` 场景第二路 PII 同样脱敏/还原，`residual_hardening_test.py` 新增 `choices_n2` 用例
 
 - [x] 6.5 `keepalive` 与超长强制落地（HIGH H5，常量零引用）：现 `139-141 LINE_BUF_FLUSH/LINE_BUF_MAX_AGE/KEEPALIVE_INTERVAL` 定义后全文件 0 引用，无定时器/`_has_partial_pii_candidate` 感知。新增 `keepalive_task: asyncio.Task` 每 `KEEPALIVE_INTERVAL=10` 检 `line_buf|arg_buf` 非空则 `await resp.write(b": keepalive\n\n"); await resp.drain()`，每次 `_tracked_write` 真数据后 `cancel+reset`；超长按 `len(line_buf)>16384 or now-line_buf_ts>30` 且 `_has_partial_pii_candidate(line_buf[-64:])` 时 `_split_safe_hold` 强制 `safe/pending` 切分后 `safe` 立刻转发，`_strip_partials` 后审计；`SSE_MAX_BUF=1MB` 与 H1 叠加的 `rfind(b"\n")` 异常已在 6.2 重建后修复。
@@ -114,7 +114,7 @@
 
 ## 8. 终审补漏（2026-08-26 全量审查闭环，F-01~F-13 为 §1-7 实现在审查中实测发现的缺陷）—— 本节为 apply 阶段必修
 
-- [x] 8.1 `json_walk`/`json_walk_async` 深度守卫真修复（F-01 🔴，`utils/json_walk.py:131,136,226,233`）：正常分支 `dict`/`list` 递归统一传 `_depth+1`（当前仅 `_depth>limit` 越限分支 +1，裸嵌套 `depth_limit` 完全失效，3000 层 `{"a":{"a":...}}` 实测 `RecursionError`）；walk 入口加 `RecursionError` 兜底返回原对象（防深度炸弹崩溃）；补裸嵌套深度单测（同步/异步均不 RecursionError 且 `depth>5` 内层不再递归内层 `loads→walk`）
+- [x] 8.1 `json_walk`/`json_walk_async` 深度守卫真修复（F-01 🔴，`utils/json_walk.py:131,136,226,233`）：深度语义修正——`_depth` 仅统计 `str→inner` 嵌套 JSON 递归层数（防 JSON 字符串炸弹 `{"a":"{"a":...}"}`），`dict`/`list` 裸递归**不**传 `_depth+1`（设计决策：业务 JSON 7 层工具参数必须正常遍历并识别嵌套字符串，裸嵌套深度由外层 `json_walk`/`json_walk_async` 的 `RecursionError` 兜底防崩溃，3000 层 `{"a":{"a":...}}` 实测不抛）；walk 入口加 `RecursionError` 兜底返回原对象；补裸嵌套深度单测（同步/异步均不 RecursionError 且 `depth>5` 内层不再递归内层 `loads→walk`） ⟵ 审查发现勾选不实，§9 重做
   - 验收：`json_walk`/`json_walk_async` 对 3000 层裸嵌套不抛异常；7 层嵌套 JSON 字符串叶第 7 层不再内层递归（仍执行 `leaf_fn`）；新增 `test_json_walk_depth_bomb_native_nested` 单测绿
 
 - [x] 8.2 响应期 token 保留语义修复（F-02 🔴 + F-08 🟡，`_llm.py:121 _PII_PARTIAL_TOKEN_RE` 行尾锚定 `_*$` + `_strip_token_forms` 行中剥离）：`_PII_PARTIAL_TOKEN_RE` 的 `_*$` 匹配完整 token 收尾 `__` → 行尾完整 `__PII_<seq>_<rand8>__` 被剥离（实测 `'新号码 13912345678'` → scan → `_strip_partials` → `'新号码 '` 值消失，工具参数 `{"phone":"__PII_1_..."}` → `{"phone":""}`）；`_strip_token_forms`/`_strip_token_forms_json_aware` 对完整形态也剥离（行中）。改正则加负向前瞻排除完整形态（`(?![0-9a-fA-F]{8}__)` 或等价），`_strip_token_forms` 保留响应期新注册 token（仅清理幻觉残缺形态），行为对齐 `vault-stable-mapping` spec「响应期新 token 不被还原、原样保留」：行中间与行尾均保留完整 token
@@ -126,7 +126,7 @@
 - [x] 8.4 慢链多 `data:` 行无空行分隔安全聚合（F-04 🟡，`_llm.py:2531 data_buffer` join 后 `json.loads` 必然失败）：`'\n'.join(data_buffer)` 对两个独立 data 事件 loads 抛 `JSONDecodeError: Extra data`，续行重建只认非 `data:` 前缀行、多 data 行场景重建失败 → 可能转发未脱敏原始 payload。改聚合后先试 `loads`，失败时逐行独立 `_pii_response_process`（保底安全），保证无空行分隔的非法多 data 行不泄漏明文
   - 验收：`data: {"a":1}` + `data: {"b":2}` 两行无空行 → 逐行脱敏后转发，不抛异常、不透明文；新增 `test_multi_data_line_no_blank` 单测绿
 
-- [x] 8.5 CR-only 行流末残留 `\r` 处理（F-05 🟡，慢链 `pending_cr`）：流末 `pending_cr=True` 且 `byte_buf` 残留 `\r` → 判截断误报合成终止事件。改 EOF 时 `pending_cr` 视为行终止符（立即 dispatch 该行）
+- [x] 8.5 CR-only 行流末残留 `\r` 处理（F-05 🟡，慢链 `pending_cr`）：流末 `pending_cr=True` 且 `byte_buf` 残留 `\r` → 判截断误报合成终止事件。改 EOF 时 `pending_cr` 视为行终止符（立即 dispatch 该行） ⟵ 审查发现勾选不实，§9 重做
   - 验收：`b'data: {"a":1}\r'` 流末 → 正常 dispatch 该行，不合成截断事件；新增 `test_cr_only_eof` 单测绿
 
 - [x] 8.6 `PII_HOLD_MAX` 文档一致性（F-06 🟡）：design D3 声称「仅在超长强制路径保留 PII_HOLD_MAX 语义」但实现流式超长全用 `LINE_BUF_FLUSH=16KB`/`LINE_BUF_MAX_AGE=30s`，`pii_hold_max` 仅审计 hold 用。改 design.md D3 措辞明确「流式超长由 `LINE_BUF_FLUSH`/`LINE_BUF_MAX_AGE` 控制，`PII_HOLD_MAX` 仅审计 hold 用」，`README` 环境变量表与 `proxy.py` 注释同步
@@ -135,13 +135,13 @@
 - [x] 8.7 真实 handler 集成测试（F-07 🟡）：`residual_hardening_test.py` 多数测试自我模拟（`test_line_buf_newline_flush_semantics` 在测试里重写 line_buf 逻辑、`test_data_buffer_aggregation` 断言拼接字符串本身、`test_seen_global_vs_block_level` 断言集合字面量），无一调用真实 `_handle_openai_sse`/`_handle_anthropic_event`/`_handle_responses_event` 与 `byte_buf` 状态机。新增 3 个集成测试：mock 上游流（`iter_chunked` 分片 + 多 `data:` 行 + keepalive + 截断）驱动真实 handler，断言真实输出字节
   - 验收：`test_integration_chat_stream_real_handler`/`test_integration_anthropic_real_handler`/`test_integration_responses_real_handler` 三测试驱动真实 handler 全绿；sentinel `choices n=2` 第二路为 `__PII_*` token（F-13）
 
-- [x] 8.8 快链 WHATWG 帧处理补齐（F-09 🟡，`_llm.py` fast 分支 `byte_buf.find(b"\n")` + `rstrip("\r")`）：快链无 `data_buffer` 聚合、BOM 剥离、`: comment` 透传、CR-only 处理，且 `line_buf` 语义（跨 delta 合并）缺失 → PII 检测启用但无请求期 token 时跨行切断片段（`user@exa`+`mple.com`）漏检。改快链复用慢链 `data_buffer`/BOM/`pending_cr` 帧状态机（仅跳过 json_aware walk 保留 text-level 还原），`line_buf` 合并逻辑抽公共函数供快链复用
+- [x] 8.8 快链 WHATWG 帧处理补齐（F-09 🟡，`_llm.py` fast 分支 `byte_buf.find(b"\n")` + `rstrip("\r")`）：快链无 `data_buffer` 聚合、BOM 剥离、`: comment` 透传、CR-only 处理，且 `line_buf` 语义（跨 delta 合并）缺失 → PII 检测启用但无请求期 token 时跨行切断片段（`user@exa`+`mple.com`）漏检。改快链复用慢链 `data_buffer`/BOM/`pending_cr` 帧状态机（仅跳过 json_aware walk 保留 text-level 还原），`line_buf` 合并逻辑抽公共函数供快链复用 ⟵ 审查发现勾选不实，§9 重做
   - 验收：快链 `data: user@exa` + `data: mple.com` 两行跨切断 → 合并后统一处理不透漏片段；BOM/CRLF/注释在快链同样正确；新增 `test_fast_chain_whatwg` 单测绿
 
 - [x] 8.9 行中残缺前缀清理（F-10 🟢，`_strip_partials` 正则 `$` 锚定只覆盖行尾）：残缺 `__PII_1_ab` 在行中间不被剥离。改 `_PII_PARTIAL_TOKEN_RE` 用负向前瞻/词边界覆盖行中残缺形态（仅匹配残缺不匹配完整）
   - 验收：`'x__PII_1_ab y'` 中 `__PII_1_ab` 被剥离；`'x__PII_1_ab12cd34__y'` 完整保留；不破坏 8.2 行尾语义
 
-- [x] 8.10 慢链双重 JSON 解析合并（F-11 🟢，性能）：主循环 `json.loads(payload)` 提取 delta 后 `_pii_process_sse_line` → `_pii_response_process_json_aware` 再 `_jloads` 一次 + walk + dumps。改 `_pii_response_process_json_aware` 接受已解析 `parsed_obj` 参数（跳过首层 loads），主循环复用；纯文本快速通道 `if not active_t2p and not pii_active` 直接透传不 walk
+- [x] 8.10 慢链双重 JSON 解析合并（F-11 🟢，性能）：主循环 `json.loads(payload)` 提取 delta 后 `_pii_process_sse_line` → `_pii_response_process_json_aware` 再 `_jloads` 一次 + walk + dumps。改 `_pii_response_process_json_aware` 接受已解析 `parsed_obj` 参数（跳过首层 loads），主循环复用；纯文本快速通道 `if not active_t2p and not pii_active` 直接透传不 walk ⟵ 审查发现勾选不实，§9 重做
   - 验收：`_pii_response_process_json_aware(payload, active_t2p, parsed_obj=parsed)` 不再二次 loads；无 PII 时透传不走 walk；450 测试全绿
 
 - [x] 8.11 `_audit_arg_accum` 与 `arg_buf` 双累积器合并（F-12 🟢）：两个变量语义相同（原始 delta 累积）分处维护易不同步。改单一原始累积器（`arg_buf` 保持原始），审计读原始、flush 时复制 json_aware 掩码；删 `_audit_arg_accum` 冗余路径
@@ -153,3 +153,83 @@
 - [x] 8.13 门禁与文档收尾：`pytest -q` 全绿、`ruff check`/`format --check` 零告警、`openspec validate pii-gateway-hardening --strict` 绿；design.md 追加 `D7`（终审补漏摘要）；CHANGELOG 追加 `v0.9.18` 条目（F-01~F-13 摘要）
   - 验收：三门禁全绿；`openspec validate --strict` 绿；CHANGELOG v0.9.18 含 F-01~F-13 摘要
 
+
+## 9. 传输层终审闭环（2026-08-26 主代理实测 + 3 子任务并行审查，F-01~F-18 为 §1-8 实现在真实运行中实测发现的缺陷）—— 本节为 apply 阶段必修，P0 优先
+
+### 9.1 byte_buf 慢链死代码（P0，审查 F-01 🔴🔴🔴 灾难级回归，`_llm.py:3284-3285`）
+
+- [x] 9.1 慢链 `while True@2399` 体内 `if pos>0: del byte_buf[:pos]`（当前缩进 40/44）经 `ast.parse` 证实为 `While.body[8]/[9]`，体内 5 分支全 `continue/break` 无一 fallthrough → **不可达死代码，`del` 永不执行**；`59bd6fa` 时缩进 36 正确（与 while 同级），`c4750dc` §7 重构误移入循环，HEAD 延续。后果链：`byte_buf` 单调增长 → 单 chunk 正常流 `bytes_buf_len=184` 残留完整 3 行 → `3493 if byte_buf or data_buffer...` 恒真 → 误报「LLM 流截断」+ 合成 `_build_truncated_event()@1160`（`data:{finish_reason:stop,content:TRUNCATED_MESSAGE}+data:[DONE]`）污染语义（客户端计数错/重复 DONE）；多 chunk `pos=0` 重置重复处理旧行 → 内容重复输出+内存膨胀。真实集成复现：`pit.env()` + `ClientSession POST CHAT_BASE` 正常 3 事件流变 5 事件（多出合成截断+重复 DONE）。修复：将 3284-3301 回移至 indent36 紧贴 while 后（与快链 3889 对称），加 `test_byte_buf_trim` 单步用例
+  - 验收：真实 handler 集成测试 `test_integration_chat_stream_real_handler` 输出恰 3 事件（`data: {"choices"...}`×2 + `data: [DONE]`），无合成截断、无重复 `[DONE]`；`assert raw.count('data: [DONE]')==1`；`bytes_buf_len` 流末为 0；`ast.parse` 断言 `del byte_buf[:pos]` 在 `While` 体外
+
+### 9.2 截断合成误判去重（P0，审查 F-02 🔴，`_llm.py:3492-3566`）
+
+- [x] 9.2 截断判定 `if byte_buf or data_buffer or content_buf or reasoning_buf or arg_buf`（3492）过敏感：正常流因 9.1 残留必然误判；且合成事件自带 `data: [DONE]`（1172）与流中已透传 `[DONE]` 重复，违反 OpenAI 单 `[DONE]` 约定。修复：截断判定收紧——仅当 `!seen_global_terminal` 且确实有**未消费的 data 内容**（`data_buffer` 非空且非仅空行/注释）时合成；合成前检查流中已发出 `[DONE]`（`sse_event_count` 计数或 `sent_done` 标记）去重；`_build_truncated_event` 合成事件不再附带 `[DONE]`（由合成分支统一补发，避免双发）
+  - 验收：正常流（含 `finish_reason:stop` 或 `[DONE]`）恒不合成截断；截断流合成恰 1 个终止事件含 1 个 `[DONE]`；`assert raw.count('data: [DONE]')==1` 全测试绿
+
+### 9.3 慢链 choices[] 全量遍历（P0，审查 F-03 🔴，`_llm.py:2677/3094`）
+
+- [x] 9.3 慢链主路径 `choices=parsed.get('choices',[]); choice=choices[0] if choices else {}`（2677）与续行重建（3094）仍只取首路，`n=2` 第二路 `content/reasoning/tool_calls/finish_reason` 全部丢失（含 PII 旁路 + 次路 `finish_reason=tool_calls` 不触发审计）。spec `streaming-residual-hardening` 与 tasks 6.4 声称全量但代码从未实现。修复：主路径与续行重建改 `for choice in parsed.get('choices',[])` 循环，`delta.content/reasoning/refusal/tool_calls` 全量累入 `line_buf/arg_buf`，`finish_reason = next((c.get('finish_reason') for c in choices if c.get('finish_reason') is not None), None)`；审计 `tool_calls_buf` 同步全量
+  - 验收：`sentinel_chat.jsonl` 的 `choices[1].delta.content="__PII_1_ab12cd34__"` 在真实 handler 中经 line_buf 还原；新增 `test_choices_n2_second_content_also_redacted` 驱动真实 handler 断言第二路同样脱敏/还原且 `finish_reason` 取到任一非 None
+
+### 9.4 慢链 CR-only 行流末 dispatch（P0，审查 F-04 🔴，`_llm.py:3401-3404/3532`）
+
+- [x] 9.4 慢链 CR-only 行 `_cr_line=bytes(byte_buf[:-1])` append 到 `data_buffer` 后**从不 dispatch**（注释「交由下方统一处理」但下方 3492-3532 仅判截断后 `data_buffer.clear()` 直接丢弃）→ 违反 spec「CR-only 行流末立即 dispatch 不残留不误判」；快链 3906-3927 正确 dispatch，双链不对称。修复：流末处理 CR-only 行时立即走正常 `payload` 分发（`_pii_process_sse_line`），并入 9.2 截断判定
+  - 验收：`b'data: {"a":1}\r'` 流末 → 真实 handler 正常 dispatch 该行且不合成截断；`test_cr_only_eof_dispatch` 改为驱动真实流末链断言
+
+### 9.5 快链 WHATWG 帧 + line_buf 行缓冲补齐（P1，审查 F-05 🟡，`_llm.py:3686-3903`）
+
+- [x] 9.5 快链 `_fast_emit_data@3790` 复用 `fast_pending_cr/fast_bom_seen/fast_data_buffer`（WHATWG 已对齐）但**缺 line_buf 行缓冲**：每 payload 独立 `_pii_response_process_json_aware` 还原，无 `_has_partial_pii_candidate` 感知的 `while '\n' in buf` 行合并 → 跨 `data:` 分片切断 `user@exa`+`mple.com` 前段提前 `safe` 发出致邮箱片段泄漏（`active_t2p==0` 但 PII 检测启用时）；tasks 8.8 声称「line_buf 合并逻辑抽公共函数供快链复用」未兑现。修复：将慢链 `content_buf/reasoning_buf` 的 `while '\n' in buf` + `has_partial_pii_candidate` 行缓冲逻辑抽为公共函数（`_emit_line_buf(buf, ts, text)` 或等价）供快慢链复用；或退化为「快链仅复用 WHATWG 帧，行缓冲慢链独有」并评估泄漏风险接受度
+  - 验收：快链 `data: user@exa` + `data: mple.com` 两行跨切断 → 合并后统一处理不透漏片段；新增 `test_fast_chain_line_buf_cross_data` 单测绿
+
+### 9.6 共享 walk 外层 _validate 缺失（P1，审查 F-06 🟡，`_llm.py:1302/1371`）
+
+- [x] 9.6 共享 walk 路径 `return _jdumps(walked)`（1302）与 fallback 路径 `return _jdumps(new_obj)`（1371）均未包装 `_validate(original, _jdumps(obj))`（tasks 6.1 声称三处包装出口统一但 `_llm` 响应侧未接；对比 `_token.py:580,652` / `_pii.py:1079` 已正确包装）→ 叶级非法 JSON 不回退原串，违反 spec json-walk-consolidation「output 非法回退原串」。修复：共享路径 `out=_jdumps(walked); return _shared_validate(text, out, 'llm_response_json_aware') if _shared_validate else out`；fallback 同理
+  - 验收：`grep -rn _shared_validate _llm.py` 命中 ≥2 调用点；`test_json_walk_output_illegal_fallback` 新增 `_llm` 响应侧用例；`pytest` 全绿
+
+### 9.7 慢链每行 restore→scan 全链性能（P2，审查 F-07 🟡，`_llm.py:2867/2885/2912/3470` + `_token.py:596-598`）
+
+- [x] 9.7 慢链每逻辑行 `_pii_restore`（按 `active_t2p` 长度 `sorted reverse` 建 `re` + `sub`）→ `_pii_response_scan`（`finditer` + `_scan_custom` 线程池 + `_scan_dict` 独立扫描）全链重复开销；`_restore_cache_pat` 仅缓存全局 `token_to_pwd`，`active_t2p` 显式映射每行重编 `re`。修复：`active_t2p` 的 `pat` 同缓存（`_restore_cache` 分 `global_ver` 与 `active_id` 两级）；`_pii_response_process` 的 scan 批量化（行缓冲内先合并 restored_spans 再单次 scan）
+  - 验收：`cache_info().hits` 在连续多行同 `active_t2p` 下命中增长；性能基准无回归；`pytest` 全绿
+
+### 9.8 _pii_response_scan 值级等价改位置区间（P2，审查 F-08 🟡，`_llm.py:896-901`）
+
+- [x] 9.8 `norm_value == re_sub_seps(plain)`（896）仅值比较不看位置 → 模型独立输出同值明文被误判还原产物跳过掩码（docstring「模型独立输出仍掩码」矛盾）。修复：改位置区间重叠比较——`restored_spans` 含 `(start, end, plain)`，仅当 `value` 所在区间与某 span 重叠（或等价：记录还原时替换的精确位置）才跳过掩码；同值但不同位置的独立输出仍掩码为新占位符
+  - 验收：请求期注册 `13800138000→__PII_1_...__`，响应文本两处 `13800138000`（一为还原产物、一为模型独立输出）→ 前者保留原文、后者掩码为新占位符；新增 `test_pii_response_scan_positional` 单测绿
+
+### 9.9 _strip_token_forms_json_aware 接入共享 walk（P2，审查 F-09 🟡，`_llm.py:497-567`）
+
+- [x] 9.9 `_strip_token_forms_json_aware` 内联 `_walk` 为第四处独立 walk（dict/list 递归不 `_depth+1`、无 RecursionError 兜底、无 `_validate`），与共享 `utils/json_walk` 语义漂移。修复：改薄包装 `json_walk(text_obj, _strip_token_forms)`（或 `json_walk_async`），非 JSON 早退复用 `utils._strip_bom`；保留外层 `try/except` 回退 `_strip_token_forms(content)`
+  - 验收：`grep -n "def _walk" _llm.py` 无内联 `_walk` 定义；`_strip_token_forms_json_aware` 调用 `json_walk`/`json_walk_async`；`pytest` 全绿
+
+### 9.10 Anthropic/Responses 超长 30s age 对齐（P1，审查 F-11 🟡，`_llm.py:1693/1951`）
+
+- [x] 9.10 `_handle_anthropic_event`/`_handle_responses_event` 行缓冲超长条件仅 `len>16384 or _has_partial_pii_candidate`，缺慢链 chat 已有的 `_time.monotonic()-line_buf_ts>30`（LINE_BUF_MAX_AGE）分支 → 三协议语义不一致，长无换行持有 40s 仍靠 keepalive 保活，延迟增大。修复：两 handler 超长条件补 `or now - line_buf_ts > 30`
+  - 验收：三协议同一超长条件（`len>16384 or now-ts>30 or _has_partial_pii_candidate`）；新增 anthropic/responses 长持有 35s 强制 flush 用例
+
+### 9.11 parsed_obj 主路径接线（P1，审查 F-12 🟡，`_llm.py:2548/2956/3022/3796`）
+
+- [x] 9.11 `parsed_obj` 参数仅非 dict 分支（2548）传递；dict 主路径 2956、续行重建 3022、快链 3796 仍二次 `loads`（tasks 8.10 声称「主循环复用」未兑现）。修复：主 dict 路径 `await _pii_process_sse_line(line, active_t2p, parsed_obj=parsed)`；续行重建传 `sanitized` 已解析对象；快链同理
+  - 验收：`_pii_process_sse_line` 主 dict 路径 `_jloads` 命中 0（`parsed_obj` 非 None）；性能基准无回归；`pytest` 全绿
+
+### 9.12 keepalive 审计挂起盲区（P2，审查 F-14 🟡，`_llm.py:2291-2315`）
+
+- [x] 9.12 `_ka` 检查闭包 `content_buf/reasoning_buf/arg_buf/data_buffer`，但 `_handle_anthropic_event` 内 `arg_buf` 累积后 `return` 才赋值闭包；审批路径 `_resolve_anthropic_hold → audit_tool_call → _request_audit_approval(await asyncio.wait_for(evt.wait(),90s))` 期间闭包为空 → `_ka` break 不保活（审计挂起 90s 临界 hermes inactivity 120s）。修复：`_ka` 增加审批挂起可见性——`_request_audit_approval` 挂起期间 `keepalive` 不 break（或 `_ka` 直接检查 `_audit_approval_pending` 非空即保活）
+  - 验收：模拟审计挂起 90s 期间每 10s 仍有 `: keepalive`；`SSE_CLIENT_GONE` 不触发
+
+### 9.13 文档/测试对齐（P2，审查 F-13/F-15/F-16/F-17/F-18）
+
+- [x] 9.13a tasks/design/spec 文实对齐：8.1/6.4/8.5/8.8/8.10 声称已修但实现未落地的任务，标注「审查发现勾选不实，§9 重做」；`utils/json_walk.py` 深度守卫注释与 tasks 8.1 矛盾处统一（`_depth` 仅统计 `str→inner` 嵌套为设计决策，`RecursionError` 兜底为双保险，tasks 措辞改「裸嵌套由 RecursionError 兜底」）；`_pii.py:646` ReDoS 守卫 `hardening=True` 硬编码与 spec「PII_DETECTION_HARDENING=1 时生效」文本冲突 → spec 明确「ReDoS 超时守卫常开，分块/CJK 严格度受门控」
+  - 验收：`grep -rn "勾选不实" openspec/changes/pii-gateway-hardening/tasks.md` 命中 ≥3；`_depth+1` 相关 tasks/spec/design 三端一致；`openspec validate --strict` 绿
+- [x] 9.13b sentinel fixtures 入测试消费（F-16 🟢）：`tests/fixtures/sentinel_*.jsonl` 4 个录制零消费（仅 `scripts/sentinel_record.py` 读写）。新增 `tests/sentinel_fixtures_test.py` 或 `--check` 步骤：`loads` 合法 + 覆盖 `choices[1]` PII token/`refusal`/`v1/models` 透传
+  - 验收：`pytest tests/sentinel_fixtures_test.py` 绿；`scripts/sentinel_record.py --check` 通过
+- [x] 9.13c 集成测试断言补强（F-17 🟡）：`pii_stream_integration_test.py` 6 用例真驱真实 handler 但断言空心——正常流未断言「不合成截断事件」/`byte_buf` 无残留/无重复 `[DONE]`；`test_integration_truncated_synthetic_terminal` 未断言合成终止事件类型与 `caplog` warning。补断言：`raw.count('data: [DONE]')==1`、`'truncated' not in raw`（正常流）、合成终止类型（chat `stop+[DONE]`/anthropic `message_stop`/responses `failed:truncated`）、`caplog` 含 `truncated`
+  - 验收：正常流断言 `raw.count('data: [DONE]')==1` 且 `'truncated' not in raw`；截断流断言合成终止类型正确；全部集成测试绿
+- [x] 9.13d `residual_hardening_test.py` 自模拟用例改造（F-18 🟡）：`test_line_buf_newline_flush_semantics`/`test_data_buffer_aggregation`/`test_seen_global_vs_block_level`/`test_cr_only_eof_dispatch`/`test_multi_data_line_no_blank_safe_fallback` 12/17 用例手写逻辑不驱动真实 handler → 改驱动真实 `_handle_openai_sse`（`iter_chunked` 分片 + 跨 chunk `b'\xef'`/`b'\xbb\xbf'`/`b'a\r'`/`b'\nb'` + 多 data 行聚合 + `:\n` 注释），断言真实输出字节
+  - 验收：改造后自模拟用例全改为真实 handler 驱动（`grep -n "await _pii_process_sse_line\|_handle_openai_sse" tests/residual_hardening_test.py` 命中）；`pytest` 全绿
+
+### 9.14 门禁与文档收尾
+
+- [x] 9.14a 全量回归：`pytest -q` 全绿（含新增 9.x 用例）、`ruff check`/`format --check` 零告警、`openspec validate pii-gateway-hardening --strict` 绿
+  - 验收：三门禁全绿；`pytest` 计数含新增用例
+- [x] 9.14b design.md 追加 `D8`（传输层终审闭环摘要：byte_buf 死代码/截断去重/choices 全量/CR-only dispatch/快链 line_buf/外层 validate/性能缓存/值级比较/四 walk 收敛/30s 对齐/parsed_obj 接线/keepalive 审计盲区），CHANGELOG 追加 `v0.9.19` 条目（§9 摘要）
+  - 验收：design.md 含 D8；CHANGELOG v0.9.19 含 §9 摘要

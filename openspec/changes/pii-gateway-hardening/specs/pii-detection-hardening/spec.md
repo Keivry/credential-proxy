@@ -22,7 +22,7 @@
 
 ### Requirement: ReDoS 线程超时守卫与输入上限（当 `PII_DETECTION_HARDENING=1` 时生效）
 
-系统 SHALL 对可配置自定义正则的每条规则用独立 `ThreadPoolExecutor(max_workers=2, thread_name_prefix='pii-re')`（与审计 `run_in_executor(None)` 不同池）+ `asyncio.timeout(0.1)` 单规则预算守卫，超时/异常跳过该规则并记审计告警，连续超时 3 次临时停用，且单次扫描输入限 `PII_SCAN_INPUT_LIMIT=1M` 分块。
+系统 SHALL 对可配置自定义正则的每条规则用独立 `ThreadPoolExecutor(max_workers=2, thread_name_prefix='pii-re')`（与审计 `run_in_executor(None)` 不同池）+ `asyncio.timeout(0.1)` 单规则预算守卫，超时/异常跳过该规则并记审计告警，连续超时 3 次临时停用，且单次扫描输入限 `PII_SCAN_INPUT_LIMIT=1M` 分块。**ReDoS 超时守卫在实现中为常开（`_scan_custom` 以 `hardening or timeout` 语义保留），`PII_DETECTION_HARDENING` 仅门控分块/CJK 严格度等增量语义；spec 此节「当 `PII_DETECTION_HARDENING=1` 时生效」仅指增量门控，ReDoS 防护本身常开（design D5 已声明）。**
 
 #### Scenario: 恶意正则不卡死
 - **WHEN** 配置 `(a+)+$` 且输入 `a`*64

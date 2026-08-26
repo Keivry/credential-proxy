@@ -78,6 +78,22 @@
 - **WHEN** 流首 `0xEF 0xBB 0xBF` 被分片为 `EF`|`BB BF` 两 chunk
 - **THEN** 累积 ≥3 字节后仍单次剥离，不因分片残留 `EF` 导致首行解析失败
 
+#### Scenario: 慢链流末缓冲无残留
+- **WHEN** 上游正常结束（`finish_reason:stop` 或 `[DONE]`）且 `byte_buf` 已消费的行在流末被正确清理
+- **THEN** 流末 `byte_buf` 长度恰为 0，不残留已消费行（`del byte_buf[:pos]` 在 `while` 循环外可达），不误报截断合成
+
+#### Scenario: 截断合成不重复 DONE
+- **WHEN** 上游流被截断且合成终止事件，但流中已透传 `data: [DONE]`
+- **THEN** 合成事件不再附带第二个 `[DONE]`，客户端收到恰 1 个 `[DONE]`（`raw.count('data: [DONE]')==1`）
+
+#### Scenario: 慢链 CR-only 行流末正常 dispatch
+- **WHEN** 慢链上游以 `data: {"a":1}\r`（CR-only 行）直接断流且 `pending_cr=True`
+- **THEN** 该行立即走正常 `payload` 分发（经 `_pii_process_sse_line`），不残留、不误判截断合成
+
+#### Scenario: 快链跨 data 行合并不透漏片段
+- **WHEN** 快链（PII 检测启用但无请求期 token）上游 `data: user@exa` + `data: mple.com` 两行跨切断
+- **THEN** 快链以 `line_buf` 合并语义统一处理，不透漏邮箱片段（tasks 8.8 声称的公共行缓冲在快链真实生效）
+
 ### Requirement: 工具参数攒整段与 JSON-aware（arg_buf）
 
 系统 SHALL 对 `tool_calls[].function.arguments` / `function_call.arguments`（deprecated） / Anthropic `input_json_delta.partial_json`（`signature_delta` 不含文本不进 `arg_buf` 仅透传） / Responses `function_call_arguments.delta` / `mcp_call_arguments.delta` / `custom_tool_call_input.delta` / `code_interpreter_call_code.delta` / `shell_call_command.delta` 等 stringified JSON/参数做 `arg_buf += delta` 攒整段（`audio.delta` 为音频字节不进 `arg_buf`/`line_buf`，`audio.transcript.delta` 文本进 `line_buf`；`file_search/web_search/image_generation/computer_call` 等 `succeeded/searching/in_progress` 中间态不进缓冲仅透传），仅在 `chat: finish_reason in (tool_calls, function_call, stop, length, content_filter) 或 [DONE]` / Anthropic `content_block_stop` / Responses `response.output_item.done` / `response.content_part.done` / `response.output_text.done` / `response.function_call_arguments.done` / `response.mcp_call_arguments.done` / `response.custom_tool_call_input.done` / `response.code_interpreter_call_code.done` / `response.mcp_call.done` / 通用 `item_done` 完成时才 `json_aware walk` + `audit hold` 后一次性 flush；攒段期间不按 `\n` 切分。
