@@ -140,7 +140,11 @@ def test_fuzzy_default_exact(monkeypatch):
 async def test_fuzzy_enabled_case_insensitive(monkeypatch):
     monkeypatch.setenv('PII_FUZZY_RESTORE', '1')
     t = GlobalPiiTokens()
-    tok = await t.register('13812345678')
+    # 确定性 token（rand8 含小写字母，upper 后必变）——不依赖 register 随机 rand8
+    # （register 可能生成全数字 rand8 如 60670288，upper()==tok，精确模式也会还原，导致断言失效）
+    tok = '__PII_1_ab12cd34__'
+    t.pii_t2p[tok] = '13812345678'
+    t.pii_p2t['13812345678'] = tok
     # 大小写漂移应还原
     assert t.restore(tok.upper()) == '13812345678'
     monkeypatch.setenv('PII_FUZZY_RESTORE', '0')

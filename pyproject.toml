@@ -50,17 +50,13 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"test_*.py" = ["D", "ANN", "S", "E402", "E741"]
-"audit_*.py" = ["D", "ANN", "S", "E402", "E741"]
-"credential_test.py" = ["D", "ANN", "S", "E402", "E741"]
-"llm_test.py" = ["D", "ANN", "S", "E402"]
-"sse_stream_loop_test.py" = ["D", "ANN", "S", "E402"]
-"matrix_test.py" = ["D", "ANN", "S", "E402"]
-"pii_*.py" = ["D", "ANN", "S", "E402"]
+"tests/*.py" = ["D", "ANN", "S", "E402", "E741"]
+"tests/audit_*.py" = ["D", "ANN", "S", "E402", "E741"]
+"tests/llm_test.py" = ["D", "ANN", "S", "E402"]
+"tests/sse_stream_loop_test.py" = ["D", "ANN", "S", "E402"]
+"tests/matrix_test.py" = ["D", "ANN", "S", "E402"]
+"tests/residual_hardening_test.py" = ["D", "ANN", "S", "E402", "E741", "RUF059", "F841"]
 "scripts/sentinel_record.py" = ["D", "ANN", "S", "E402", "F841"]
-"vault_stable_test.py" = ["D", "ANN", "S", "E402", "E741"]
-"residual_hardening_test.py" = ["D", "ANN", "S", "E402", "E741", "RUF059", "F841"]
-"detection_hardening_test.py" = ["D", "ANN", "S", "E402", "E741"]
 
 [tool.ruff.format]
 quote-style = "single"

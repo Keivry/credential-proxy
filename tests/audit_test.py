@@ -333,7 +333,13 @@ internal_suffixes:
 
     def test_example_policy_parses(self):
         """examples/audit-policy.yaml 可被 loader 解析。"""
-        path = os.path.join(os.path.dirname(__file__), 'examples', 'audit-policy.yaml')
+        # 测试在 tests/ 下：先找 tests/examples/，回退到项目根 examples/
+        here = os.path.dirname(__file__)
+        candidates = [
+            os.path.join(here, 'examples', 'audit-policy.yaml'),
+            os.path.join(os.path.dirname(here), 'examples', 'audit-policy.yaml'),
+        ]
+        path = next((p for p in candidates if os.path.exists(p)), candidates[-1])
         policy = load_policy_file(path)
         assert 'allow' in policy
         assert 'dangerous' in policy
