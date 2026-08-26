@@ -190,6 +190,8 @@ get revoke --name "check-mail"
 | `PII_FUZZY_RESTORE` | 模糊还原（大小写不敏感，仅 `re.IGNORECASE`，默认精确匹配，不含编辑距离） | `0` |
 | `PII_DETECTION_HARDENING` | 检测侧硬化总闸（`1` 时启用：保留地址精确前缀 `fc:/fd:`/`10.` 等含尾点/冒号+`lower()`+`ip_network` 兜底 / ReDoS `ThreadPool(2)+timeout 0.1s` / 字典 CJK 边界 `(?<![\\w\\u4e00-\\u9fff])` / `@lru_cache(4)`，默认关闭不改变既有行为） | `0` |
 | `PII_VAULT_GAP_AWARE` | 内置稳态下标（非开关，`next_available_index` 空洞跳过，`__PII_<seq>_<rand8>__` 其中 `rand8=secrets.token_hex(4)`） | —（内置） |
+
+> **Vault 稳态与保留前缀**：`__PII_<seq>_<rand8>__`（`seq` 为 `next_available_index` 空洞跳过递增，`rand8=secrets.token_hex(4)` CSPRNG）与 `__VG_CRED_NNNNNN__` 为保留前缀，完整形态原样保留不剥离；`resp_p2t`（响应期注册）不还原为明文（仅请求期 `pii_t2p` 可还原），响应侧命中仅提升 LRU 不泄漏；并发 `register` 全程持 `asyncio.Lock` 原子覆盖 `used set` 快照与 `token` 写入，`asyncio.gather` 100 并发无下标冲突。
 | `AUDIT_MODE` | 输出审计模式：`off`/`block`/`approve` | `off`（默认关闭） |
 | `AUDIT_TIMEOUT` | 审批超时（秒）；**禁止 110-130s**（上游断连竞态窗口） | `90` |
 | `AUDIT_HOLD_MAX_BYTES` | 审批挂起缓冲上限（字节） | `1048576` |

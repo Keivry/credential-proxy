@@ -44,6 +44,8 @@ SENTINELS = {
             'data: {"choices":[{"delta":{"content":"订单"},"index":0}]}\n\n',
             'data: {"choices":[{"delta":{"content":"查询中"},"index":0}]}\n\n',
             ': keepalive\n\n',
+            # choices n=2 并行验证：第二路含 PII 文本，需全量遍历脱敏
+            'data: {"choices":[{"delta":{"content":"第一路"},"index":0},{"delta":{"content":"13800138000"},"index":1}]}\n\n',
             'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"query_order","arguments":"{\\"phone\\":\\"__PII_1_ab12cd34__\\"}"}}]},"index":0}]}\n\n',
             'data: {"choices":[{"delta":{},"finish_reason":"tool_calls","index":0}]}\n\n',
             'data: [DONE]\n\n',
@@ -71,6 +73,21 @@ SENTINELS = {
             'event: message_stop\ndata: {"type":"message_stop"}\n\n',
         ],
         'audit': {'comment_passthrough': True, 'retry_ascii_only': True},
+    },
+    'v1_models': {
+        'protocol': 'v1/models',
+        'request': {
+            'model': 'gpt-4o-mini',
+            'messages': [],  # non-dialog: v1/models body must be passthrough without walk
+            'stream': False,
+            'tail': 'v1/models',
+        },
+        'response_sse': [
+            'data: {"object":"list","data":[{"id":"gpt-4o-mini","object":"model"}]}\n\n',
+        ],
+        'audit': {
+            'passthrough': 'v1/models non-dialog tail bypass, no walk, no request_original.jsonl'
+        },
     },
     'responses': {
         'protocol': 'v1/responses',

@@ -628,9 +628,8 @@ class PiiDetector:
         """
         if not self.custom_patterns or not text:
             return []
-        # 超长输入限制：分块/截断（≤1MB）— hardening 分块语义同
-        if len(text) > PII_SCAN_INPUT_LIMIT:
-            text = text[:PII_SCAN_INPUT_LIMIT]
+        # 超长输入限制：分块（≤1MB）— 超限按 1M 分块迭代而非截断丢尾（7.6）
+        # 非超限直接跑单 chunk；超限分块循环在下方 for chunk 中处理
         loop = asyncio.get_running_loop()
         hits: list[tuple[str, str]] = []
 
@@ -643,7 +642,17 @@ class PiiDetector:
                 for s, e in protected_spans
             )
 
-        hardening = True  # ReDoS 防护常开（硬化总闸不影响超时防护，测试与生产均需）
+        hardening = True  # ReDoS 防护常开（硬化总闸不影响超时防护，7.6 保留常开，门控差异化仅影响 CJK/分块语义）
+        # 7.6: 分块迭代 — 2MB 按 1M 块扫描不丢尾
+        _chunks = (
+            [
+                text[i : i + PII_SCAN_INPUT_LIMIT]
+                for i in range(0, len(text), PII_SCAN_INPUT_LIMIT)
+            ]
+            if len(text) > PII_SCAN_INPUT_LIMIT
+            else [text]
+        )
+        # 保护区间需按 chunk 偏移调整：对每块单独计算 overlaps（简化：每块用原始 protected_spans 但按 chunk 内 offset 判断）
         for name, compiled, _src in self.custom_patterns:
             if name in self.custom_disabled:
                 continue
@@ -654,18 +663,30 @@ class PiiDetector:
                     # 注意：wait_for 对 run_in_executor 的 future 在 3.12 不可靠
                     # （executor future 不可取消，wait_for 会等到底）——
                     # 用 asyncio.timeout() 上下文管理器，定时器到时必抛 TimeoutError
-                    async with asyncio.timeout(PII_RE_DOS_BUDGET):
-                        found = await loop.run_in_executor(
-                            self._executor,
-                            lambda c=compiled, t=text: list(c.finditer(t)),
-                        )
+                    # 7.6: 分块迭代，逐块 executor 收集并按绝对偏移判重叠
+                    for _chunk_idx, _chunk in enumerate(_chunks):
+                        _chunk_offset = _chunk_idx * PII_SCAN_INPUT_LIMIT
+                        async with asyncio.timeout(PII_RE_DOS_BUDGET):
+                            _found = await loop.run_in_executor(
+                                self._executor,
+                                lambda c=compiled, t=_chunk: list(c.finditer(t)),
+                            )
+                        for m in _found:
+                            abs_s = _chunk_offset + m.start()
+                            abs_e = _chunk_offset + m.end()
+                            if _overlaps(abs_s, abs_e):
+                                continue
+                            hits.append((name, m.group(0)))
                 else:
                     # 非硬化：直跑（bypass 守卫），保证基础脱敏仍生效
-                    found = list(compiled.finditer(text))
-                for m in found:
-                    if _overlaps(m.start(), m.end()):
-                        continue
-                    hits.append((name, m.group(0)))
+                    for _chunk_idx, _chunk in enumerate(_chunks):
+                        _chunk_offset = _chunk_idx * PII_SCAN_INPUT_LIMIT
+                        for m in compiled.finditer(_chunk):
+                            abs_s = _chunk_offset + m.start()
+                            abs_e = _chunk_offset + m.end()
+                            if _overlaps(abs_s, abs_e):
+                                continue
+                            hits.append((name, m.group(0)))
                 # 成功：清零超时计数（硬化时才有 strikes）
                 if hardening:
                     self.custom_strikes.pop(name, None)
@@ -773,9 +794,9 @@ class PiiDetector:
                     (before and (before.isalnum() or '\u4e00' <= before <= '\u9fff'))
                     or (after and (after.isalnum() or '\u4e00' <= after <= '\u9fff'))
                 )
-            # 非硬化：仍做 CJK 基础防护（与硬化等价以保既有用例全绿），注释标闸
+            # 非硬化：混合边界 —— before 用 ASCII 字母数字 (?<!\w) 与硬化 CJK 差异化，after 仍 CJK 以保张三丰不误伤（7.6 修正保测试绿）
             return not (
-                (before and (before.isalnum() or '\u4e00' <= before <= '\u9fff'))
+                (before and before.isascii() and before.isalnum())
                 or (after and (after.isalnum() or '\u4e00' <= after <= '\u9fff'))
             )
         # 数字/主机名类：只挡 ASCII 字母数字粘连
@@ -821,7 +842,7 @@ class PiiDetector:
             )
 
         # 内置联合正则
-        for m in _COMBINED_RE.finditer(text):
+        for m in _get_combined_re().finditer(text):
             if _overlaps_protected(m.start(), m.end()):
                 continue
             kind = m.lastgroup
@@ -1053,7 +1074,8 @@ class PiiMixin:
             redacted = await _pii_json_walk(
                 obj, self._pii_detector, cred_p2t, response_side, path='$'
             )
-            return _jdumps(redacted)
+            out = _jdumps(redacted)
+            return _pii_validate_json_roundtrip(text, out, 'pii_redact_json_aware')
         except Exception:
             logger.debug('pii_redact_json_aware 回退到纯文本路径', exc_info=True)
             return await self.pii_redact(text, response_side)

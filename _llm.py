@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re as _re
+import time as _time
 import uuid as _uuid
 
 from aiohttp import ClientSession, ClientTimeout, web
@@ -144,6 +145,36 @@ KEEPALIVE_INTERVAL = 10  # 保活间隔 (10s, `: keepalive\\n\\n` comment)
 _PARTIAL_TOKEN_RE = _re.compile(r'__VG_C(?:R(?:E(?:D(?:_?\d*)?)?)?)?_*$')
 # 完整 token 形态（行尾）：__VG_CRED_NNNNNN__
 _FULL_TOKEN_RE = _re.compile(r'__VG_CRED_\d+__$')
+# ── 6.5 超长强制候选感知：检测行尾是否可能为 PII 前缀（IP/邮箱/fe80::）──
+_HAS_PARTIAL_IP_RE = _re.compile(r'\b\d{1,3}(?:\.\d{1,3}){0,2}$')
+_HAS_PARTIAL_EMAIL_RE = _re.compile(r'[A-Za-z0-9._%+-]+@$')
+_HAS_PARTIAL_IPV6_RE = _re.compile(r'fe80::[0-9a-f:]*$', _re.IGNORECASE)
+
+
+def _has_partial_pii_candidate(text: str) -> bool:
+    """检测文本尾部是否存在 PII 前缀候选（6.5 超长强制感知）。
+    - IP 前缀：\\b\\d{1,3}\\.(?:\\d{1,3}\\.){0,2}$  (如 "192.168." / "10.")
+    - 邮箱前缀：[A-Za-z0-9._%+-]+@$  (如 "user@")
+    - IPv6 前缀：fe80::[0-9a-f:]*$  (如 "fe80::a")
+    仅检查尾部 64 字符窗口（调用方传入已截断），命中即视为候选。
+    """
+    if not text:
+        return False
+    tail = text[-64:] if len(text) > 64 else text
+    if _HAS_PARTIAL_IP_RE.search(tail):
+        return True
+    if _HAS_PARTIAL_EMAIL_RE.search(tail):
+        return True
+    if _HAS_PARTIAL_IPV6_RE.search(tail):
+        return True
+    if '__' in tail:
+        last = tail.rfind('__')
+        suffix = tail[last:]
+        if suffix.startswith('__VG_') or suffix.startswith('__PII_'):
+            return True
+    return False
+
+
 # Debug 开关：设置环境变量 CREDENTIAL_PROXY_DEBUG_DIR 开启
 _DEBUG_DIR = os.environ.get('CREDENTIAL_PROXY_DEBUG_DIR', '')
 
@@ -1534,6 +1565,22 @@ class LlmMixin(AuditMixin):
             # 后续分片（token 不会跨两个 tool_use block），清空防伪还原
             # （content/reasoning 保留 pending，由流末统一清理）
             # 审计触发点：读取掩码前原始完整参数累积器（design D3 审计对抗性）
+            # 6.6 攒整段刷新：单次 json_aware walk
+            if arg_buf:
+                try:
+                    restored_arg = await self._pii_response_process_json_aware(
+                        arg_buf, active_t2p
+                    )
+                    restored_arg = _strip_partials(restored_arg)
+                    if restored_arg:
+                        await write(
+                            _mk_anthropic_delta_event(
+                                parsed, restored_arg, 'partial_json'
+                            ).encode('utf-8')
+                        )
+                except Exception:
+                    pass
+                arg_buf = ''
             if getattr(self, '_audit_arg_accum', '') and self.audit_enabled():
                 name = self._last_anthropic_tool_name or ''
                 verdict = await self.audit_tool_call(
@@ -1574,20 +1621,13 @@ class LlmMixin(AuditMixin):
         if kind in ('text', 'thinking', 'function_args'):
             if delta_text is None:  # pragma: no cover — 识别器保证 delta 事件携带 str
                 return content_buf, reasoning_buf, arg_buf
-            field = _ANTHROPIC_DELTA_FIELDS[kind][0]
-            if kind == 'text':
-                content_buf += delta_text
-            elif kind == 'thinking':
-                reasoning_buf += delta_text
-            else:
+            # 6.3/6.6: 文本 delta 统一 CRLF 归一，工具参数攒整段不即时 json_aware
+            if kind == 'function_args':
+                # 6.6 攒整段：仅累积，不每 delta 即 json_aware/切片（防跨行泄漏）
                 arg_buf += delta_text
-                # 审计参数累积（掩码前原始完整参数，design D3）
                 self._audit_arg_accum = (
                     getattr(self, '_audit_arg_accum', '') + delta_text
                 )
-                # ── 预检暂停（design D4：暂停先于判定）──
-                # 同步廉价前缀匹配，命中即暂停 flush——不 await 异步判定
-                # （await 期间后续 delta 会继续走 flush 循环流出）
                 if (
                     self.audit_enabled()
                     and not getattr(self, '_audit_hold_active', False)
@@ -1599,34 +1639,51 @@ class LlmMixin(AuditMixin):
                     self._audit_hold_active = True
                     self._audit_hold_buf = []
                     self._audit_hold_bytes = 0
-                    # 本次 delta 行缓冲（不 flush）
                     self._audit_hold_buf.append(line)
                     self._audit_hold_bytes = len(line.encode('utf-8'))
                     return content_buf, reasoning_buf, arg_buf
-            buf = (
-                content_buf
-                if kind == 'text'
-                else (reasoning_buf if kind == 'thinking' else arg_buf)
-            )
-            # arg_buf 为 partial_json（stringified JSON），需 JSON-aware 处理特殊字符；
-            # content/reasoning 为纯文本，json-aware 会自动回退 plain，等价
-            if kind == 'function_args':
-                restored = await self._pii_response_process_json_aware(buf, active_t2p)
+                # 持有不发，仅在 block_stop 时单次 json_aware
+                return content_buf, reasoning_buf, arg_buf
+            # text/thinking 走 line_buf 行缓冲（6.3），而非 _split_safe_hold 每 delta 切片
+            field = _ANTHROPIC_DELTA_FIELDS[kind][0]
+            norm = delta_text.replace('\r\n', '\n').replace('\r', '\n')
+            if kind == 'text':
+                content_buf += norm
+                buf = content_buf
             else:
+                reasoning_buf += norm
+                buf = reasoning_buf
+            # 行缓冲：有 \n 立即刷，无则持有（除非超长）
+            out_lines = []
+            while '\n' in buf:
+                line_seg, buf = buf.split('\n', 1)
+                line_seg += '\n'
+                restored = await self._pii_response_process(line_seg, active_t2p)
+                safe = _strip_partials(restored)
+                if safe:
+                    out_lines.append(safe)
+            # 超长强制（6.5）——即使无 \n 也按候选感知切片
+            if buf and (
+                len(buf) > LINE_BUF_FLUSH or _has_partial_pii_candidate(buf[-64:])
+            ):
+                # 简化：超长时接 _split_safe_hold 才不残留 token 前缀
                 restored = await self._pii_response_process(buf, active_t2p)
-            safe, pending = _split_safe_hold(
-                restored, active_t2p, self._pii_scope_or_none()
-            )
-            if safe:
+                safe, pending = _split_safe_hold(
+                    restored, active_t2p, self._pii_scope_or_none()
+                )
+                if safe:
+                    safe = _strip_partials(safe)
+                    out_lines.append(safe)
+                buf = pending
+            if out_lines:
+                combined = ''.join(out_lines)
                 await write(
-                    _mk_anthropic_delta_event(parsed, safe, field).encode('utf-8')
+                    _mk_anthropic_delta_event(parsed, combined, field).encode('utf-8')
                 )
             if kind == 'text':
-                content_buf = pending
-            elif kind == 'thinking':
-                reasoning_buf = pending
+                content_buf = buf
             else:
-                arg_buf = pending
+                reasoning_buf = buf
             return content_buf, reasoning_buf, arg_buf
 
         # 其他 content_block_delta：flush 各缓冲 safe 部分（pending 保留）→ 原样透传
@@ -1793,6 +1850,22 @@ class LlmMixin(AuditMixin):
             # item 结束：arg_buf 中未完成的 token 前缀不可能再有后续分片
             # （function call 参数不会跨 item 续写），清空防跨 item 伪还原
             # （content/reasoning 保留 pending，由流末统一清理）
+            # 6.6 攒整段刷新
+            if arg_buf:
+                try:
+                    restored_arg = await self._pii_response_process_json_aware(
+                        arg_buf, active_t2p
+                    )
+                    restored_arg = _strip_partials(restored_arg)
+                    if restored_arg:
+                        await write(
+                            _mk_responses_sse_event(parsed, restored_arg).encode(
+                                'utf-8'
+                            )
+                        )
+                except Exception:
+                    pass
+                arg_buf = ''
             # 审计触发点：读取掩码前原始完整参数累积器（design D3 审计对抗性）
             if getattr(self, '_audit_arg_accum', '') and self.audit_enabled():
                 name = self._last_responses_tool_name or ''
@@ -1823,17 +1896,12 @@ class LlmMixin(AuditMixin):
         if kind in ('output_text', 'reasoning_text', 'function_call_arguments'):
             if delta_text is None:  # pragma: no cover — 识别器保证 delta 事件携带 str
                 return content_buf, reasoning_buf, arg_buf
-            if kind == 'output_text':
-                content_buf += delta_text
-            elif kind == 'reasoning_text':
-                reasoning_buf += delta_text
-            else:
+            if kind == 'function_call_arguments':
+                # 6.6 攒整段：仅累积，不每 delta 即 json_aware
                 arg_buf += delta_text
-                # 审计参数累积（掩码前原始完整参数，design D3）
                 self._audit_arg_accum = (
                     getattr(self, '_audit_arg_accum', '') + delta_text
                 )
-                # ── 预检暂停（design D4：暂停先于判定）──
                 if (
                     self.audit_enabled()
                     and not getattr(self, '_audit_hold_active', False)
@@ -1845,31 +1913,44 @@ class LlmMixin(AuditMixin):
                     self._audit_hold_active = True
                     self._audit_hold_buf = []
                     self._audit_hold_bytes = 0
-                    # 本次 delta 行缓冲（不 flush）
                     self._audit_hold_buf.append(line)
                     self._audit_hold_bytes = len(line.encode('utf-8'))
                     return content_buf, reasoning_buf, arg_buf
-            buf = (
-                content_buf
-                if kind == 'output_text'
-                else (reasoning_buf if kind == 'reasoning_text' else arg_buf)
-            )
-            # function_call_arguments 的 arg_buf 为 stringified JSON，需 JSON-aware；其他为纯文本回退
-            if kind == 'function_call_arguments':
-                restored = await self._pii_response_process_json_aware(buf, active_t2p)
-            else:
-                restored = await self._pii_response_process(buf, active_t2p)
-            safe, pending = _split_safe_hold(
-                restored, active_t2p, self._pii_scope_or_none()
-            )
-            if safe:
-                await write(_mk_responses_sse_event(parsed, safe).encode('utf-8'))
+                return content_buf, reasoning_buf, arg_buf
+            # output_text / reasoning_text 走 line_buf 行缓冲（6.3）
+            norm = delta_text.replace('\r\n', '\n').replace('\r', '\n')
             if kind == 'output_text':
-                content_buf = pending
-            elif kind == 'reasoning_text':
-                reasoning_buf = pending
+                content_buf += norm
+                buf = content_buf
             else:
-                arg_buf = pending
+                reasoning_buf += norm
+                buf = reasoning_buf
+            out_lines = []
+            while '\n' in buf:
+                line_seg, buf = buf.split('\n', 1)
+                line_seg += '\n'
+                restored = await self._pii_response_process(line_seg, active_t2p)
+                safe = _strip_partials(restored)
+                if safe:
+                    out_lines.append(safe)
+            if buf and (
+                len(buf) > LINE_BUF_FLUSH or _has_partial_pii_candidate(buf[-64:])
+            ):
+                restored = await self._pii_response_process(buf, active_t2p)
+                safe, pending = _split_safe_hold(
+                    restored, active_t2p, self._pii_scope_or_none()
+                )
+                if safe:
+                    safe = _strip_partials(safe)
+                    out_lines.append(safe)
+                buf = pending
+            if out_lines:
+                combined = ''.join(out_lines)
+                await write(_mk_responses_sse_event(parsed, combined).encode('utf-8'))
+            if kind == 'output_text':
+                content_buf = buf
+            else:
+                reasoning_buf = buf
             return content_buf, reasoning_buf, arg_buf
 
         # 其他 response.* 事件：flush 各缓冲 safe 部分（pending 保留）→ 原样透传
@@ -1932,6 +2013,9 @@ class LlmMixin(AuditMixin):
             _cv_last_responses_tok = _last_responses_tool_name_var.set(None)
             _cv_audit_created_ids_tok = _audit_created_ids_var.set([])
             tail = request.match_info['tail']
+            is_dialog_tail = tail.rstrip('/').endswith(
+                ('chat/completions', 'v1/messages', 'v1/responses')
+            )
             target_url = f'{upstream.rstrip("/")}/{tail}'
             if request.query_string:
                 target_url += '?' + request.query_string
@@ -1983,18 +2067,22 @@ class LlmMixin(AuditMixin):
                 # PII 请求侧脱敏（在凭据 redact 前，PII_REDACTION_ENABLED 时）：
                 # 检测 PII → 注册请求级映射 → 替换为 __PII_*__ 占位符
                 # JSON-aware：仅对字符串节点替换，避免纯文本替换破坏 \u 转义（Invalid \escape）
-                if getattr(self, 'pii_enabled', False):
+                # 7.4: 非对话尾（v1/models 等）透传不 walk
+                if is_dialog_tail and getattr(self, 'pii_enabled', False):
                     self._pii_request_scope()
                     if hasattr(self, 'pii_redact_json_aware'):
                         body_text = await self.pii_redact_json_aware(body_text)
                     else:
                         body_text = await self.pii_redact(body_text)
-                if hasattr(self, '_redact_json_aware'):
+                if is_dialog_tail and hasattr(self, '_redact_json_aware'):
                     out_body = self._redact_json_aware(body_text, snapshot_p2t).encode(
                         'utf-8'
                     )
-                else:
+                elif is_dialog_tail and hasattr(self, '_redact'):
                     out_body = self._redact(body_text, snapshot_p2t).encode('utf-8')
+                else:
+                    # 非对话尾：透传原文，不走 walk/脱敏
+                    out_body = body_text.encode('utf-8') if body_text else body
                 # 快速路径：无 token 时不扫描（门控扩展：PII token 同样触发还原路径）
                 pii_scope = self._pii_scope_or_none()
                 has_cred = snapshot_t2p and b'__VG_CRED_' in out_body
@@ -2140,7 +2228,9 @@ class LlmMixin(AuditMixin):
                                 upstream_resp.status,
                             )
 
-                        if active_t2p or self._pii_active() or self.audit_enabled():
+                        if is_dialog_tail and (
+                            active_t2p or self._pii_active() or self.audit_enabled()
+                        ):
                             # ── JSON-aware 流式 token 还原（广义 Plan C） ──
                             content_buf = ''  # 累积 delta.content 片段（每事件经 safe/pending 分割重置为小字符串，摊还 O(1)）
                             reasoning_buf = ''  # 累积 delta.reasoning_content 片段
@@ -2157,11 +2247,65 @@ class LlmMixin(AuditMixin):
                             )
                             seen_terminal = False  # 是否已收到终止事件（responses: completed/failed/incomplete, chat: [DONE]）
                             seen_global_terminal = False  # 全局终止，仅全局置位；item_done/block_stop 仅清 arg_buf
+                            # ── 6.2 WHATWG / 6.3 line_buf / 6.5 keepalive 新增变量 ──
+                            data_buffer: list[
+                                str
+                            ] = []  # 同事件多 data: 行聚合（WHATWG）
+                            pending_cr = False  # 上 chunk 末孤立 \r 跨块粘合
+                            bom_seen = False  # 流首 BOM 单次剥离
+                            line_buf_ts = _time.monotonic()  # 6.3/6.5 行缓冲时间戳
+                            reasoning_buf_ts = _time.monotonic()
+                            keepalive_task: asyncio.Task | None = None
+
+                            def _reset_keepalive():
+                                nonlocal keepalive_task, line_buf_ts, reasoning_buf_ts
+                                if keepalive_task is not None:
+                                    try:
+                                        keepalive_task.cancel()
+                                    except Exception:
+                                        pass
+                                    keepalive_task = None
+                                if (
+                                    content_buf
+                                    or reasoning_buf
+                                    or arg_buf
+                                    or data_buffer
+                                ):
+                                    line_buf_ts = _time.monotonic()
+                                    reasoning_buf_ts = _time.monotonic()
+
+                                    async def _ka():
+                                        while True:
+                                            try:
+                                                await asyncio.sleep(KEEPALIVE_INTERVAL)
+                                                if (
+                                                    content_buf
+                                                    or reasoning_buf
+                                                    or arg_buf
+                                                    or data_buffer
+                                                ):
+                                                    try:
+                                                        await resp.write(
+                                                            b': keepalive\n\n'
+                                                        )
+                                                        await resp.drain()
+                                                    except Exception:
+                                                        break
+                                                else:
+                                                    break
+                                            except asyncio.CancelledError:
+                                                break
+
+                                    keepalive_task = asyncio.create_task(_ka())
 
                             async def _tracked_write(data: bytes):
                                 nonlocal bytes_written
                                 await resp.write(data)
                                 bytes_written += len(data)
+                                try:
+                                    _reset_keepalive()
+                                except Exception:
+                                    pass
                                 if _debug_save_eligible:
                                     try:
                                         txt = data.decode('utf-8', errors='replace')
@@ -2220,655 +2364,919 @@ class LlmMixin(AuditMixin):
                                     SSE_CHUNK_SIZE,
                                 ):
                                     byte_buf.extend(chunk)
-                                    pos = 0
-                                    while (
-                                        idx := byte_buf.find(
-                                            b'\n',
-                                            pos,
-                                        )
-                                    ) >= 0:
-                                        line_bytes = byte_buf[pos:idx]
-                                        pos = idx + 1
-                                        line = line_bytes.decode(
-                                            'utf-8',
-                                            errors='replace',
-                                        ).rstrip('\r')
-
-                                        # 非 data 行：还原后透传（防 token 泄漏）
-                                        if not line.startswith('data:'):
-                                            await _tracked_write(
-                                                (
-                                                    await self._pii_process_sse_line(
-                                                        line, active_t2p
-                                                    )
-                                                    + '\n'
-                                                ).encode('utf-8'),
-                                            )
-                                            continue
-
-                                        payload = line[5:]
-                                        payload = payload.removeprefix(' ')
-                                        # 空 data 行不计为有效事件，避免下游 JSONDecodeError (char 0)
-                                        if not payload.strip():
-                                            continue
-
-                                        sse_event_count += 1
-                                        if _debug_save_eligible:
-                                            try:
-                                                await _debug_append_line(
-                                                    req_id,
-                                                    'response_original.jsonl',
-                                                    payload,
-                                                )
-                                            except Exception as exc:
-                                                logger.debug(
-                                                    '保存上游原版日志失败: %s', exc
-                                                )
-
-                                        # [DONE] 标记：先 flush 累积内容
-                                        if payload.strip() == '[DONE]':
-                                            # 流末兜底审计（finish_reason 未触发时）
-                                            if (
-                                                tool_calls_buf
-                                                and not tool_calls_audited
-                                            ):
-                                                tool_calls_audited = True
-                                                injections = (
-                                                    await self._audit_openai_tool_calls(
-                                                        tool_calls_buf,
-                                                        active_t2p,
-                                                    )
-                                                )
-                                                if injections:
-                                                    # deny：丢弃缓冲 + 注入拒绝
-                                                    tool_calls_blocked = True
-                                                    tool_calls_pending_events.clear()
-                                                    for ev in injections:
-                                                        await _tracked_write(
-                                                            ev.encode('utf-8')
-                                                        )
-                                                else:
-                                                    # allow：verdict 后统一放行缓冲事件
-                                                    for ev in tool_calls_pending_events:
-                                                        await _tracked_write(
-                                                            (
-                                                                await self._pii_process_sse_line(
-                                                                    ev, active_t2p
-                                                                )
-                                                                + '\n'
-                                                            ).encode('utf-8')
-                                                        )
-                                                    tool_calls_pending_events.clear()
-                                            if is_responses_stream:
-                                                # 兼容网关可能在 responses 流中发 [DONE]：
-                                                # 用 responses 格式 flush，避免 chat 格式污染
-                                                content_buf = (
-                                                    await self._flush_responses_buf(
-                                                        _tracked_write,
-                                                        'response.output_text.delta',
-                                                        content_buf,
-                                                        active_t2p,
-                                                    )
-                                                )
-                                                reasoning_buf = (
-                                                    await self._flush_responses_buf(
-                                                        _tracked_write,
-                                                        'response.reasoning_text.delta',
-                                                        reasoning_buf,
-                                                        active_t2p,
-                                                    )
-                                                )
-                                                arg_buf = await self._flush_responses_buf(
-                                                    _tracked_write,
-                                                    'response.function_call_arguments.delta',
-                                                    arg_buf,
-                                                    active_t2p,
-                                                )
-                                            elif is_anthropic_stream:
-                                                # 兼容网关可能在 anthropic 流中发 [DONE]：
-                                                # 用 anthropic 格式 flush，避免 chat 格式污染
-                                                _dummy = {
-                                                    'type': 'content_block_delta',
-                                                    'index': 0,
-                                                }
-                                                content_buf = (
-                                                    await self._flush_anthropic_buf(
-                                                        _tracked_write,
-                                                        _dummy,
-                                                        'text',
-                                                        content_buf,
-                                                        active_t2p,
-                                                    )
-                                                )
-                                                reasoning_buf = (
-                                                    await self._flush_anthropic_buf(
-                                                        _tracked_write,
-                                                        _dummy,
-                                                        'thinking',
-                                                        reasoning_buf,
-                                                        active_t2p,
-                                                    )
-                                                )
-                                                arg_buf = (
-                                                    await self._flush_anthropic_buf(
-                                                        _tracked_write,
-                                                        _dummy,
-                                                        'partial_json',
-                                                        arg_buf,
-                                                        active_t2p,
-                                                    )
-                                                )
-                                            else:
-                                                await _flush(
-                                                    c=content_buf,
-                                                    rc=reasoning_buf,
-                                                )
-                                            seen_terminal = True
-                                            seen_global_terminal = True
-                                            await _tracked_write(
-                                                b'data: [DONE]\n',
-                                            )
-                                            continue
-
-                                        # 解析 JSON，提取 delta content
-                                        try:
-                                            parsed = json.loads(payload)
-                                            # 非 dict payload（JSON 数组/标量）→
-                                            # 原样透传，避免下游 .get 抛 AttributeError
-                                            if not isinstance(parsed, dict):
-                                                await _tracked_write(
-                                                    (
-                                                        await self._pii_process_sse_line(
-                                                            line, active_t2p
-                                                        )
-                                                        + '\n'
-                                                    ).encode('utf-8'),
-                                                )
+                                    # ── 6.2 BOM 单次剥离 ──
+                                    if not bom_seen:
+                                        if len(byte_buf) >= 3:
+                                            if byte_buf[:3] == b'\xef\xbb\xbf':
+                                                del byte_buf[:3]
+                                            bom_seen = True
+                                        else:
+                                            if byte_buf.startswith(
+                                                b'\xef'
+                                            ) or byte_buf.startswith(b'\xef\xbb'):
                                                 continue
-
-                                            # 保存原始 SSE payload 到 response.jsonl
-                                            if resp_log_path:
-                                                await _save_response_line(
-                                                    resp_log_path,
-                                                    payload,
-                                                )
-                                            # DEBUG: 已在上游原版落盘，此处补充 conv_id 映射（若首次）
+                                            else:
+                                                bom_seen = True
+                                    if pending_cr:
+                                        if byte_buf.startswith(b'\n'):
+                                            del byte_buf[0]
+                                        pending_cr = False
+                                    pos = 0
+                                    while True:
+                                        idx_n = byte_buf.find(b'\n', pos)
+                                        idx_r = byte_buf.find(b'\r', pos)
+                                        if idx_n == -1 and idx_r == -1:
+                                            break
+                                        if idx_r != -1 and (
+                                            idx_n == -1 or idx_r < idx_n
+                                        ):
                                             if (
-                                                _debug_save_eligible
-                                                and not _debug_saved
+                                                idx_r + 1 < len(byte_buf)
+                                                and byte_buf[idx_r + 1] == 10
                                             ):
-                                                try:
-                                                    _tmp_parsed = json.loads(payload)
-                                                    _tmp_cid = _extract_conv_id(
-                                                        _tmp_parsed
-                                                    )
-                                                    if _tmp_cid:
-                                                        _debug_link_conv_id(
-                                                            req_id, _tmp_cid, out_body
+                                                line_bytes = byte_buf[pos:idx_r]
+                                                pos = idx_r + 2
+                                            else:
+                                                if idx_r == len(byte_buf) - 1:
+                                                    pending_cr = True
+                                                    break
+                                                else:
+                                                    line_bytes = byte_buf[pos:idx_r]
+                                                    pos = idx_r + 1
+                                        else:
+                                            line_bytes = byte_buf[pos:idx_n]
+                                            pos = idx_n + 1
+                                        line = line_bytes.decode(
+                                            'utf-8', errors='replace'
+                                        )
+                                        if line == '':
+                                            if data_buffer:
+                                                payload = '\n'.join(data_buffer)
+                                                data_buffer.clear()
+                                                line = 'data: ' + payload
+                                                # 空 data 行不计为有效事件，避免下游 JSONDecodeError (char 0)
+                                                if not payload.strip():
+                                                    continue
+
+                                                sse_event_count += 1
+                                                if _debug_save_eligible:
+                                                    try:
+                                                        await _debug_append_line(
+                                                            req_id,
+                                                            'response_original.jsonl',
+                                                            payload,
                                                         )
-                                                except Exception:
-                                                    logger.debug(
-                                                        '解析临时 payload 失败',
-                                                        exc_info=True,
-                                                    )
+                                                    except Exception as exc:
+                                                        logger.debug(
+                                                            '保存上游原版日志失败: %s',
+                                                            exc,
+                                                        )
 
-                                            # 首次成功解析 SSE data 时提取 conversation ID 保存原始请求
-                                            if (
-                                                _debug_save_eligible
-                                                and not _debug_saved
-                                            ):
-                                                conv_id = _extract_conv_id(parsed)
-                                                if conv_id:
-                                                    _save_request_body(
-                                                        conv_id, out_body
-                                                    )
-                                                    _debug_link_conv_id(
-                                                        req_id, conv_id, out_body
-                                                    )
-                                                    _debug_saved = True
-                                                    resp_log_path = os.path.join(
-                                                        _DEBUG_DIR,
-                                                        conv_id,
-                                                        'response.jsonl',
-                                                    )
-                                                    await _save_response_line(
-                                                        resp_log_path,
-                                                        payload,
-                                                    )
-
-                                            # ── Responses API 事件（/v1/responses SSE）──
-                                            if _responses_event(parsed) is not None:
-                                                is_responses_stream = True
-                                                if parsed.get('type') in (
-                                                    'response.completed',
-                                                    'response.failed',
-                                                    'response.incomplete',
-                                                ):
+                                                # [DONE] 标记：先 flush 累积内容
+                                                if payload.strip() == '[DONE]':
+                                                    # 流末兜底审计（finish_reason 未触发时）
+                                                    if (
+                                                        tool_calls_buf
+                                                        and not tool_calls_audited
+                                                    ):
+                                                        tool_calls_audited = True
+                                                        injections = await self._audit_openai_tool_calls(
+                                                            tool_calls_buf,
+                                                            active_t2p,
+                                                        )
+                                                        if injections:
+                                                            # deny：丢弃缓冲 + 注入拒绝
+                                                            tool_calls_blocked = True
+                                                            tool_calls_pending_events.clear()
+                                                            for ev in injections:
+                                                                await _tracked_write(
+                                                                    ev.encode('utf-8')
+                                                                )
+                                                        else:
+                                                            # allow：verdict 后统一放行缓冲事件
+                                                            for ev in tool_calls_pending_events:
+                                                                await _tracked_write(
+                                                                    (
+                                                                        await self._pii_process_sse_line(
+                                                                            ev,
+                                                                            active_t2p,
+                                                                        )
+                                                                        + '\n'
+                                                                    ).encode('utf-8')
+                                                                )
+                                                            tool_calls_pending_events.clear()
+                                                    if is_responses_stream:
+                                                        # 兼容网关可能在 responses 流中发 [DONE]：
+                                                        # 用 responses 格式 flush，避免 chat 格式污染
+                                                        content_buf = await self._flush_responses_buf(
+                                                            _tracked_write,
+                                                            'response.output_text.delta',
+                                                            content_buf,
+                                                            active_t2p,
+                                                        )
+                                                        reasoning_buf = await self._flush_responses_buf(
+                                                            _tracked_write,
+                                                            'response.reasoning_text.delta',
+                                                            reasoning_buf,
+                                                            active_t2p,
+                                                        )
+                                                        arg_buf = await self._flush_responses_buf(
+                                                            _tracked_write,
+                                                            'response.function_call_arguments.delta',
+                                                            arg_buf,
+                                                            active_t2p,
+                                                        )
+                                                    elif is_anthropic_stream:
+                                                        # 兼容网关可能在 anthropic 流中发 [DONE]：
+                                                        # 用 anthropic 格式 flush，避免 chat 格式污染
+                                                        _dummy = {
+                                                            'type': 'content_block_delta',
+                                                            'index': 0,
+                                                        }
+                                                        content_buf = await self._flush_anthropic_buf(
+                                                            _tracked_write,
+                                                            _dummy,
+                                                            'text',
+                                                            content_buf,
+                                                            active_t2p,
+                                                        )
+                                                        reasoning_buf = await self._flush_anthropic_buf(
+                                                            _tracked_write,
+                                                            _dummy,
+                                                            'thinking',
+                                                            reasoning_buf,
+                                                            active_t2p,
+                                                        )
+                                                        arg_buf = await self._flush_anthropic_buf(
+                                                            _tracked_write,
+                                                            _dummy,
+                                                            'partial_json',
+                                                            arg_buf,
+                                                            active_t2p,
+                                                        )
+                                                    else:
+                                                        await _flush(
+                                                            c=content_buf,
+                                                            rc=reasoning_buf,
+                                                        )
                                                     seen_terminal = True
                                                     seen_global_terminal = True
-                                                (
-                                                    content_buf,
-                                                    reasoning_buf,
-                                                    arg_buf,
-                                                ) = await self._handle_responses_event(
-                                                    _tracked_write,
-                                                    parsed,
-                                                    line,
-                                                    active_t2p,
-                                                    content_buf,
-                                                    reasoning_buf,
-                                                    arg_buf,
-                                                )
-                                                continue
-
-                                            # ── Anthropic Messages API 事件（/v1/messages SSE）──
-                                            if _anthropic_event(parsed) is not None:
-                                                is_anthropic_stream = True
-                                                (
-                                                    content_buf,
-                                                    reasoning_buf,
-                                                    arg_buf,
-                                                ) = await self._handle_anthropic_event(
-                                                    _tracked_write,
-                                                    parsed,
-                                                    line,
-                                                    active_t2p,
-                                                    content_buf,
-                                                    reasoning_buf,
-                                                    arg_buf,
-                                                )
-                                                continue
-
-                                            if parsed.get('type') == 'message_stop':
-                                                seen_terminal = True
-
-                                                seen_global_terminal = True
-                                            choices = parsed.get('choices', [])
-                                            choice = choices[0] if choices else {}
-                                            delta = choice.get('delta', {})
-                                            finish_reason = choice.get(
-                                                'finish_reason',
-                                            )
-                                            if finish_reason is not None:
-                                                seen_terminal = True
-
-                                                seen_global_terminal = True
-                                            # ── OpenAI tool_calls 分片累积 ──
-                                            # 全程缓冲至审计 verdict 前不 flush
-                                            # （design D4：未出 verdict 无 tool call 事件流出）
-                                            if delta.get('tool_calls') is not None:
-                                                _accumulate_tool_calls(
-                                                    tool_calls_buf,
-                                                    delta['tool_calls'],
-                                                )
-                                                if self.audit_enabled():
-                                                    # 审计启用：缓冲事件行，verdict 后统一放行/丢弃
-                                                    tool_calls_pending_events.append(
-                                                        line
+                                                    await _tracked_write(
+                                                        b'data: [DONE]\n',
                                                     )
                                                     continue
 
-                                            # ── finish_reason == tool_calls：审计触发点 ──
-                                            if (
-                                                finish_reason == 'tool_calls'
-                                                and tool_calls_buf
-                                                and not tool_calls_audited
-                                            ):
-                                                tool_calls_audited = True
-                                                injections = (
-                                                    await self._audit_openai_tool_calls(
-                                                        tool_calls_buf,
-                                                        active_t2p,
-                                                    )
-                                                )
-                                                if injections:
-                                                    # deny：丢弃缓冲的 tool_calls 事件 + 注入拒绝
-                                                    tool_calls_blocked = True
-                                                    tool_calls_pending_events.clear()
-                                                    for ev in injections:
-                                                        await _tracked_write(
-                                                            ev.encode('utf-8')
-                                                        )
-                                                    audit_block_injected = True
-                                                else:
-                                                    # allow：verdict 后统一放行缓冲事件
-                                                    for ev in tool_calls_pending_events:
+                                                # 解析 JSON，提取 delta content
+                                                try:
+                                                    parsed = json.loads(payload)
+                                                    # 非 dict payload（JSON 数组/标量）→
+                                                    # 原样透传，避免下游 .get 抛 AttributeError
+                                                    if not isinstance(parsed, dict):
                                                         await _tracked_write(
                                                             (
                                                                 await self._pii_process_sse_line(
-                                                                    ev, active_t2p
+                                                                    line, active_t2p
                                                                 )
                                                                 + '\n'
-                                                            ).encode('utf-8')
+                                                            ).encode('utf-8'),
                                                         )
-                                                    tool_calls_pending_events.clear()
+                                                        continue
 
-                                            # deny：finish_reason: tool_calls 行不透传
-                                            # （客户端不应看到 tool_calls 语义——拒绝后
-                                            # 只有拒绝消息 + finish_reason: stop）
-                                            # 只跳过当前终止行，不得永久跳过后续行
-                                            # （阻断后模型可能继续发 content 说明）
-                                            if tool_calls_blocked and (
-                                                finish_reason == 'tool_calls'
-                                            ):
-                                                continue
-
-                                            # ── Reasoning content（独立处理，不受 content 影响）──
-                                            rc_val = delta.get('reasoning_content')
-                                            if rc_val is not None:
-                                                reasoning_buf += rc_val
-                                                restored = (
-                                                    await self._pii_response_process(
-                                                        reasoning_buf, active_t2p
-                                                    )
-                                                )
-                                                safe, pending = _split_safe_hold(
-                                                    restored,
-                                                    active_t2p,
-                                                    self._pii_scope_or_none(),
-                                                )
-                                                if safe:
-                                                    await _tracked_write(
-                                                        _mk_sse_event(
-                                                            reasoning_content=safe,
-                                                        ).encode(),
-                                                    )
-                                                reasoning_buf = pending
-                                                if finish_reason and not delta.get(
-                                                    'content'
-                                                ):
-                                                    reasoning_buf = await self._pii_response_process(
-                                                        reasoning_buf, active_t2p
-                                                    )
-                                                    reasoning_buf = _strip_partials(
-                                                        reasoning_buf
-                                                    )
-                                                    await _tracked_write(
-                                                        _mk_sse_event(
-                                                            reasoning_content=reasoning_buf,
-                                                            finish_reason=finish_reason,
-                                                        ).encode(),
-                                                    )
-                                                    reasoning_buf = ''
-
-                                            # ── Content / 非 content 事件 ──
-                                            if delta.get('content') is not None:
-                                                # 追加 content 片段，还原 token
-                                                content_buf += delta['content']
-                                                restored = (
-                                                    await self._pii_response_process(
-                                                        content_buf, active_t2p
-                                                    )
-                                                )
-
-                                                # 找安全 flush 点
-                                                safe, pending = _split_safe_hold(
-                                                    restored,
-                                                    active_t2p,
-                                                    self._pii_scope_or_none(),
-                                                )
-
-                                                # flush 安全部分
-                                                if safe:
-                                                    await _tracked_write(
-                                                        _mk_sse_event(safe).encode(),
-                                                    )
-                                                content_buf = pending
-
-                                                if finish_reason:
-                                                    content_buf = await self._pii_response_process(
-                                                        content_buf, active_t2p
-                                                    )
-                                                    content_buf = _strip_partials(
-                                                        content_buf
-                                                    )
-                                                    await _tracked_write(
-                                                        _mk_sse_event(
-                                                            content_buf,
-                                                            finish_reason,
-                                                        ).encode(),
-                                                    )
-                                                    content_buf = ''
-                                            elif 'reasoning_content' not in delta:
-                                                # 真正的非 content 事件
-                                                await _flush(
-                                                    c=content_buf,
-                                                    rc=reasoning_buf,
-                                                )
-                                                # 审计阻断：抑制 tool_calls 事件流出
-                                                # （design D4：拒绝后 tool call 不发给客户端）
-                                                if tool_calls_blocked and (
-                                                    'tool_calls' in delta
-                                                    or delta.get('role') == 'assistant'
-                                                    and 'content' not in delta
-                                                ):
-                                                    continue
-                                                await _tracked_write(
-                                                    (
-                                                        await self._pii_process_sse_line(
-                                                            line, active_t2p
-                                                        )
-                                                        + '\n'
-                                                    ).encode('utf-8'),
-                                                )
-
-                                        except json.JSONDecodeError:
-                                            # 尝试从 byte_buf 读取续行重建 JSON
-                                            # （处理 \n 在 JSON content 内截断的情况）
-                                            accumulated = payload
-                                            reconstructed = False
-                                            parsed = None  # 续行重建成功时赋值
-                                            sanitized = ''
-                                            for _ in range(20):
-                                                nl = byte_buf.find(b'\n', pos)
-                                                if nl < 0:
-                                                    break
-                                                next_line = (
-                                                    bytes(byte_buf[pos:nl])
-                                                    .decode('utf-8', errors='replace')
-                                                    .rstrip('\r')
-                                                )
-                                                # 只有不以 data:/event:/id: 开头的行才是续行
-                                                if (
-                                                    not next_line.strip()
-                                                    or next_line.startswith(
-                                                        ('data:', 'event:', 'id:')
-                                                    )
-                                                ):
-                                                    break
-                                                accumulated += '\n' + next_line
-                                                pos = nl + 1
-                                                try:
-                                                    sanitized = _sanitize_json(
-                                                        accumulated,
-                                                    )
-                                                    parsed = json.loads(sanitized)
-                                                    reconstructed = True
+                                                    # 保存原始 SSE payload 到 response.jsonl
                                                     if resp_log_path:
                                                         await _save_response_line(
                                                             resp_log_path,
-                                                            sanitized,
+                                                            payload,
                                                         )
-                                                    break
-                                                except json.JSONDecodeError:
-                                                    continue
-                                            if reconstructed:
-                                                if parsed is None:
-                                                    continue  # pragma: no cover
-                                                # 非 dict payload（数组/标量）→ 原样透传
-                                                # （与主循环 isinstance 防御对称）
-                                                if not isinstance(parsed, dict):
-                                                    await _tracked_write(
-                                                        (
-                                                            await self._pii_process_sse_line(
-                                                                'data: ' + sanitized,
-                                                                active_t2p,
-                                                            )
-                                                            + '\n'
-                                                        ).encode('utf-8'),
-                                                    )
-                                                    continue
-                                                # ── Responses API 事件（续行重建路径）──
-                                                if _responses_event(parsed) is not None:
-                                                    is_responses_stream = True
-                                                    if parsed.get('type') in (
-                                                        'response.completed',
-                                                        'response.failed',
-                                                        'response.incomplete',
+                                                    # DEBUG: 已在上游原版落盘，此处补充 conv_id 映射（若首次）
+                                                    if (
+                                                        _debug_save_eligible
+                                                        and not _debug_saved
                                                     ):
-                                                        seen_terminal = True
-                                                        seen_global_terminal = True
-                                                    (
-                                                        content_buf,
-                                                        reasoning_buf,
-                                                        arg_buf,
-                                                    ) = await self._handle_responses_event(
-                                                        _tracked_write,
-                                                        parsed,
-                                                        'data: ' + sanitized,
-                                                        active_t2p,
-                                                        content_buf,
-                                                        reasoning_buf,
-                                                        arg_buf,
-                                                    )
-                                                    continue
-                                                # ── Anthropic Messages API 事件（续行重建路径）──
-                                                if _anthropic_event(parsed) is not None:
-                                                    is_anthropic_stream = True
+                                                        try:
+                                                            _tmp_parsed = json.loads(
+                                                                payload
+                                                            )
+                                                            _tmp_cid = _extract_conv_id(
+                                                                _tmp_parsed
+                                                            )
+                                                            if _tmp_cid:
+                                                                _debug_link_conv_id(
+                                                                    req_id,
+                                                                    _tmp_cid,
+                                                                    out_body,
+                                                                )
+                                                        except Exception:
+                                                            logger.debug(
+                                                                '解析临时 payload 失败',
+                                                                exc_info=True,
+                                                            )
+
+                                                    # 首次成功解析 SSE data 时提取 conversation ID 保存原始请求
+                                                    if (
+                                                        _debug_save_eligible
+                                                        and not _debug_saved
+                                                    ):
+                                                        conv_id = _extract_conv_id(
+                                                            parsed
+                                                        )
+                                                        if conv_id:
+                                                            _save_request_body(
+                                                                conv_id, out_body
+                                                            )
+                                                            _debug_link_conv_id(
+                                                                req_id,
+                                                                conv_id,
+                                                                out_body,
+                                                            )
+                                                            _debug_saved = True
+                                                            resp_log_path = (
+                                                                os.path.join(
+                                                                    _DEBUG_DIR,
+                                                                    conv_id,
+                                                                    'response.jsonl',
+                                                                )
+                                                            )
+                                                            await _save_response_line(
+                                                                resp_log_path,
+                                                                payload,
+                                                            )
+
+                                                    # ── Responses API 事件（/v1/responses SSE）──
+                                                    if (
+                                                        _responses_event(parsed)
+                                                        is not None
+                                                    ):
+                                                        is_responses_stream = True
+                                                        if parsed.get('type') in (
+                                                            'response.completed',
+                                                            'response.failed',
+                                                            'response.incomplete',
+                                                        ):
+                                                            seen_terminal = True
+                                                            seen_global_terminal = True
+                                                        (
+                                                            content_buf,
+                                                            reasoning_buf,
+                                                            arg_buf,
+                                                        ) = await self._handle_responses_event(
+                                                            _tracked_write,
+                                                            parsed,
+                                                            line,
+                                                            active_t2p,
+                                                            content_buf,
+                                                            reasoning_buf,
+                                                            arg_buf,
+                                                        )
+                                                        continue
+
+                                                    # ── Anthropic Messages API 事件（/v1/messages SSE）──
+                                                    if (
+                                                        _anthropic_event(parsed)
+                                                        is not None
+                                                    ):
+                                                        is_anthropic_stream = True
+                                                        (
+                                                            content_buf,
+                                                            reasoning_buf,
+                                                            arg_buf,
+                                                        ) = await self._handle_anthropic_event(
+                                                            _tracked_write,
+                                                            parsed,
+                                                            line,
+                                                            active_t2p,
+                                                            content_buf,
+                                                            reasoning_buf,
+                                                            arg_buf,
+                                                        )
+                                                        continue
+
                                                     if (
                                                         parsed.get('type')
                                                         == 'message_stop'
                                                     ):
                                                         seen_terminal = True
+
                                                         seen_global_terminal = True
-                                                    (
-                                                        content_buf,
-                                                        reasoning_buf,
-                                                        arg_buf,
-                                                    ) = await self._handle_anthropic_event(
-                                                        _tracked_write,
-                                                        parsed,
-                                                        'data: ' + sanitized,
-                                                        active_t2p,
-                                                        content_buf,
-                                                        reasoning_buf,
-                                                        arg_buf,
+                                                    choices = parsed.get('choices', [])
+                                                    choice = (
+                                                        choices[0] if choices else {}
                                                     )
-                                                    continue
-                                                if parsed.get('type') == 'message_stop':
-                                                    seen_terminal = True
-                                                    seen_global_terminal = True
-                                                choices = parsed.get(
-                                                    'choices',
-                                                    [],
-                                                )
-                                                choice = choices[0] if choices else {}
-                                                delta = choice.get('delta', {})
-                                                content = delta.get('content', '')
-                                                finish_reason = choice.get(
-                                                    'finish_reason',
-                                                )
-                                                if finish_reason is not None:
-                                                    seen_terminal = True
+                                                    delta = choice.get('delta', {})
+                                                    finish_reason = choice.get(
+                                                        'finish_reason',
+                                                    )
+                                                    if finish_reason is not None:
+                                                        seen_terminal = True
 
-                                                    seen_global_terminal = True
-                                                # reasoning_content 独立处理
-                                                rc_val = delta.get('reasoning_content')
-                                                if rc_val is not None:
-                                                    rc_combined = reasoning_buf + rc_val
-                                                    reasoning_buf = ''
-                                                    rc_restored = await self._pii_response_process(
-                                                        rc_combined, active_t2p
-                                                    )
-                                                    rc_restored = _strip_partials(
-                                                        rc_restored
-                                                    )
-                                                    await _tracked_write(
-                                                        _mk_sse_event(
-                                                            reasoning_content=rc_restored,
-                                                            finish_reason=(
-                                                                finish_reason
-                                                                if not content
-                                                                else None
-                                                            ),
-                                                        ).encode(),
-                                                    )
+                                                        seen_global_terminal = True
+                                                    # ── OpenAI tool_calls 分片累积 ──
+                                                    # 全程缓冲至审计 verdict 前不 flush
+                                                    # （design D4：未出 verdict 无 tool call 事件流出）
+                                                    if (
+                                                        delta.get('tool_calls')
+                                                        is not None
+                                                    ):
+                                                        _accumulate_tool_calls(
+                                                            tool_calls_buf,
+                                                            delta['tool_calls'],
+                                                        )
+                                                        if self.audit_enabled():
+                                                            # 审计启用：缓冲事件行，verdict 后统一放行/丢弃
+                                                            tool_calls_pending_events.append(
+                                                                line
+                                                            )
+                                                            continue
 
-                                                # content / 非 content
-                                                if content:
-                                                    combined = content_buf + content
-                                                    content_buf = ''
-                                                    restored = await self._pii_response_process(
-                                                        combined, active_t2p
+                                                    # ── finish_reason == tool_calls：审计触发点 ──
+                                                    if (
+                                                        finish_reason == 'tool_calls'
+                                                        and tool_calls_buf
+                                                        and not tool_calls_audited
+                                                    ):
+                                                        tool_calls_audited = True
+                                                        injections = await self._audit_openai_tool_calls(
+                                                            tool_calls_buf,
+                                                            active_t2p,
+                                                        )
+                                                        if injections:
+                                                            # deny：丢弃缓冲的 tool_calls 事件 + 注入拒绝
+                                                            tool_calls_blocked = True
+                                                            tool_calls_pending_events.clear()
+                                                            for ev in injections:
+                                                                await _tracked_write(
+                                                                    ev.encode('utf-8')
+                                                                )
+                                                            audit_block_injected = True
+                                                        else:
+                                                            # allow：verdict 后统一放行缓冲事件
+                                                            for ev in tool_calls_pending_events:
+                                                                await _tracked_write(
+                                                                    (
+                                                                        await self._pii_process_sse_line(
+                                                                            ev,
+                                                                            active_t2p,
+                                                                        )
+                                                                        + '\n'
+                                                                    ).encode('utf-8')
+                                                                )
+                                                            tool_calls_pending_events.clear()
+
+                                                    # deny：finish_reason: tool_calls 行不透传
+                                                    # （客户端不应看到 tool_calls 语义——拒绝后
+                                                    # 只有拒绝消息 + finish_reason: stop）
+                                                    # 只跳过当前终止行，不得永久跳过后续行
+                                                    # （阻断后模型可能继续发 content 说明）
+                                                    if tool_calls_blocked and (
+                                                        finish_reason == 'tool_calls'
+                                                    ):
+                                                        continue
+
+                                                    # ── Reasoning content（独立处理，不受 content 影响）──
+                                                    rc_val = delta.get(
+                                                        'reasoning_content'
                                                     )
-                                                    restored = _strip_partials(restored)
-                                                    await _tracked_write(
-                                                        _mk_sse_event(
-                                                            content=restored,
-                                                            finish_reason=finish_reason,
-                                                        ).encode(),
-                                                    )
-                                                elif 'reasoning_content' not in delta:
-                                                    # 非 content 事件
-                                                    await _flush(
-                                                        c=content_buf,
-                                                        rc=reasoning_buf,
+                                                    if rc_val is None:
+                                                        rc_val = delta.get('reasoning')
+                                                    if rc_val is not None:
+                                                        norm = rc_val.replace(
+                                                            '\r\n', '\n'
+                                                        ).replace('\r', '\n')
+                                                        reasoning_buf += norm
+                                                        reasoning_buf_ts = (
+                                                            _time.monotonic()
+                                                        )
+                                                        out_rc = []
+                                                        while '\n' in reasoning_buf:
+                                                            line_seg, reasoning_buf = (
+                                                                reasoning_buf.split(
+                                                                    '\n', 1
+                                                                )
+                                                            )
+                                                            line_seg += '\n'
+                                                            restored = await self._pii_response_process(
+                                                                line_seg, active_t2p
+                                                            )
+                                                            safe = _strip_partials(
+                                                                restored
+                                                            )
+                                                            if safe:
+                                                                out_rc.append(safe)
+                                                        if reasoning_buf and (
+                                                            len(reasoning_buf)
+                                                            > LINE_BUF_FLUSH
+                                                            or _time.monotonic()
+                                                            - reasoning_buf_ts
+                                                            > LINE_BUF_MAX_AGE
+                                                            or _has_partial_pii_candidate(
+                                                                reasoning_buf[-64:]
+                                                            )
+                                                        ):
+                                                            restored = await self._pii_response_process(
+                                                                reasoning_buf,
+                                                                active_t2p,
+                                                            )
+                                                            safe, pending = (
+                                                                _split_safe_hold(
+                                                                    restored,
+                                                                    active_t2p,
+                                                                    self._pii_scope_or_none(),
+                                                                )
+                                                            )
+                                                            if safe:
+                                                                safe = _strip_partials(
+                                                                    safe
+                                                                )
+                                                                out_rc.append(safe)
+                                                            reasoning_buf = pending
+                                                            reasoning_buf_ts = (
+                                                                _time.monotonic()
+                                                            )
+                                                        if out_rc:
+                                                            await _tracked_write(
+                                                                _mk_sse_event(
+                                                                    reasoning_content=''.join(
+                                                                        out_rc
+                                                                    )
+                                                                ).encode()
+                                                            )
+                                                        if (
+                                                            finish_reason
+                                                            and not delta.get('content')
+                                                        ):
+                                                            if reasoning_buf:
+                                                                reasoning_buf = await self._pii_response_process(
+                                                                    reasoning_buf,
+                                                                    active_t2p,
+                                                                )
+                                                                reasoning_buf = (
+                                                                    _strip_partials(
+                                                                        reasoning_buf
+                                                                    )
+                                                                )
+                                                                await _tracked_write(
+                                                                    _mk_sse_event(
+                                                                        reasoning_content=reasoning_buf,
+                                                                        finish_reason=finish_reason,
+                                                                    ).encode()
+                                                                )
+                                                                reasoning_buf = ''
+                                                            else:
+                                                                await _tracked_write(
+                                                                    _mk_sse_event(
+                                                                        finish_reason=finish_reason
+                                                                    ).encode()
+                                                                )
+                                                            reasoning_buf_ts = (
+                                                                _time.monotonic()
+                                                            )
+
+                                                    # ── Content / 非 content 事件 ──
+                                                    if delta.get('content') is not None:
+                                                        norm = (
+                                                            delta['content']
+                                                            .replace('\r\n', '\n')
+                                                            .replace('\r', '\n')
+                                                        )
+                                                        content_buf += norm
+                                                        line_buf_ts = _time.monotonic()
+                                                        out_c = []
+                                                        while '\n' in content_buf:
+                                                            line_seg, content_buf = (
+                                                                content_buf.split(
+                                                                    '\n', 1
+                                                                )
+                                                            )
+                                                            line_seg += '\n'
+                                                            restored = await self._pii_response_process(
+                                                                line_seg, active_t2p
+                                                            )
+                                                            safe = _strip_partials(
+                                                                restored
+                                                            )
+                                                            if safe:
+                                                                out_c.append(safe)
+                                                        if content_buf and (
+                                                            len(content_buf)
+                                                            > LINE_BUF_FLUSH
+                                                            or _time.monotonic()
+                                                            - line_buf_ts
+                                                            > LINE_BUF_MAX_AGE
+                                                            or _has_partial_pii_candidate(
+                                                                content_buf[-64:]
+                                                            )
+                                                        ):
+                                                            restored = await self._pii_response_process(
+                                                                content_buf, active_t2p
+                                                            )
+                                                            safe, pending = (
+                                                                _split_safe_hold(
+                                                                    restored,
+                                                                    active_t2p,
+                                                                    self._pii_scope_or_none(),
+                                                                )
+                                                            )
+                                                            if safe:
+                                                                safe = _strip_partials(
+                                                                    safe
+                                                                )
+                                                                out_c.append(safe)
+                                                            content_buf = pending
+                                                            line_buf_ts = (
+                                                                _time.monotonic()
+                                                            )
+                                                        if out_c:
+                                                            await _tracked_write(
+                                                                _mk_sse_event(
+                                                                    ''.join(out_c)
+                                                                ).encode()
+                                                            )
+                                                        if finish_reason:
+                                                            if content_buf:
+                                                                content_buf = await self._pii_response_process(
+                                                                    content_buf,
+                                                                    active_t2p,
+                                                                )
+                                                                content_buf = (
+                                                                    _strip_partials(
+                                                                        content_buf
+                                                                    )
+                                                                )
+                                                                await _tracked_write(
+                                                                    _mk_sse_event(
+                                                                        content_buf,
+                                                                        finish_reason,
+                                                                    ).encode()
+                                                                )
+                                                                content_buf = ''
+                                                                line_buf_ts = (
+                                                                    _time.monotonic()
+                                                                )
+                                                            else:
+                                                                await _tracked_write(
+                                                                    _mk_sse_event(
+                                                                        finish_reason=finish_reason
+                                                                    ).encode()
+                                                                )
+                                                    elif (
+                                                        'reasoning_content' not in delta
+                                                    ):
+                                                        # 真正的非 content 事件
+                                                        await _flush(
+                                                            c=content_buf,
+                                                            rc=reasoning_buf,
+                                                        )
+                                                        # 审计阻断：抑制 tool_calls 事件流出
+                                                        # （design D4：拒绝后 tool call 不发给客户端）
+                                                        if tool_calls_blocked and (
+                                                            'tool_calls' in delta
+                                                            or delta.get('role')
+                                                            == 'assistant'
+                                                            and 'content' not in delta
+                                                        ):
+                                                            continue
+                                                        await _tracked_write(
+                                                            (
+                                                                await self._pii_process_sse_line(
+                                                                    line, active_t2p
+                                                                )
+                                                                + '\n'
+                                                            ).encode('utf-8'),
+                                                        )
+
+                                                except json.JSONDecodeError:
+                                                    # 尝试从 byte_buf 读取续行重建 JSON
+                                                    # （处理 \n 在 JSON content 内截断的情况）
+                                                    accumulated = payload
+                                                    reconstructed = False
+                                                    parsed = None  # 续行重建成功时赋值
+                                                    sanitized = ''
+                                                    for _ in range(20):
+                                                        nl = byte_buf.find(b'\n', pos)
+                                                        if nl < 0:
+                                                            break
+                                                        next_line = (
+                                                            bytes(byte_buf[pos:nl])
+                                                            .decode(
+                                                                'utf-8',
+                                                                errors='replace',
+                                                            )
+                                                            .rstrip('\r')
+                                                        )
+                                                        # 只有不以 data:/event:/id: 开头的行才是续行
+                                                        if (
+                                                            not next_line.strip()
+                                                            or next_line.startswith(
+                                                                (
+                                                                    'data:',
+                                                                    'event:',
+                                                                    'id:',
+                                                                )
+                                                            )
+                                                        ):
+                                                            break
+                                                        accumulated += '\n' + next_line
+                                                        pos = nl + 1
+                                                        try:
+                                                            sanitized = _sanitize_json(
+                                                                accumulated,
+                                                            )
+                                                            parsed = json.loads(
+                                                                sanitized
+                                                            )
+                                                            reconstructed = True
+                                                            if resp_log_path:
+                                                                await (
+                                                                    _save_response_line(
+                                                                        resp_log_path,
+                                                                        sanitized,
+                                                                    )
+                                                                )
+                                                            break
+                                                        except json.JSONDecodeError:
+                                                            continue
+                                                    if reconstructed:
+                                                        if parsed is None:
+                                                            continue  # pragma: no cover
+                                                        # 非 dict payload（数组/标量）→ 原样透传
+                                                        # （与主循环 isinstance 防御对称）
+                                                        if not isinstance(parsed, dict):
+                                                            await _tracked_write(
+                                                                (
+                                                                    await self._pii_process_sse_line(
+                                                                        'data: '
+                                                                        + sanitized,
+                                                                        active_t2p,
+                                                                    )
+                                                                    + '\n'
+                                                                ).encode('utf-8'),
+                                                            )
+                                                            continue
+                                                        # ── Responses API 事件（续行重建路径）──
+                                                        if (
+                                                            _responses_event(parsed)
+                                                            is not None
+                                                        ):
+                                                            is_responses_stream = True
+                                                            if parsed.get('type') in (
+                                                                'response.completed',
+                                                                'response.failed',
+                                                                'response.incomplete',
+                                                            ):
+                                                                seen_terminal = True
+                                                                seen_global_terminal = (
+                                                                    True
+                                                                )
+                                                            (
+                                                                content_buf,
+                                                                reasoning_buf,
+                                                                arg_buf,
+                                                            ) = await self._handle_responses_event(
+                                                                _tracked_write,
+                                                                parsed,
+                                                                'data: ' + sanitized,
+                                                                active_t2p,
+                                                                content_buf,
+                                                                reasoning_buf,
+                                                                arg_buf,
+                                                            )
+                                                            continue
+                                                        # ── Anthropic Messages API 事件（续行重建路径）──
+                                                        if (
+                                                            _anthropic_event(parsed)
+                                                            is not None
+                                                        ):
+                                                            is_anthropic_stream = True
+                                                            if (
+                                                                parsed.get('type')
+                                                                == 'message_stop'
+                                                            ):
+                                                                seen_terminal = True
+                                                                seen_global_terminal = (
+                                                                    True
+                                                                )
+                                                            (
+                                                                content_buf,
+                                                                reasoning_buf,
+                                                                arg_buf,
+                                                            ) = await self._handle_anthropic_event(
+                                                                _tracked_write,
+                                                                parsed,
+                                                                'data: ' + sanitized,
+                                                                active_t2p,
+                                                                content_buf,
+                                                                reasoning_buf,
+                                                                arg_buf,
+                                                            )
+                                                            continue
+                                                        if (
+                                                            parsed.get('type')
+                                                            == 'message_stop'
+                                                        ):
+                                                            seen_terminal = True
+                                                            seen_global_terminal = True
+                                                        choices = parsed.get(
+                                                            'choices',
+                                                            [],
+                                                        )
+                                                        choice = (
+                                                            choices[0]
+                                                            if choices
+                                                            else {}
+                                                        )
+                                                        delta = choice.get('delta', {})
+                                                        content = delta.get(
+                                                            'content', ''
+                                                        )
+                                                        finish_reason = choice.get(
+                                                            'finish_reason',
+                                                        )
+                                                        if finish_reason is not None:
+                                                            seen_terminal = True
+
+                                                            seen_global_terminal = True
+                                                        # reasoning_content 独立处理
+                                                        rc_val = delta.get(
+                                                            'reasoning_content'
+                                                        )
+                                                        if rc_val is not None:
+                                                            rc_combined = (
+                                                                reasoning_buf + rc_val
+                                                            )
+                                                            reasoning_buf = ''
+                                                            rc_restored = await self._pii_response_process(
+                                                                rc_combined, active_t2p
+                                                            )
+                                                            rc_restored = (
+                                                                _strip_partials(
+                                                                    rc_restored
+                                                                )
+                                                            )
+                                                            await _tracked_write(
+                                                                _mk_sse_event(
+                                                                    reasoning_content=rc_restored,
+                                                                    finish_reason=(
+                                                                        finish_reason
+                                                                        if not content
+                                                                        else None
+                                                                    ),
+                                                                ).encode(),
+                                                            )
+
+                                                        # content / 非 content
+                                                        if content:
+                                                            combined = (
+                                                                content_buf + content
+                                                            )
+                                                            content_buf = ''
+                                                            restored = await self._pii_response_process(
+                                                                combined, active_t2p
+                                                            )
+                                                            restored = _strip_partials(
+                                                                restored
+                                                            )
+                                                            await _tracked_write(
+                                                                _mk_sse_event(
+                                                                    content=restored,
+                                                                    finish_reason=finish_reason,
+                                                                ).encode(),
+                                                            )
+                                                        elif (
+                                                            'reasoning_content'
+                                                            not in delta
+                                                        ):
+                                                            # 非 content 事件
+                                                            await _flush(
+                                                                c=content_buf,
+                                                                rc=reasoning_buf,
+                                                            )
+                                                            await _tracked_write(
+                                                                (
+                                                                    await self._pii_process_sse_line(
+                                                                        'data: '
+                                                                        + sanitized,
+                                                                        active_t2p,
+                                                                    )
+                                                                    + '\n'
+                                                                ).encode('utf-8'),
+                                                            )
+                                                    else:
+                                                        # pos 已越过续行，不回退（续行已在 byte_buf 中被消费）
+                                                        logger.warning(
+                                                            'SSE JSON 解析失败，'
+                                                            '续行重建失败，转发原始行: %s...',
+                                                            payload[:80],
+                                                        )
+                                                        await _tracked_write(
+                                                            (
+                                                                await self._pii_process_sse_line(
+                                                                    line, active_t2p
+                                                                )
+                                                                + '\n'
+                                                            ).encode('utf-8'),
+                                                        )
+                                                except (
+                                                    KeyError,
+                                                    IndexError,
+                                                    TypeError,
+                                                ):
+                                                    logger.warning(
+                                                        'SSE 数据结构异常: %s...',
+                                                        payload[:80],
                                                     )
                                                     await _tracked_write(
                                                         (
                                                             await self._pii_process_sse_line(
-                                                                'data: ' + sanitized,
-                                                                active_t2p,
+                                                                line, active_t2p
                                                             )
                                                             + '\n'
                                                         ).encode('utf-8'),
                                                     )
-                                            else:
-                                                # pos 已越过续行，不回退（续行已在 byte_buf 中被消费）
-                                                logger.warning(
-                                                    'SSE JSON 解析失败，'
-                                                    '续行重建失败，转发原始行: %s...',
-                                                    payload[:80],
-                                                )
+                                            continue
+                                        if line.startswith(':'):
+                                            await _tracked_write(
+                                                (line + '\n').encode('utf-8')
+                                            )
+                                            continue
+                                        if ':' in line:
+                                            field, value = line.split(':', 1)
+                                            value = value.removeprefix(' ')
+                                            if field == 'data':
+                                                data_buffer.append(value)
+                                                continue
+                                            elif field == 'event' or field == 'id':
                                                 await _tracked_write(
                                                     (
                                                         await self._pii_process_sse_line(
                                                             line, active_t2p
                                                         )
                                                         + '\n'
-                                                    ).encode('utf-8'),
+                                                    ).encode('utf-8')
                                                 )
-                                        except (KeyError, IndexError, TypeError):
-                                            logger.warning(
-                                                'SSE 数据结构异常: %s...',
-                                                payload[:80],
-                                            )
-                                            await _tracked_write(
-                                                (
-                                                    await self._pii_process_sse_line(
-                                                        line, active_t2p
+                                                continue
+                                            elif field == 'retry':
+                                                if value.isdigit() and value.isascii():
+                                                    await _tracked_write(
+                                                        (line + '\n').encode('utf-8')
                                                     )
-                                                    + '\n'
-                                                ).encode('utf-8'),
-                                            )
-
-                                    # Trim processed portion (in-place, avoid new allocation)
-                                    if pos > 0:
-                                        del byte_buf[:pos]
-
-                                    # 缓冲区溢出保护
-                                    if len(byte_buf) > SSE_MAX_BUF:
-                                        logger.warning(
-                                            'SSE 缓冲区超过 1MB 上限，'
-                                            '保留最后一个部分行',
-                                        )
-                                        last_nl = byte_buf.rfind(b'\n')
-                                        if last_nl >= 0:
-                                            byte_buf = bytearray(
-                                                byte_buf[last_nl + 1 :],
-                                            )
+                                                continue
+                                            else:
+                                                await _tracked_write(
+                                                    (
+                                                        await self._pii_process_sse_line(
+                                                            line, active_t2p
+                                                        )
+                                                        + '\n'
+                                                    ).encode('utf-8')
+                                                )
+                                                continue
+                                        else:
+                                            field = line
+                                            value = ''
+                                            if field == 'data':
+                                                data_buffer.append(value)
+                                                continue
+                                            elif field in ('event', 'id'):
+                                                await _tracked_write(
+                                                    (
+                                                        await self._pii_process_sse_line(
+                                                            line, active_t2p
+                                                        )
+                                                        + '\n'
+                                                    ).encode('utf-8')
+                                                )
+                                                continue
+                                            elif field == 'retry':
+                                                continue
+                                            else:
+                                                await _tracked_write(
+                                                    (
+                                                        await self._pii_process_sse_line(
+                                                            line, active_t2p
+                                                        )
+                                                        + '\n'
+                                                    ).encode('utf-8')
+                                                )
+                                                continue
+                                        if pos > 0:
+                                            del byte_buf[:pos]
                                         if len(byte_buf) > SSE_MAX_BUF:
-                                            byte_buf = bytearray()
+                                            logger.warning(
+                                                'SSE 缓冲区超过 1MB 上限，保留最后一个部分行'
+                                            )
+                                            last_nl = byte_buf.rfind(b'\n')
+                                            if last_nl >= 0:
+                                                byte_buf = bytearray(
+                                                    byte_buf[last_nl + 1 :]
+                                                )
+                                            if len(byte_buf) > SSE_MAX_BUF:
+                                                byte_buf = bytearray()
+                                            # 7.5: 截断后清空 data_buffer 避免残留与后续事件叠加
+                                            try:
+                                                data_buffer.clear()
+                                            except Exception:
+                                                pass
+
                             except SSE_CLIENT_GONE as e:
                                 logger.debug('SSE 客户端断连: %s', e)
 
@@ -3023,16 +3431,41 @@ class LlmMixin(AuditMixin):
                                         )
                                     except SSE_CLIENT_GONE:
                                         logger.debug('SSE 残余写入失败')
-                            # ── 截断检测：byte_buf 残留或未收到终止事件则告警并合成 ──
+                            # ── 截断检测：byte_buf/data_buffer/line_buf/arg_buf 残留或未收到终止事件则告警并合成 ──
                             _truncated = False
-                            if byte_buf:
+                            # 6.2/6.3 残留检测包含 data_buffer 与 line_buf
+                            if (
+                                byte_buf
+                                or data_buffer
+                                or content_buf
+                                or reasoning_buf
+                                or arg_buf
+                            ):
                                 _truncated = True
-                                _preview = byte_buf[:200].decode(
-                                    'utf-8', errors='replace'
+                                _preview = (
+                                    byte_buf[:200].decode('utf-8', errors='replace')
+                                    if byte_buf
+                                    else (
+                                        'data_buffer=' + str(data_buffer[:2])
+                                        if data_buffer
+                                        else (
+                                            content_buf[:200]
+                                            if content_buf
+                                            else (
+                                                reasoning_buf[:200]
+                                                if reasoning_buf
+                                                else arg_buf[:200]
+                                            )
+                                        )
+                                    )
                                 )
                                 logger.warning(
-                                    'LLM 流截断: bytes_buf_len=%d sse_events=%d bytes_written=%d req_id=%s tail=%s preview=%r',
+                                    'LLM 流截断: bytes_buf_len=%d data_buffer=%d content_buf=%d reasoning_buf=%d arg_buf=%d sse_events=%d bytes_written=%d req_id=%s tail=%s preview=%r',
                                     len(byte_buf),
+                                    len(data_buffer),
+                                    len(content_buf),
+                                    len(reasoning_buf),
+                                    len(arg_buf),
                                     sse_event_count,
                                     bytes_written,
                                     req_id,
@@ -3040,6 +3473,8 @@ class LlmMixin(AuditMixin):
                                     _preview,
                                 )
                                 # 丢弃破损残余，不直接转发避免下游 JSONDecodeError
+                                # 清空 data_buffer 避免重复合成
+                                data_buffer.clear()
                             if (
                                 not seen_global_terminal
                                 and bytes_written > 0
@@ -3056,6 +3491,13 @@ class LlmMixin(AuditMixin):
                                         is_anthropic_stream,
                                     )
                                 _truncated = True
+                            # 6.5 keepalive 清理
+                            if keepalive_task is not None:
+                                try:
+                                    keepalive_task.cancel()
+                                except Exception:
+                                    pass
+                                keepalive_task = None
                             if _truncated:
                                 try:
                                     if is_responses_stream:
@@ -3241,16 +3683,57 @@ class LlmMixin(AuditMixin):
                                                 continue
 
                                             fast_sse_event_count += 1
-                                            if (
-                                                payload.strip() == '[DONE]'
-                                                or '"response.completed"' in payload
-                                                or '"response.failed"' in payload
-                                                or '"response.incomplete"' in payload
-                                                or '"message_stop"' in payload
-                                                or '"finish_reason"' in payload
-                                            ):
+                                            if payload.strip() == '[DONE]':
                                                 fast_seen_terminal = True
                                                 fast_seen_global_terminal = True
+                                            else:
+                                                try:
+                                                    _fast_parsed = (
+                                                        json.loads(payload.strip())
+                                                        if payload.strip().startswith(
+                                                            ('{', '[')
+                                                        )
+                                                        else {}
+                                                    )
+                                                    _ft = (
+                                                        _fast_parsed.get('type')
+                                                        if isinstance(
+                                                            _fast_parsed, dict
+                                                        )
+                                                        else None
+                                                    )
+                                                    if _ft in (
+                                                        'response.completed',
+                                                        'response.failed',
+                                                        'response.incomplete',
+                                                        'message_stop',
+                                                    ):
+                                                        fast_seen_terminal = True
+                                                        fast_seen_global_terminal = True
+                                                    else:
+                                                        for _c in (
+                                                            _fast_parsed.get(
+                                                                'choices', []
+                                                            )
+                                                            if isinstance(
+                                                                _fast_parsed, dict
+                                                            )
+                                                            else []
+                                                        ) or []:
+                                                            if (
+                                                                isinstance(_c, dict)
+                                                                and _c.get(
+                                                                    'finish_reason'
+                                                                )
+                                                                is not None
+                                                            ):
+                                                                fast_seen_terminal = (
+                                                                    True
+                                                                )
+                                                                fast_seen_global_terminal = True
+                                                                break
+                                                except Exception:
+                                                    pass
                                             if _debug_save_eligible:
                                                 try:
                                                     await _debug_append_line(
@@ -3302,7 +3785,10 @@ class LlmMixin(AuditMixin):
                                                     pass
 
                                             # JSON-aware: data 载荷为 JSON 时走 loads→walk→dumps，避免 p@ss"quote/\u 破坏
-                                            if hasattr(
+                                            # 7.4: 非对话尾透传不 walk
+                                            if not is_dialog_tail:
+                                                _restored_payload = payload
+                                            elif hasattr(
                                                 self, '_pii_response_process_json_aware'
                                             ):
                                                 _restored_payload = await self._pii_response_process_json_aware(
@@ -3343,6 +3829,7 @@ class LlmMixin(AuditMixin):
                                             )
                                         if len(byte_buf) > SSE_MAX_BUF:
                                             byte_buf = bytearray()
+                                        # 7.5: fast 无 data_buffer（直接按行处理），仅保 byte_buf 截断一致性为 rfind
                             except SSE_CLIENT_GONE as e:
                                 logger.debug('SSE 客户端断连: %s', e)
                             # ── fast 截断检测 ──
@@ -3660,7 +4147,10 @@ class LlmMixin(AuditMixin):
                                 ),
                             )
                         # JSON-aware：仅对字符串节点做还原/检测，避免纯文本替换破坏 \\u 转义（Invalid \\escape）
-                        if hasattr(self, '_pii_response_process_json_aware'):
+                        # 7.4: 非对话尾透传不 walk
+                        if not is_dialog_tail:
+                            out_text = resp_text
+                        elif hasattr(self, '_pii_response_process_json_aware'):
                             out_text = await self._pii_response_process_json_aware(
                                 resp_text, active_t2p
                             )

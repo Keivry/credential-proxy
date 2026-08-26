@@ -80,10 +80,20 @@ def json_walk(obj, leaf_fn, depth_limit: int = 5, path: str = '$', _depth: int =
                         path,
                         exc,
                         obj[:500],
-                        new_s[:500],
+                        new_s[:500] if isinstance(new_s, str) else repr(new_s)[:500],
                     )
                     return obj
             return new_s
+        if isinstance(obj, dict):
+            return {
+                k: json_walk(v, leaf_fn, depth_limit, f'{path}.{k}', _depth + 1)
+                for k, v in obj.items()
+            }
+        if isinstance(obj, list):
+            return [
+                json_walk(x, leaf_fn, depth_limit, f'{path}[{i}]', _depth + 1)
+                for i, x in enumerate(obj)
+            ]
         return obj
     if isinstance(obj, str):
         inner_stripped = obj.lstrip('\ufeff').strip()
@@ -94,7 +104,9 @@ def json_walk(obj, leaf_fn, depth_limit: int = 5, path: str = '$', _depth: int =
                     walked = json_walk(
                         inner, leaf_fn, depth_limit, f'{path}->$.inner', _depth + 1
                     )
-                    return _jdumps(walked)
+                    out = _jdumps(walked)
+                    # 6.1 叶子内层校验：inner 合法而 out 非法时回退该叶原串
+                    return _validate_json_roundtrip(inner_stripped, out, 'json_walk')
             except Exception:
                 pass
         try:
@@ -110,7 +122,7 @@ def json_walk(obj, leaf_fn, depth_limit: int = 5, path: str = '$', _depth: int =
                     path,
                     exc,
                     obj[:500],
-                    new_s[:500],
+                    new_s[:500] if isinstance(new_s, str) else repr(new_s)[:500],
                 )
                 return obj
         return new_s
@@ -150,10 +162,26 @@ async def json_walk_async(
                         path,
                         exc,
                         obj[:500],
-                        new_s[:500],
+                        new_s[:500] if isinstance(new_s, str) else repr(new_s)[:500],
                     )
                     return obj
             return new_s
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                out[k] = await json_walk_async(
+                    v, leaf_fn, depth_limit, f'{path}.{k}', _depth + 1
+                )
+            return out
+        if isinstance(obj, list):
+            res = []
+            for i, x in enumerate(obj):
+                res.append(
+                    await json_walk_async(
+                        x, leaf_fn, depth_limit, f'{path}[{i}]', _depth
+                    )
+                )
+            return res
         return obj
     if isinstance(obj, str):
         inner_stripped = obj.lstrip('\ufeff').strip()
@@ -164,7 +192,10 @@ async def json_walk_async(
                     walked = await json_walk_async(
                         inner, leaf_fn, depth_limit, f'{path}->$.inner', _depth + 1
                     )
-                    return _jdumps(walked)
+                    out = _jdumps(walked)
+                    return _validate_json_roundtrip(
+                        inner_stripped, out, 'json_walk_async'
+                    )
             except Exception:
                 pass
         try:
@@ -184,7 +215,7 @@ async def json_walk_async(
                     path,
                     exc,
                     obj[:500],
-                    new_s[:500],
+                    new_s[:500] if isinstance(new_s, str) else repr(new_s)[:500],
                 )
                 return obj
         return new_s

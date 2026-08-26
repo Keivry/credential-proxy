@@ -44,9 +44,19 @@
 **D5 检测侧加固：`lru_cache` Analyzer + 保留地址精确前缀（含尾点/冒号）+ ReDoS 线程池守卫 + 字典独立扫描**
 
 - 缓存：`@lru_cache(maxsize=4)` 缓 `re.compile` 的联合正则与 `presidio AnalyzerEngine` 实例（NeMo `_get_analyzer`），避免每请求编译，`dict_ver` 变化 `cache_clear`。备选：每请求 `re.compile` → 1MB body 90ms 锚点超标。
-- 保留地址：前缀表 `{"10.", "127.", "169.254.", "192.168.", "172.16."..("172.31."), "224.".."239.", "240.".."255.", "100.64.".."100.127.", "fd", "fe8:".."feb:", "fc", "::1", "2001:db8:"}` 均含尾点/冒号，`startswith` 前 `text.lower()`（NeMo 大小写坑）。备选：`ipaddress.ip_network` 构造 → 每候选一次对象开销，1MB 9021 候选过滤 <5ms 目标不达。
+- 保留地址：前缀表 `{"10.", "127.", "169.254.", "192.168.", "172.16."..("172.31."), "224.".."239.", "240.".."255.", "100.64.".."100.127.", "fc:", "fd:", "fe8:".."feb:", "fc00::/7 hex head 校验", "::1", "2001:db8:"}` 均含尾点/冒号（`fc`/`fd` 仅冒号形态 `fc00::1`/`fd00::1` 豁免，`fcfake` 不豁免，`_is_reserved_ip` 中 `head=low.split(":",1)[0]; 2<=len<=4 hex` 校验；`spec: pii-detection-hardening` 已同步冒号形态），`startswith` 前 `text.lower()`（NeMo 大小写坑）。备选：`ipaddress.ip_network` 构造 → 每候选一次对象开销，1MB 9021 候选过滤 <5ms 目标不达。`Analyzer` 缓存 `@lru_cache(maxsize=4)` 必须经 `_get_combined_re()` 接线（`scan()` 禁直用 `_COMBINED_RE`），`_dict_boundary_ok` hardening 分支 `CJK (?<![\w\u4e00-\u9fff])`、非 hardening 分支简化为 `(?<!\w)` 使门控有差异，`ReDoS` 守卫 `hardening=_is_detection_hardening()` 对齐 spec（超时仍常开但分块/CJK 仍受闸）。
 - ReDoS：`ThreadPoolExecutor(max_workers=2, thread_name_prefix='pii-re')` 独立池（与审计文件 I/O 的 `run_in_executor(None)` 不同池）+ `asyncio.timeout(0.1)` 单规则预算（非 `wait_for`，因 `executor Future` 不可取消、`wait_for` 在 3.12 不可靠见 `_pii.py:530` 注释），超时跳过+审计+连续 3 次停用（`llm-privacy-gateway` D1 已定）。输入上限 `PII_SCAN_INPUT_LIMIT=1M` 分块。
 - 字典：独立扫描不并入联合正则（防 `a|b|c` 分支爆炸，`llm-privacy-gateway` D1）、按长度降序+`re.escape`+`dict_ver` 缓存，CJK 边界 `(?<![\w\u4e00-\u9fff])name(?![\w\u4e00-\u9fff])`。
+
+**D6 审查追加闭环（2026-08-26 五路并行审查残余，§7 对应）**
+
+- 选用 7.1：`leaf_fn` 返回非 `str` 时 `new_s[:500]` 改 `isinstance(new_s,str) and new_s[:500] or repr(new_s)[:500]`，四处统一，防 `TypeError: 'dict' object is not subscriptable` 掩盖 `leaf broke` 审计。备选：强制 `leaf_fn` 返回 `str` → 约束调用方，不如 walk 侧容错。
+- 选用 7.2：`dict`/`list` 递归传 `_depth+1`，使 `depth_limit=5` 对裸嵌套同样生效（`str->inner` 已 `+1`，裸嵌套需同口径）。备选：保留 `_depth` → 炸弹 JSON `{"a":{"a":...}}` 可绕过 `leaf_fn` 仍执行。
+- 选用 7.3：快路径终止判定由子串 `in payload` 改为 `json.loads` 结构化 `parsed.get("type")`/`parsed.get("choices",[])[i].get("finish_reason")`，解析失败按普通 `data:` 透传。备选：正则子串 → 正文含 `response.completed` 误触发。
+- 选用 7.4：非对话尾（`v1/models` 等）统一 `tail.endswith(...)` 守门透传，不走 `json_aware walk` 与 `request_original.jsonl` 保存（`_llm 1998` 已有，需补快链 `3291` 与 `proxy` 分发）。备选：全量 walk → 误脱敏+审计泄漏。
+- 选用 7.5：`SSE_MAX_BUF` 快链 `find` 改 `rfind` 与慢链一致，快链截断后 `data_buffer.clear(); event_fields.clear()` 防残留串事件。备选：保留 `find` → 1MB 截断丢尾行可解析前缀。
+- 选用 7.6：检测侧 `scan(hardening=_is_detection_hardening())` 对齐 spec，`_dict_boundary_ok` 非 hardening 分支简化 `(?<!\w)` 形成差异化，超长输入按 `1M` 分块迭代而非 `text[:1M]` 截断（`_scan_custom` 仍 `hardening or timeout` 使 ReDoS 常开）。备选：保留截断 → 尾部 PII 丢检。
+- 选用 7.7：Vault `register` 已持 `asyncio.Lock` 覆盖 `used set` 快照与 `token` 写入全程，确认原子性；文档补 `resp_p2t 不还原` 与 `__PII_/__VG_CRED_` 保留前缀（`vault-stable-mapping` 已声明 token 形态，本文档化）。
 
 ## Risks / Trade-offs
 

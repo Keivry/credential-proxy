@@ -1,0 +1,3 @@
+{"kind": "request", "body": {"model": "gpt-4o-mini", "messages": [], "stream": false, "tail": "v1/models"}}
+{"kind": "sse", "line": "data: {\"object\":\"list\",\"data\":[{\"id\":\"gpt-4o-mini\",\"object\":\"model\"}]}\n\n"}
+{"kind": "audit", "audit": {"passthrough": "v1/models non-dialog tail bypass, no walk, no request_original.jsonl"}}

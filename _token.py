@@ -268,7 +268,9 @@ class GlobalPiiTokens:
             or TOKEN_PREFIX in value
         ):
             raise ValueError('PII 值不能匹配内部 token 格式或以 token 前缀开头')
-        async with self._lock:
+        async with (
+            self._lock
+        ):  # 7.7: 原子覆盖 used 快照与 token 写入全程（含 resp_p2t 不还原语义）
             table_p2t = self.resp_p2t if response_side else self.pii_p2t
             table_t2p = self.resp_t2p if response_side else self.pii_t2p
             if value in table_p2t:
@@ -565,7 +567,8 @@ class TokenMixin:
 
         try:
             redacted = _cred_json_walk(obj, _redact_str, path='$')
-            return _jdumps(redacted)
+            out = _jdumps(redacted)
+            return _validate_json_roundtrip(text, out, 'cred_redact_json_aware')
         except Exception:
             logger.debug('_redact_json_aware 回退到纯文本路径', exc_info=True)
             return self._redact(text, pwd_to_token)
@@ -636,7 +639,8 @@ class TokenMixin:
 
         try:
             restored = _cred_json_walk(obj, _restore_str, path='$')
-            return _jdumps(restored)
+            out = _jdumps(restored)
+            return _validate_json_roundtrip(text, out, 'cred_restore_json_aware')
         except Exception:
             logger.debug('_restore_json_aware 回退到纯文本路径', exc_info=True)
             return self._restore(text, token_to_pwd)
