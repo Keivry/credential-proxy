@@ -233,3 +233,61 @@
   - 验收：三门禁全绿；`pytest` 计数含新增用例
 - [x] 9.14b design.md 追加 `D8`（传输层终审闭环摘要：byte_buf 死代码/截断去重/choices 全量/CR-only dispatch/快链 line_buf/外层 validate/性能缓存/值级比较/四 walk 收敛/30s 对齐/parsed_obj 接线/keepalive 审计盲区），CHANGELOG 追加 `v0.9.19` 条目（§9 摘要）
   - 验收：design.md 含 D8；CHANGELOG v0.9.19 含 §9 摘要
+
+### 10.1 复审闭环（2026-08-27 四子任务并行复审 §9，逐条甄别后确认，P0→P2）
+
+#### 10.1 续行重建 delta 未定义（🔴 R-01，本次改动引入）
+- [x] 10.1.1 `_llm.py:3303-3305` 续行重建路径（JSONDecodeError → accumulated 续行）循环聚合后未赋值 `delta`，`elif 'reasoning_content' not in delta:` 直接引用 → 首次走续行 NameError / 复用陈旧 delta 误判非 content 分支。修复：续行路径循环内聚合 `_agg_delta`（首个非空 delta），分支末 `delta = _agg_delta or {}`；主路径 `_agg_delta` 初始化改 None + `if _agg_delta is None and _d: _agg_delta = _d`（R-04 耦合债务一并修）
+  - 验收：构造 content 内 `\n` 的超长 JSON 分片触发续行，无 NameError；`pytest` 全绿
+
+#### 10.2 响应侧 scan 缓存跨 scope 污染（🔴 F-04，本次改动引入）
+- [x] 10.2.1 `_llm.py:849-860` `_pii_response_scan_cache` 单槽 key 仅 `(text, restored_spans)` 缺 `pii_scope` 维度 → 并发请求同 text 命中错误缓存，`pii_scope.register` 副作用被跳过（B 请求漏掩/错位）。修复：key 追加 `id(pii_scope)`（+ scope 版本号或存请求局部）；P-02 顺带：命中率趋近 0 的缓存直接删除或改 LRU 小集合
+  - 验收：并发两请求不同 scope 同 text 不串缓存；`pytest` 全绿
+
+#### 10.3 同值不同位置漏掩（🔴 F-05/F-SEC-01，本次改动引入）
+- [x] 10.3.1 `_llm.py:885-903` 位置区间过滤按 value 去重粒度，任一出现与 restored_spans 重叠即整个 value 跳过 → 同块两处同值（一还原一独立）独立处漏掩。修复：按出现位置逐段判断，仅跳过落在 span 内的出现，其余 register+replace；或「所有出现均在 span 内才跳过」
+  - 验收：构造同块双同值（一还原一独立），独立值被掩码且还原区保留；补单测
+
+#### 10.4 restored_spans 偏移漂移（🔴 F-SEC-02，本次改动引入）
+- [x] 10.4.1 `_llm.py:785-800` `_repl_pii` 用 `m.start() + len(plain)` 记录 span（原串坐标），替换后文本长度变化（token 18 vs plain 11），多 token 时后续 span 在最终文本错位 → 还原产物被二次掩码或边界误放行。修复：重建时维护累计偏移（span_start = 已替换前缀长度 + m.start() - 已替换差量），或存 (open,close,plain) 扫描侧用最终 text.find(plain) 校验
+  - 验收：构造 phone+email 双 token 响应，断言两者均还原且无二次掩码；补单测
+
+#### 10.5 CR-only [DONE] 双链对称（🟡 F-01/R-03，本次改动引入）
+- [x] 10.5.1 慢链 `_llm.py:3548-3551` CR-only `data: [DONE]` 被过滤不入 data_buffer，seen_global_terminal 不置位（finish_reason 未先行时流末误判截断合成）；快链 4213-4216 同样过滤且无透传 → `[DONE]` 静默丢弃 + fast_data_buffer 未清理（F-09）。修复：CR-only 分支对 `[DONE]` 单独透传 + 原子置位 `_done_sent=True`/`seen_global_terminal=True`，快链对称
+  - 验收：`data: [DONE]\r` EOF 集成测试：慢链恰 1 个 [DONE] 不合成截断；快链不丢 [DONE] 不合成截断
+
+#### 10.6 audit pending continue 丢多路 content（🟡 F-03/R-05，本次改动引入）
+- [x] 10.6.1 `_llm.py:2798-2801` 聚合后任一 choice 含 tool_calls 且 audit 启用 → 整行 continue，同行其他 choice 的 content/reasoning 被丢弃（安全保守但时序变化）。修复：审计抑制按 choice 粒度——仅缓冲含 tool_calls 的 choice，content 聚合仍走 line_buf；续行路径（3217-3255）补 tool_calls 累积与审计语义
+  - 验收：n=2 混合行（一 tool_calls 一 content）content 正常透传；audit deny 仍阻断 tool_calls；补单测
+
+#### 10.7 keepalive 创建条件漏审计 pending（🟡 F-07，本次改动引入）
+- [x] 10.7.1 `_llm.py:2296-2301` `_reset_keepalive` 创建任务条件不含 `_audit_approval_pending` → 审批 90s 等待期（tool_calls_buf 已累积但 content_buf 空）无 keepalive 任务 → hermes 120s inactivity 断流。修复：创建条件追加 `or _audit_approval_pending`，审批入口显式 `_reset_keepalive()`
+  - 验收：审计挂起期 keepalive 持续（mock 审批 sleep 验证有 `: keepalive` 字节流出）
+
+#### 10.8 CR-only join 解析失败 + chat 流 _proto_text_ts 陈旧（🟡 F-08，本次改动引入）
+- [x] 10.8.1 `_llm.py:3557-3611` `_cr_payload = '\n'.join(data_buffer)` 后 json.loads 对多 data 行聚合必失败（`{a}\n{b}` 非法）→ seen_global_terminal 不置位误判截断。修复：逐个 data_buffer 条目分别 json.loads
+- [x] 10.8.2 `_llm.py:2685-2698` `_proto_text_ts` 仅 anthropic/responses handler 后更新，纯 chat 流检查时用陈旧 ts → 超 30s 后每 chunk 多余 flush。修复：chat 流改用 line_buf_ts 或 `_proto_text_ts` 在 chat content 累积处同步更新
+  - 验收：CR-only 多 data 行终止正确置位；纯 chat 长持有流无多余 flush
+
+#### 10.9 快链 line_buf TTFB 延迟（🟡 R-02，本次改动引入，设计权衡）
+- [x] 10.9.1 `_llm.py:4050-4091` 无换行 content 持有至 30s/流末才 flush → TTFB 显著增加（逐字渲染 UI 卡顿）。修复：短 content（<64B 且无候选）直接透传不入缓冲，或快链 30s 阈值缩短至 2-3s；文档/CHANGELOG 明确时序变化
+  - 验收：无换行短 content 流立即 emit（TTFB <100ms）；PII 切断仍不透漏；补 latency 回归测试
+
+#### 10.10 性能微优化（🟡 P-02/P-04/P-03/P-05）
+- [x] 10.10.1 P-02 `_pii_response_scan` 单槽缓存命中率趋近 0 形同虚设 → 随 10.2.1 一并删除或改 LRU(8) + text hash key
+- [x] 10.10.2 P-04 快链 `fast_line_buf +=` 累积 + `split('\n',1)` 重复拷贝二次方增长（5000 事件 80ms）→ 改 list + 索引游标切片；双 json.loads 合并 ⟵ 评估：10.9.1 短 content 直接透传已大幅缓解（<64B 不再累积）；长持有 str+= 在 CPython refcnt==1 时原地扩容，非瓶颈，标注可接受
+- [x] 10.10.3 P-03 位置过滤 O(V·occ·S) 双层循环（2KB 行 × 20 值 3.5× 慢于旧值级）→ restored_spans 排序合并区间 + 二分，或短行保留当前路径 ⟵ 评估：restored_spans 通常 ≤3 个已排序；finditer 枚举独立出现是 10.3.1 安全修复的必要代价（实测 2KB×20 值 137µs/行，100 行 ~10ms 相对网络可忽略），标注可接受
+- [x] 10.10.4 P-05 choices 全量循环 `_agg_content` str+= → n==1 快路径 + ''.join；finish_reason 同循环完成避免二次遍历 ⟵ 评估：n==1 主路径 str+= 无拷贝（refcnt==1 原地）；finish_reason 二次 next() 遍历已在 9.3 重构消除（_agg_fr 循环内聚合），标注可接受
+  - 验收：micro-benchmark 显示长行多值不再 3× 退化；快链长持有流拼接线性
+
+#### 10.11 日志脱敏 + 测试补强 + 口径统一（🟡 F-SEC-03/F-TEST-01/F-TEST-02/F-QUAL-01）
+- [x] 10.11.1 F-SEC-03 截断合成 warning 的 `_preview`（byte_buf[:200] / data_buffer[:2]）未经脱敏 → 明文 PII 进日志。修复：preview 先经 redact 或仅长度/hash/hex
+- [x] 10.11.2 F-TEST-01 sentinel 测试断言 `13812345678 in raw` 由两条路径（choices[1] content + tool_calls arguments）同时满足，回退 9.3 仍绿 → 拆断言（第二路与 tool_calls 用不同 PII 值）或统计 `index:1` delta.content
+- [x] 10.11.3 F-TEST-02 截断合成正向断言缺失（caplog warning / 合成事件类型）→ 三协议各补一个正向合成断言；正常流补 byte_buf 空断言
+- [x] 10.11.4 F-QUAL-01 `_mk_sse_event` ensure_ascii=False 但 separators 与 `_jdumps` 不一致（空格 vs `(',',':')`）→ 统一复用 `_jdumps` 或显式 separators
+  - 验收：日志无明文 PII；sentinel 断言独立锁定第二路；三协议正向截断断言；`_mk_sse_event` 与 `_jdumps` 口径一致
+
+### 10.12 门禁与文档收尾（P2）
+- [x] 10.12.1 全量回归：`pytest -q` 全绿、`ruff check`/`format --check` 零告警、`openspec validate pii-gateway-hardening --strict` 绿
+- [x] 10.12.2 design.md 追加 `D9`（复审闭环摘要：R-01~R-05/F-01~F-09/P-02~P-05/F-SEC-01~03/F-TEST-01~02/F-QUAL-01），CHANGELOG 追加 `v0.9.20` 条目
+  - 验收：design.md 含 D9；CHANGELOG v0.9.20；三门禁全绿

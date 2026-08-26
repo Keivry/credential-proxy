@@ -710,3 +710,46 @@ class TestNestedToolArgsSpecialChars:
         zh = _json.dumps({'c': '\u4e2d\u6587'}, ensure_ascii=False)
         out2 = cp._restore_json_aware(zh, {})
         assert _json.loads(out2)['c'] == '中文'
+
+    @pytest.mark.asyncio
+    async def test_same_plain_two_spots_one_restored_one_independent(self, proxy):
+        """10.3.1 (F-05/F-SEC-01): 同块两处同值——一处还原产物一处独立输出，
+        独立处必须仍掩码（位置感知替换，value 级去重曾漏掩）。"""
+        scope = proxy._pii_request_scope()
+        body = '我的电话是 13800138000'
+        await proxy.pii_redact(body)
+        token = next(iter(scope.pii_t2p))
+        plain = scope.pii_t2p[token]
+
+        # 同块：回显占位符（→还原） + 模型独立输出同号（→应掩码）
+        echo_and_independent = f'回显 {token} 独立 13800138000'
+        out = await proxy._pii_response_process(echo_and_independent, {})
+        # 还原区保留明文
+        assert plain in out
+        # 独立输出处被掩码（出现新响应期 token）
+        assert out.count(plain) == 1
+        assert '__PII_' in out
+        proxy._pii_cleanup()
+
+    @pytest.mark.asyncio
+    async def test_multi_token_restore_span_offset_corrected(self, proxy):
+        """10.4.1 (F-SEC-02): 多 token 还原时 span 坐标偏移校正——
+        两个 token 都还原为明文，且均不被二次掩码（原实现第二 span 错位
+        会导致还原区被重掩码）。"""
+        scope = proxy._pii_request_scope()
+        body = '电话 13800138000 邮箱 a@b.com'
+        await proxy.pii_redact(body)
+        # 两个请求期 token
+        toks = list(scope.pii_t2p.keys())
+        assert len(toks) >= 2
+        plain1 = scope.pii_t2p[toks[0]]
+        plain2 = scope.pii_t2p[toks[1]]
+
+        echo = f'回显 {toks[0]} 和 {toks[1]}'
+        out = await proxy._pii_response_process(echo, {})
+        # 两个明文都还原
+        assert plain1 in out
+        assert plain2 in out
+        # 且都没有被二次掩码（span 坐标正确 → 还原区跳过）
+        assert '__PII_' not in out
+        proxy._pii_cleanup()

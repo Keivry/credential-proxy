@@ -151,6 +151,19 @@ async def make_upstream():
             )
             await resp.write_eof()
             return resp
+        elif case == 'cr_only_done':
+            # 10.5.1 (F-01/R-03): CR-only 的 `data: [DONE]` 流末——单独
+            # 透传并置位，不合成截断、不双发 [DONE]
+            await resp.write(
+                (
+                    'data: {"choices":[{"index":0,"delta":{"content":"正常内容'
+                    + tok
+                    + '"}}]}\n\n'
+                ).encode()
+            )
+            await resp.write(b'data: [DONE]\r')
+            await resp.write_eof()
+            return resp
         await resp.write_eof()
         return resp
 
@@ -260,8 +273,12 @@ async def test_integration_responses_real_handler():
 
 
 @pytest.mark.asyncio
-async def test_integration_truncated_synthetic_terminal():
-    """8.7：真实 handler — 上游无终止断流 → 合成终止事件（不空体）。"""
+async def test_integration_truncated_synthetic_terminal(caplog):
+    """8.7：真实 handler — 上游无终止断流 → 合成终止事件（不空体）。
+
+    10.11.3 (F-TEST-02): 补正向断言——caplog 含截断 warning、合成事件
+    类型正确（chat 协议 finish_reason:stop + [DONE] 恰 1 个）。
+    """
     async with env(), ClientSession() as s:
         body = json.dumps({'case': 'truncated_no_terminal'})
         async with s.post(CHAT_BASE, headers=HEADERS, data=body) as r:
@@ -269,8 +286,18 @@ async def test_integration_truncated_synthetic_terminal():
             raw = await r.text()
         # 不空体：至少有一个 data 事件 + 合成的终止
         assert raw.strip()
-        # 中文被 ensure_ascii 转义为 \uXXXX，断言 unicode 转义形态
+        # 中文被 ensure_ascii 转义为 \\uXXXX，断言 unicode 转义形态
         assert '\\u534a\\u622a\\u5185\\u5bb9' in raw or '半截内容' in raw
+        # 10.11.3: 正向合成断言——chat 协议合成 finish_reason:stop 事件
+        # + [DONE] 恰 1 个（去重后）
+        assert 'finish_reason' in raw
+        assert raw.count('data: [DONE]') == 1, f'[DONE] 数量异常: {raw!r}'
+        # caplog 含截断 warning（合成路径触发过告警——「流截断」或
+        # 「未收到终止事件」两个 warning 之一）
+        assert any(
+            '截断' in r.message or 'truncated' in r.message or '终止' in r.message
+            for r in caplog.records
+        ), f'截断 warning 未记录: {[r.message for r in caplog.records]}'
 
 
 @pytest.mark.asyncio
@@ -377,9 +404,16 @@ async def test_sentinel_chat_fixture_choices_n2_and_tool_calls():
         async with s.post(CHAT_BASE, headers=HEADERS, data=body) as r:
             assert r.status == 200
             raw = await r.text()
-        # 9.3: choices n=2 第二路 __PII token 还原为明文（不丢第二路）
-        assert '13812345678' in raw, f'第二路 token 未还原: {raw!r}'
-        # 工具调用 arguments 还原
+        # 10.11.2 (F-TEST-01): 第二路 content 用独立明文「独立第二路」
+        # （与 tool_calls 内嵌 token 解耦）——断言它出现即锁定第二路
+        # content 不被 9.3 聚合/审计 continue 丢弃（原 fixture 第二路与
+        # tool_calls 同 token，tool_calls 路径也能满足断言，回退 9.3 仍绿）
+        assert '独立第二路' in raw, f'第二路 content 丢失: {raw!r}'
+        # 9.3: 第一路 content 正常
+        assert '第一路' in raw
+        # 9.3: 工具调用 arguments 内嵌 token 还原为明文
+        assert '13812345678' in raw, f'tool_calls token 未还原: {raw!r}'
+        # 工具调用存在
         assert 'query_order' in raw
         # 正常流不合成截断：无 TRUNCATED_MESSAGE，[DONE] 恰 1 个
         assert 'TRUNCATED_MESSAGE' not in raw and '被截断' not in raw
@@ -471,3 +505,26 @@ async def test_fast_chain_line_buf_cross_data():
                 await proxy._shared_session.close()
     finally:
         await up_runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_integration_cr_only_done():
+    """10.5.1 (F-01/R-03)：CR-only 的 `data: [DONE]`（无 LF）流末 EOF——
+    单独透传、置位终止，不合成截断、不双发 [DONE]。"""
+
+    async with env(), ClientSession() as s:
+        body = json.dumps(
+            {
+                'case': 'cr_only_done',
+                'messages': [{'role': 'user', 'content': '我的号码是 13800138000'}],
+            }
+        )
+        async with s.post(CHAT_BASE, headers=HEADERS, data=body) as r:
+            assert r.status == 200
+            raw = await r.text()
+        # 内容行已分发 + token 还原
+        assert '正常内容' in raw
+        assert '13800138000' in raw, f'CR-only [DONE] 流 token 未还原: {raw!r}'
+        # 无合成截断（[DONE] 恰 1 个，来自 CR-only 透传）
+        assert 'TRUNCATED_MESSAGE' not in raw and '被截断' not in raw
+        assert raw.count('data: [DONE]') == 1, f'[DONE] 数量异常: {raw!r}'

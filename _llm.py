@@ -332,12 +332,14 @@ def _mk_sse_event(
         delta['content'] = content
     if reasoning_content:
         delta['reasoning_content'] = reasoning_content
-    event = json.dumps(
+    # 10.11.4 (F-QUAL-01): 统一走 _jdumps（ensure_ascii=False +
+    # separators=(',',':')），与共享 json_walk 口径一致（原裸
+    # json.dumps 空格分隔与 _jdumps 输出形态不一致）
+    event = _jdumps(
         {
             'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish_reason}],
             'object': 'chat.completion.chunk',
-        },
-        ensure_ascii=False,
+        }
     )
     return f'data: {event}\n'
 
@@ -781,8 +783,14 @@ class LlmMixin(AuditMixin):
         restored_spans: list = []
         if pii_scope is not None:
             scope = pii_scope
+            # 10.4.1 (F-SEC-02): re.sub 的 m.start() 是原串坐标，替换后
+            # 文本长度变化（token 18 vs plain 11），多 token 时后续 span 若
+            # 沿用原串坐标会在最终文本中错位（还原区被二次掩码/边界误放行）。
+            # 用累计偏移差把原串坐标映射到最终文本坐标。
+            _offset_delta = 0  # 已替换前缀的总长度变化（新 - 旧）
 
             def _repl_pii(m):
+                nonlocal _offset_delta
                 tok = m.group(0)
                 if tok in scope.pii_t2p:
                     start = m.start()
@@ -793,10 +801,13 @@ class LlmMixin(AuditMixin):
                         scope.pii_p2t.move_to_end(plain)
                     except (KeyError, RuntimeError):
                         pass
-                    # 记录还原产物区间（原 token 位置 → 明文）
+                    # 记录还原产物区间（原 token 位置 → 明文），坐标校正到
+                    # 最终文本（替换后）
+                    _final_start = start + _offset_delta
                     restored_spans.append(
-                        (start, start + len(plain), plain),
+                        (_final_start, _final_start + len(plain), plain),
                     )
+                    _offset_delta += len(plain) - len(tok)
                     return plain
                 if tok in scope.resp_t2p:
                     try:
@@ -850,13 +861,25 @@ class LlmMixin(AuditMixin):
         # 组合不重复跑检测（流内重复文本行/重复占位符场景）。spans 含
         # 位置元组，指纹即全量；容量 1（流内几乎每行 text 不同，大容量
         # 只会无界增长，单槽足够覆盖「重复行」热点）。
+        # 10.2.1 (F-04): key 必须含 pii_scope 指纹（id + 注册版本），
+        # 否则并发请求同 text 命中他 scope 的缓存，register 副作用被跳过
+        # （跨会话 PII token 串扰/漏掩）。
+        _scope_fp = (
+            id(pii_scope),
+            getattr(pii_scope, '_seq', 0) if pii_scope is not None else 0,
+        )
         _cache = getattr(self, '_pii_response_scan_cache', None)
-        if _cache is not None and _cache[0] == text and _cache[1] == restored_spans:
-            return _cache[2]
+        if (
+            _cache is not None
+            and _cache[0] == _scope_fp
+            and _cache[1] == text
+            and _cache[2] == restored_spans
+        ):
+            return _cache[3]
         _result = await self._pii_response_scan_uncached(
             text, restored_spans, pii_scope
         )
-        self._pii_response_scan_cache = (text, restored_spans, _result)
+        self._pii_response_scan_cache = (_scope_fp, text, restored_spans, _result)
         return _result
 
     async def _pii_response_scan_uncached(
@@ -882,28 +905,36 @@ class LlmMixin(AuditMixin):
         # 过滤：命中值若完全落在还原产物区间内 → 跳过（9.8 F-08: 位置区间
         # 重叠比较而非值级等价 —— 模型独立输出的同值明文（不同位置）仍掩码，
         # 与 docstring「模型独立输出仍掩码」一致）
+        # 10.3.1 (F-05/F-SEC-01): 按出现位置逐段判定，仅跳过落在 span 内的
+        # 出现；同值多处（一还原一独立）时独立处必须仍掩码——value 级去重
+        # 粒度会让「任一重叠即整值跳过」漏掩独立输出。
         filtered: list[tuple[str, str]] = []
+        _restored_spans = sorted(restored_spans)  # 按 start 排序便于二分
         for typ, value in hits:
             # 找 value 在 text 中的全部出现位置，与还原产物区间比对
-            is_restored = False
+            is_restored_all = True
             _search_from = 0
             while True:
                 _pos = text.find(value, _search_from)
                 if _pos < 0:
                     break
-                for _s, _e, _plain in restored_spans:
+                _overlaps = False
+                for _s, _e, _plain in _restored_spans:
                     # 区间重叠：命中起点落在还原产物 span 内（或其内包含 span）
                     if _pos < _e and _pos + len(value) > _s:
-                        is_restored = True
+                        _overlaps = True
                         break
-                if is_restored:
+                if not _overlaps:
+                    is_restored_all = False
                     break
                 _search_from = _pos + 1
-            if not is_restored:
+            if not is_restored_all:
                 filtered.append((typ, value))
         if not filtered:
             return text
         # 新检测值注册实时请求级映射（响应期）并替换
+        # 10.3.1: 位置感知替换——仅替换不在 span 内的出现，span 内的
+        # 还原产物保留明文（避免二次掩码）
         seen: set[str] = set()
         items = []
         for typ, value in filtered:
@@ -912,10 +943,30 @@ class LlmMixin(AuditMixin):
             seen.add(value)
             items.append((len(value), typ, value))
         items.sort(key=lambda x: x[0], reverse=True)
+        # 构建替换区间：对每个 value 找出不在 span 内的出现
+        _repl_ranges: list[tuple[int, int, str, str]] = []
         for _, typ, value in items:
             token = await pii_scope.register(value, response_side=True)
-            if token != value:
-                text = text.replace(value, token)
+            if token == value:
+                continue
+            _search_from = 0
+            while True:
+                _pos = text.find(value, _search_from)
+                if _pos < 0:
+                    break
+                _in_span = any(
+                    _pos < _e and _pos + len(value) > _s
+                    for _s, _e, _plain in _restored_spans
+                )
+                if not _in_span:
+                    _repl_ranges.append((_pos, _pos + len(value), value, token))
+                _search_from = _pos + 1
+        if not _repl_ranges:
+            return text
+        # 按位置倒序替换，避免偏移漂移
+        _repl_ranges.sort(key=lambda x: x[0], reverse=True)
+        for _start, _end, _val, _tok in _repl_ranges:
+            text = text[:_start] + _tok + text[_end:]
         return text
 
     def _pii_active(self) -> bool:
@@ -999,6 +1050,28 @@ class LlmMixin(AuditMixin):
             'event': evt,
         }
         self._audit_approval_pending[req_id] = entry
+        # 10.7.1 (F-07): 审批挂起期即使无任何 SSE 输出也要保活——
+        # tool_calls 审批窗口（缓冲区空、_tracked_write 不触发）若无
+        # keepalive 任务，hermes inactivity 120s 会判定断流。这里直接
+        # 启动独立保活协程（读 _audit_approval_pending，空即退出）。
+        _ka_resp = getattr(self, '_audit_keepalive_resp', None)
+        if _ka_resp is not None and not getattr(self, '_audit_keepalive_task', None):
+
+            async def _audit_ka():
+                try:
+                    while getattr(self, '_audit_approval_pending', None):
+                        await asyncio.sleep(KEEPALIVE_INTERVAL)
+                        if not getattr(self, '_audit_approval_pending', None):
+                            break
+                        try:
+                            await _ka_resp.write(b': keepalive\n\n')
+                            await _ka_resp.drain()
+                        except Exception:
+                            break
+                except asyncio.CancelledError:
+                    pass
+
+            self._audit_keepalive_task = asyncio.create_task(_audit_ka())
         try:
             msg_id = await self._ask(
                 f'⚠️ 工具调用待审批: {name}\n参数摘要: {summary}\n'
@@ -2243,6 +2316,10 @@ class LlmMixin(AuditMixin):
                             ),
                         )
                         await resp.prepare(request)
+                        # 10.7.1 (F-07): 供审批 keepalive 协程使用（见
+                        # _request_audit_approval）；流结束后清理
+                        self._audit_keepalive_resp = resp
+                        self._audit_keepalive_task = None
                         if tail.rstrip('/').endswith(
                             ('chat/completions', 'v1/messages', 'v1/responses')
                         ):
@@ -2298,6 +2375,16 @@ class LlmMixin(AuditMixin):
                                     or reasoning_buf
                                     or arg_buf
                                     or data_buffer
+                                    # 10.7.1 (F-07): 审计审批挂起期（最长 90s
+                                    # Matrix 人工审批）即使缓冲区为空也必须
+                                    # 有 keepalive 任务——否则 tool_calls 审批
+                                    # 窗口（content_buf 空）无 keepalive，
+                                    # hermes inactivity 120s 判定断流
+                                    or getattr(
+                                        self,
+                                        '_audit_approval_pending',
+                                        {},
+                                    )
                                 ):
                                     line_buf_ts = _time.monotonic()
                                     reasoning_buf_ts = _time.monotonic()
@@ -2682,12 +2769,23 @@ class LlmMixin(AuditMixin):
                                                     # ── 9.10 (F-11): 三协议同阈值 ——
                                                     # anthropic/responses 持有超 30s 强制 flush
                                                     # （chat 分支 line_buf_ts 已有此语义）
+                                                    # 10.8.2 (F-08): 仅非 chat 协议检查——
+                                                    # chat 流 _proto_text_ts 不更新（保持初始
+                                                    # 值），若也检查会在超 30s 后每个 chunk
+                                                    # 触发多余 flush（碎片化）
                                                     if (
-                                                        content_buf or reasoning_buf
-                                                    ) and (
-                                                        _time.monotonic()
-                                                        - _proto_text_ts
-                                                        > LINE_BUF_MAX_AGE
+                                                        (
+                                                            is_anthropic_stream
+                                                            or is_responses_stream
+                                                        )
+                                                        and (
+                                                            content_buf or reasoning_buf
+                                                        )
+                                                        and (
+                                                            _time.monotonic()
+                                                            - _proto_text_ts
+                                                            > LINE_BUF_MAX_AGE
+                                                        )
                                                     ):
                                                         await _flush(
                                                             c=content_buf,
@@ -2741,7 +2839,7 @@ class LlmMixin(AuditMixin):
                                                     # 块继续使用聚合后的单一 delta 语义）
                                                     _agg_content = ''
                                                     _agg_reasoning = None
-                                                    _agg_delta = {}
+                                                    _agg_delta = None  # 10.1.1 (R-04): None 哨兵保留首个 delta
                                                     # 审计启用时 tool_calls 行整体进 pending
                                                     # 不输出（原 continue 语义，见下）
                                                     _tool_calls_audit_pending = False
@@ -2794,17 +2892,33 @@ class LlmMixin(AuditMixin):
                                                             and _agg_reasoning is None
                                                         ):
                                                             _agg_reasoning = _ch_rc
+                                                        # 10.1.1 (R-04): 保留首个非空 delta（content-only
+                                                        # 单 choice 流也应拿到原语义的 delta）
+                                                        if (
+                                                            _agg_delta is None
+                                                            and _delta
+                                                        ):
                                                             _agg_delta = _delta
-                                                    # 审计启用且本行含 tool_calls：跳过整行输出
-                                                    # （verdict 后统一放行/丢弃，原 continue 语义）
-                                                    if _tool_calls_audit_pending:
+                                                    # 10.6.1 (F-03/R-05): 审计启用且本行含 tool_calls——
+                                                    # 不再整行 continue（会连带丢弃同 event 其他 choice 的
+                                                    # content/reasoning）。仅当行纯 tool_calls（无 content/
+                                                    # reasoning）时跳过；有 content 的行正常处理，
+                                                    # tool_calls 部分仍由 pending 机制 verdict 后统一放行/丢弃。
+                                                    if (
+                                                        _tool_calls_audit_pending
+                                                        and not _agg_content
+                                                        and _agg_reasoning is None
+                                                    ):
                                                         continue
+                                                    # 注：有 content 的行走 content 分支（只发 content），
+                                                    # tool_calls 已进 pending_events，verdict 后统一放行——
+                                                    # 无需额外抑制透传
                                                     if _seen_any_finish:
                                                         seen_terminal = True
 
                                                         seen_global_terminal = True
                                                     # 供下方原逻辑使用（多路聚合为单路语义）
-                                                    delta = _agg_delta
+                                                    delta = _agg_delta or {}
                                                     finish_reason = (
                                                         next(
                                                             (
@@ -3219,12 +3333,18 @@ class LlmMixin(AuditMixin):
                                                         _agg_c = ''
                                                         _agg_rc = None
                                                         _agg_fr = None
+                                                        _agg_delta = None  # 10.1.1 (R-01): 续行路径补 delta 聚合
                                                         for _ch in choices:
                                                             _d = (
                                                                 _ch.get('delta', {})
                                                                 if isinstance(_ch, dict)
                                                                 else {}
                                                             )
+                                                            if (
+                                                                _agg_delta is None
+                                                                and _d
+                                                            ):
+                                                                _agg_delta = _d
                                                             _c = _d.get('content')
                                                             if _c is not None:
                                                                 _agg_c += _c
@@ -3253,6 +3373,9 @@ class LlmMixin(AuditMixin):
                                                         content = _agg_c
                                                         rc_val = _agg_rc
                                                         finish_reason = _agg_fr
+                                                        # 10.1.1 (R-01): 续行路径曾缺 delta 赋值
+                                                        # （3303 elif 引用 NameError/陈旧值）
+                                                        delta = _agg_delta or {}
                                                         if finish_reason is not None:
                                                             seen_terminal = True
 
@@ -3547,7 +3670,18 @@ class LlmMixin(AuditMixin):
                                         )
                                     elif _cr_line.startswith('data:'):
                                         _pl = _cr_line[5:].removeprefix(' ')
-                                        if _pl.strip() and _pl.strip() != '[DONE]':
+                                        # 10.5.1 (F-01/R-03): CR-only 的
+                                        # `data: [DONE]` 不得过滤丢弃——单独
+                                        # 透传并原子置位（原实现不入 data_buffer
+                                        # 导致 seen_global_terminal 不置位，
+                                        # finish_reason 未先行时流末误判截断
+                                        # 合成；或 _done_sent 未置位被流末补发
+                                        # 双 [DONE]）
+                                        if _pl.strip() == '[DONE]':
+                                            seen_global_terminal = True
+                                            _done_sent = True
+                                            await _tracked_write(b'data: [DONE]\n\n')
+                                        elif _pl.strip():
                                             data_buffer.append(_pl)
                                         # 9.4 (F-04): CR-only 行流末立即 dispatch，
                                         # 不能等流末统一处理 —— 下方截断检测会把
@@ -3568,13 +3702,30 @@ class LlmMixin(AuditMixin):
                                                 # 绕过主循环 JSON 解析，finish_reason
                                                 # 不会被 _seen_any_finish 捕获）
                                                 else:
-                                                    _cr_payload_plain = (
-                                                        _cr_payload.strip()
-                                                    )
-                                                    try:
-                                                        _cr_parsed = json.loads(
-                                                            _cr_payload_plain
+                                                    # 10.8.1 (F-08): join 后一次
+                                                    # json.loads 对多 data 行（WHATWG
+                                                    # 同事件多行 `{a}\n{b}`）必失败 →
+                                                    # 逐个条目分别解析判断终止，任一
+                                                    # 含 finish_reason/终止类型即置位
+                                                    # （data_buffer 已 clear，用
+                                                    # _cr_payload 按行切回条目）
+                                                    _cr_term_found = False
+                                                    for _cr_entry in _cr_payload.split(
+                                                        '\n'
+                                                    ):
+                                                        _cr_entry_plain = (
+                                                            _cr_entry.strip()
                                                         )
+                                                        if not _cr_entry_plain:
+                                                            continue
+                                                        try:
+                                                            _cr_parsed = json.loads(
+                                                                _cr_entry_plain
+                                                            )
+                                                        except Exception:  # noqa: S112 - 非 JSON 条目跳过是设计
+                                                            # 单个 data 条目非 JSON 跳过，
+                                                            # 其余条目继续判断终止
+                                                            continue
                                                         _cr_choices = (
                                                             _cr_parsed.get(
                                                                 'choices', []
@@ -3606,9 +3757,10 @@ class LlmMixin(AuditMixin):
                                                             else False
                                                         )
                                                         if _cr_fr or _cr_term:
-                                                            seen_global_terminal = True
-                                                    except Exception:
-                                                        pass
+                                                            _cr_term_found = True
+                                                            break
+                                                    if _cr_term_found:
+                                                        seen_global_terminal = True
                                                 # _pii_process_sse_line 接收完整 SSE 行
                                                 # （含 data: 前缀），返回完整行
                                                 _cr_out = (
@@ -3711,15 +3863,31 @@ class LlmMixin(AuditMixin):
                             # 过敏感，9.1 修复前 byte_buf 恒残留致正常流误报）
                             if byte_buf or data_buffer:
                                 _truncated = True
-                                _preview = (
-                                    byte_buf[:200].decode('utf-8', errors='replace')
-                                    if byte_buf
-                                    else (
+                                # 10.11.1 (F-SEC-03): preview 必须脱敏——
+                                # byte_buf/data_buffer 残留可能含明文手机号/
+                                # 邮箱/工具参数，直写日志形成 PII 泄漏路径。
+                                # 剥离 PII 候选形态（__PII_/__VG_ 前缀、残缺
+                                # 片段）+ 限制长度，保留排障信息
+                                if byte_buf:
+                                    _preview_raw = byte_buf[:200].decode(
+                                        'utf-8', errors='replace'
+                                    )
+                                    # 10.11.1: 双重脱敏——先剥离 token 残缺
+                                    # 形态，再过 redact_summary（手机号/邮箱等
+                                    # 明文 PII → ***）
+                                    _preview = _strip_partials(_preview_raw)
+                                    _preview = redact_summary(_preview)
+                                    if not _preview:
+                                        _preview = (
+                                            f'len={len(byte_buf)} '
+                                            f'hex_head={bytes(byte_buf[:16]).hex()}'
+                                        )
+                                else:
+                                    _preview = redact_summary(
                                         'data_buffer=' + str(data_buffer[:2])
                                         if data_buffer
                                         else ''
                                     )
-                                )
                                 logger.warning(
                                     'LLM 流截断: bytes_buf_len=%d data_buffer=%d content_buf=%d reasoning_buf=%d arg_buf=%d sse_events=%d bytes_written=%d req_id=%s tail=%s preview=%r',
                                     len(byte_buf),
@@ -3888,6 +4056,16 @@ class LlmMixin(AuditMixin):
                                     bytes_written,
                                     tail,
                                 )
+                            # 10.7.1 (F-07): 流结束清理审批 keepalive
+                            # 资源（响应对象 + 任务），防跨请求残留
+                            self._audit_keepalive_resp = None
+                            _akt = self._audit_keepalive_task
+                            self._audit_keepalive_task = None
+                            if _akt is not None:
+                                try:
+                                    _akt.cancel()
+                                except Exception:
+                                    pass
                             if _debug_save_eligible:
                                 try:
                                     _save_debug_json(
@@ -4048,47 +4226,71 @@ class LlmMixin(AuditMixin):
                                     except Exception:
                                         _fast_text = ''
                                     if _fast_text:
-                                        fast_line_buf += _fast_text
-                                        fast_line_buf_ts = _time.monotonic()
-                                        # 有 \n 按行 flush，无则持有（除非超长）
-                                        _out_c = []
-                                        while '\n' in fast_line_buf:
-                                            _seg, fast_line_buf = fast_line_buf.split(
-                                                '\n', 1
-                                            )
-                                            _seg += '\n'
-                                            _rest = await self._pii_response_process(
-                                                _seg, active_t2p
-                                            )
-                                            _safe = _strip_partials(_rest)
-                                            if _safe:
-                                                _out_c.append(_safe)
-                                        if fast_line_buf and (
-                                            len(fast_line_buf) > LINE_BUF_FLUSH
-                                            or _time.monotonic() - fast_line_buf_ts
-                                            > LINE_BUF_MAX_AGE
-                                            or _has_partial_pii_candidate(
-                                                fast_line_buf[-64:]
+                                        # 10.9.1 (R-02): 快链 TTFB 优化——
+                                        # 无历史持有且短 content（<64B）且无
+                                        # PII 候选时直接透传（不入 line_buf），
+                                        # 避免逐字渲染流（无换行）被持有 30s
+                                        if (
+                                            not fast_line_buf
+                                            and len(_fast_text) < 64
+                                            and not _has_partial_pii_candidate(
+                                                _fast_text[-64:]
                                             )
                                         ):
                                             _rest = await self._pii_response_process(
-                                                fast_line_buf, active_t2p
+                                                _fast_text, active_t2p
                                             )
-                                            _safe, _pend = _split_safe_hold(
-                                                _rest,
-                                                active_t2p,
-                                                self._pii_scope_or_none(),
-                                            )
+                                            _safe = _strip_partials(_rest)
                                             if _safe:
-                                                _safe = _strip_partials(_safe)
-                                                _out_c.append(_safe)
-                                            fast_line_buf = _pend
-                                            fast_line_buf_ts = _time.monotonic()
-                                        if _out_c:
-                                            _restored_payload = ''.join(_out_c)
+                                                _restored_payload = _safe
+                                            else:
+                                                return
                                         else:
-                                            # 无完整行可发：跳过本次 emit（行内持有）
-                                            return
+                                            fast_line_buf += _fast_text
+                                            fast_line_buf_ts = _time.monotonic()
+                                            # 有 \n 按行 flush，无则持有（除非超长）
+                                            _out_c = []
+                                            while '\n' in fast_line_buf:
+                                                _seg, fast_line_buf = (
+                                                    fast_line_buf.split('\n', 1)
+                                                )
+                                                _seg += '\n'
+                                                _rest = (
+                                                    await self._pii_response_process(
+                                                        _seg, active_t2p
+                                                    )
+                                                )
+                                                _safe = _strip_partials(_rest)
+                                                if _safe:
+                                                    _out_c.append(_safe)
+                                            if fast_line_buf and (
+                                                len(fast_line_buf) > LINE_BUF_FLUSH
+                                                or _time.monotonic() - fast_line_buf_ts
+                                                > LINE_BUF_MAX_AGE
+                                                or _has_partial_pii_candidate(
+                                                    fast_line_buf[-64:]
+                                                )
+                                            ):
+                                                _rest = (
+                                                    await self._pii_response_process(
+                                                        fast_line_buf, active_t2p
+                                                    )
+                                                )
+                                                _safe, _pend = _split_safe_hold(
+                                                    _rest,
+                                                    active_t2p,
+                                                    self._pii_scope_or_none(),
+                                                )
+                                                if _safe:
+                                                    _safe = _strip_partials(_safe)
+                                                    _out_c.append(_safe)
+                                                fast_line_buf = _pend
+                                                fast_line_buf_ts = _time.monotonic()
+                                            if _out_c:
+                                                _restored_payload = ''.join(_out_c)
+                                            else:
+                                                # 无完整行可发：跳过本次 emit（行内持有）
+                                                return
                                     else:
                                         if hasattr(
                                             self, '_pii_response_process_json_aware'
@@ -4212,7 +4414,16 @@ class LlmMixin(AuditMixin):
                                 fast_pending_cr = False
                                 if _cr_line.startswith('data:'):
                                     _pl = _cr_line[5:].removeprefix(' ')
-                                    if _pl.strip() and _pl.strip() != '[DONE]':
+                                    # 10.5.1 (F-01/R-03): 快链 CR-only
+                                    # `data: [DONE]` 不得静默丢弃——单独透传
+                                    # 并置位（原实现过滤后既不入 buffer 也
+                                    # 不透传 → fast_seen_global 保持 False
+                                    # → 流末误判截断合成）
+                                    if _pl.strip() == '[DONE]':
+                                        fast_seen_terminal = True
+                                        fast_seen_global_terminal = True
+                                        await _tracked_write(b'data: [DONE]\n\n')
+                                    elif _pl.strip():
                                         fast_data_buffer.append(_pl)
                             # data_buffer 残留 → dispatch
                             if fast_data_buffer:

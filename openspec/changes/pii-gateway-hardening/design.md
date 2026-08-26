@@ -90,6 +90,21 @@
 - 选用 9.13（F-13/F-15/F-16/F-17/F-18）：文档/测试对齐——tasks 勾选不实标注、sentinel 入测试、集成断言补强（`raw.count('data: [DONE]')==1`/`'truncated' not in raw`）、自模拟用例改造为真实 handler 驱动。备选：保留空心断言 → 回归无法捕获。
 - 选用 9.14：门禁与文档收尾——三门禁 + design D8 + CHANGELOG v0.9.19。
 
+**D9 复审闭环（2026-08-27 四子任务并行复审 §9 后逐条甄别，§10 对应）**
+
+- 选用 10.1（R-01 🔴 本次引入）：续行重建路径（JSONDecodeError → accumulated 续行）聚合循环未赋值 `delta`，`elif 'reasoning_content' not in delta:` 直接引用 → 首次走续行 NameError / 复用陈旧 delta 误判分支。修复：续行路径补 `_agg_delta`（首个非空 delta）+ `delta = _agg_delta or {}`；主路径 `_agg_delta` 初始化改 None 哨兵（R-04 耦合债务同修）。备选：保留 → 续行场景崩溃/语义错乱。
+- 选用 10.2（F-04 🔴 本次引入）：`_pii_response_scan_cache` 单槽 key 缺 `pii_scope` 维度，并发请求同 text 命中他 scope 缓存 → register 副作用被跳过（跨会话 PII token 串扰/漏掩）。修复：key 加 `id(pii_scope) + _seq` 指纹。备选：删除缓存 → 每行重 scan。
+- 选用 10.3（F-05/F-SEC-01 🔴 本次引入）：位置区间过滤按 value 级去重，任一出现重叠即整值跳过 → 同块两处同值（一还原一独立）独立处漏掩。修复：按出现位置逐段判定 + 位置感知替换（仅替换不在 span 内的出现）。备选：保留 value 级 → D2 语义违背（PII 泄漏）。
+- 选用 10.4（F-SEC-02 🔴 本次引入）：`_repl_pii` 用原串 `m.start()` 记录 span，替换后长度变化（token 18 vs plain 11）→ 多 token 时后续 span 在最终文本错位（还原区被二次掩码/边界误放行）。修复：`_offset_delta` 累计偏移差把原串坐标映射到最终文本坐标。备选：保留 → 多 token 响应错位。
+- 选用 10.5（F-01/R-03 🟡 本次引入）：CR-only `data: [DONE]` 慢链过滤不入 data_buffer（finish_reason 未先行时流末误判截断合成）、快链静默丢弃 + fast_data_buffer 未清理。修复：双链 `[DONE]` 单独透传 + 原子置位 `_done_sent`/`seen_global_terminal`。备选：保留 → 低频双发/截断误判。
+- 选用 10.6（F-03/R-05 🟡 本次引入）：聚合后任一 choice 含 tool_calls 且 audit 启用 → 整行 continue，同行其他 choice 的 content/reasoning 被丢弃（安全保守但时序变化）。修复：仅纯 tool_calls 行（无 content/reasoning）continue，混合行 content 正常处理。备选：保留整行抑制 → 混合行 content 延迟/丢失。
+- 选用 10.7（F-07 🟡 本次引入）：`_reset_keepalive` 创建任务条件漏 `_audit_approval_pending`，tool_calls 审批窗口（缓冲区空）无 keepalive → hermes 120s 断流。修复：创建条件补 `_audit_approval_pending` + `_request_audit_approval` 独立保活协程（`_audit_keepalive_resp`）。备选：保留 → 审批期断连。
+- 选用 10.8（F-08 🟡 本次引入）：CR-only join 后一次 `json.loads` 对多 data 行必失败 → 终止漏置位误判截断；chat 流 `_proto_text_ts` 不更新，超 30s 后每 chunk 多余 flush。修复：逐条目解析 + 30s 检查限定非 chat 协议。备选：保留 → 截断误判/碎片化。
+- 选用 10.9（R-02 🟡 本次引入，设计权衡）：快链 line_buf 无换行 content 持有至 30s/流末 → TTFB 显著增加（逐字渲染卡顿）。修复：短 content（<64B 且无 PII 候选）直接透传不入缓冲。备选：保留持有 → 首字延迟 30s。
+- 选用 10.10（P-02~P-05 🟢）：单槽缓存 scope 指纹（随 10.2）、str+= 与位置过滤经评估为可接受（n==1 无拷贝、spans ≤3 排序、finditer 是安全修复必要代价）。备选：list join/二分 → 复杂度不抵收益。
+- 选用 10.11（F-SEC-03/F-TEST-01/F-TEST-02/F-QUAL-01 🟡）：截断 warning preview 双重脱敏（`_strip_partials` + `redact_summary`）；sentinel 第二路改独立明文「独立第二路」解耦 tool_calls 断言（mutation 验证锁住）；截断正向断言补 caplog + `finish_reason` + `[DONE]==1`；`_mk_sse_event` 统一 `_jdumps` 口径。备选：保留 → 日志 PII 泄漏/断言空心。
+- 选用 10.12：门禁收尾 + design D9 + CHANGELOG v0.9.20。
+
 ## Risks / Trade-offs
 
 - [Risk] 共享 walk 抽取后 `_token`/`_pii`/`_llm` 三处行为短期不一致 → Mitigation：`json_walk` 单测覆盖 `BOM`/嵌套/深度/非 JSON 早退四象限，`_token`/`_pii` 各保留薄包装做转发；`byte_buf` 与 `hold` 时序在 D3/D4 明确分离
