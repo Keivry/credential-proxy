@@ -12,9 +12,22 @@ RequestScopedTokens 保留为兼容别名（指向 GlobalPiiTokens）。
 import asyncio
 import json as _json
 import logging
+import os as _os
 import re as _re
 import secrets
 from collections import OrderedDict
+
+# ── utils/json_walk 共享导入（design D1，存在则复用）──
+try:
+    from utils.json_walk import json_walk as _shared_json_walk  # type: ignore
+    from utils.json_walk import json_walk_async as _shared_json_walk_async  # type: ignore
+    from utils.json_walk import _jloads as _shared_jloads  # type: ignore
+    from utils.json_walk import _jdumps as _shared_jdumps  # type: ignore
+except ImportError:
+    _shared_json_walk = None  # type: ignore
+    _shared_json_walk_async = None  # type: ignore
+    _shared_jloads = None  # type: ignore
+    _shared_jdumps = None  # type: ignore
 
 logger = logging.getLogger('credential-proxy')
 
@@ -29,12 +42,16 @@ except ImportError:  # pragma: no cover - 回退路径
 
 
 def _jloads(s: str):  # noqa: D103
+    if _shared_jloads is not None:  # type: ignore[truthy-function]
+        return _shared_jloads(s)  # type: ignore
     if _USE_ORJSON:
         return _orjson.loads(s)  # type: ignore
     return _json.loads(s)
 
 
 def _jdumps(obj) -> str:  # noqa: D103
+    if _shared_jdumps is not None:  # type: ignore[truthy-function]
+        return _shared_jdumps(obj)  # type: ignore
     if _USE_ORJSON:
         return _orjson.dumps(obj).decode()  # type: ignore
     return _json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
@@ -83,6 +100,13 @@ PII_TOKEN_PREFIX = '__PII_'
 # PII token 完整形态: __PII_<seq>_<rand8>__（rand8 = 8 位十六进制随机段）
 PII_TOKEN_RE = _re.compile(rb'__PII_\d+_[0-9a-f]{8}__')
 PII_TOKEN_STR_RE = _re.compile(r'__PII_\d+_[0-9a-f]{8}__')
+# 模糊还原分支（PII_FUZZY_RESTORE=1 时大小写不敏感）
+PII_TOKEN_STR_RE_FUZZY = _re.compile(r'__PII_\d+_[0-9a-f]{8}__', _re.IGNORECASE)
+# 宽松形态大小写不敏感（fuzzy 分支审计用）
+PII_TOKEN_LOOSE_RE_FUZZY = _re.compile(r'__PII_\d+_[^_\s]{1,16}__', _re.IGNORECASE)
+
+def _is_pii_fuzzy_restore_enabled() -> bool:
+    return _os.environ.get('PII_FUZZY_RESTORE', '0') == '1'
 # 宽松形态（restore 扫描用）：捕获格式不符/越界 token 以记审计事件
 PII_TOKEN_LOOSE_RE = _re.compile(r'__PII_\d+_[^_\s]{1,16}__')
 # 行尾完整 PII token 形态（流末清理模型幻觉的完整未知 token）
@@ -104,6 +128,8 @@ def _cred_json_walk(obj, redact_func, path: str = '$', _depth: int = 0):
     dict/list），则对内层同走 walk→redact/restore→dumps，失败回退 plain。
     叶子级：仅当 redact 后值变化时做 _jdumps 校验，失败仅回退该叶子。
     """
+    if _shared_json_walk is not None:  # type: ignore[truthy-function]
+        return _shared_json_walk(obj, redact_func, depth_limit=5, path=path, _depth=_depth)  # type: ignore
     if _depth > 5:
         if isinstance(obj, str):
             try:
@@ -201,6 +227,27 @@ class GlobalPiiTokens:
         self._malformed_counts: dict[str, int] = {}
         self._lock = asyncio.Lock()
 
+    def _next_available_index(self, used: set[int] | None = None) -> int:
+        """空洞跳过：收集 pii_t2p+resp_t2p 已用 seq set，取最小空缺。"""
+        if used is None:
+            used = set()
+            _seq_pat = _re.compile(r'__PII_(\d+)_')
+            for _tok in list(self.pii_t2p.keys()) + list(self.resp_t2p.keys()):
+                _m = _seq_pat.search(_tok)
+                if _m:
+                    try:
+                        used.add(int(_m.group(1)))
+                    except ValueError:
+                        continue
+        nxt = 1
+        while nxt in used:
+            nxt += 1
+        return nxt
+
+    def next_available_index(self) -> int:
+        """对外兼容别名（同 _next_available_index）。"""
+        return self._next_available_index()
+
     async def register(self, value: str, response_side: bool = False) -> str:
         """注册 PII 值，返回 token。同值去重复用。响应期值注册到 resp 映射。"""
         if not value:
@@ -224,8 +271,19 @@ class GlobalPiiTokens:
                 if tok in table_t2p:
                     table_t2p.move_to_end(tok)
                 return tok
-            self._seq += 1
-            token = _make_pii_token(self._seq, secrets.token_hex(4))
+            # gap-aware: 收集 pii_t2p+resp_t2p 已用 seq set + batch_tracker 再 while递增
+            used: set[int] = set()
+            _seq_pat = _re.compile(r'__PII_(\d+)_')
+            for _tok in list(self.pii_t2p.keys()) + list(self.resp_t2p.keys()):
+                _m = _seq_pat.search(_tok)
+                if _m:
+                    try:
+                        used.add(int(_m.group(1)))
+                    except ValueError:
+                        continue
+            nxt = self._next_available_index(used)
+            self._seq = max(self._seq, nxt)
+            token = _make_pii_token(nxt, secrets.token_hex(4))
             table_p2t[value] = token
             table_t2p[token] = value
             # LRU 淘汰：仅对当前表（pii/resp 各限 1000，总量≤2000）
@@ -291,7 +349,49 @@ class GlobalPiiTokens:
 
         # 先还原完整形态（pii_t2p / resp_t2p 命中），再对未命中项审计。
         # PII_TOKEN_STR_RE 只覆盖合法形态；格式不符用宽松正则补扫。
-        restored = PII_TOKEN_STR_RE.sub(_repl, text)
+        # PII_FUZZY_RESTORE 分支：精确 vs IGNORECASE
+        if _is_pii_fuzzy_restore_enabled():
+            # fuzzy: 大小写不敏感匹配，命中记审计
+            pii_lower = {k.lower(): (k, v) for k, v in pii_t2p_snapshot.items()}
+            resp_lower = {k.lower(): (k, v) for k, v in resp_t2p_snapshot.items()}
+            def _repl_fuzzy(m: _re.Match) -> str:
+                tok = m.group(0)
+                low = tok.lower()
+                if low in pii_lower:
+                    orig, plain = pii_lower[low]
+                    try:
+                        if orig in self.pii_t2p:
+                            self.pii_t2p.move_to_end(orig)
+                        if plain in self.pii_p2t:
+                            self.pii_p2t.move_to_end(plain)
+                    except (KeyError, RuntimeError):
+                        pass
+                    if tok != orig and self._audit_cb is not None:
+                        # 模糊命中审计（大小写漂移）
+                        try:
+                            cat = 'fuzzy'
+                            cnt = self._malformed_counts.get(cat, 0)
+                            self._malformed_counts[cat] = cnt + 1
+                            if cnt == 0:
+                                self._audit_cb('pii_restore_malformed', {'category': cat, 'token': tok})
+                        except Exception:
+                            pass
+                    return plain
+                if low in resp_lower:
+                    orig, plain_resp = resp_lower[low]
+                    try:
+                        if orig in self.resp_t2p:
+                            self.resp_t2p.move_to_end(orig)
+                        if plain_resp in self.resp_p2t:
+                            self.resp_p2t.move_to_end(plain_resp)
+                    except (KeyError, RuntimeError):
+                        pass
+                    return tok
+                self._audit_malformed(tok)
+                return tok
+            restored = PII_TOKEN_STR_RE_FUZZY.sub(_repl_fuzzy, text)
+        else:
+            restored = PII_TOKEN_STR_RE.sub(_repl, text)
         if self._audit_cb is not None:
             # 用快照二次审计，避免并发期漏判
             try:

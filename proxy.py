@@ -210,11 +210,17 @@ class CredentialProxy(
         from _pii import parse_pii_env_config
 
         pii_cfg = parse_pii_env_config()
+        if pii_cfg['errors']:
+            for e in pii_cfg['errors']:
+                logger.error('PII 配置错误: %s', e)
+            raise SystemExit(f'PII 配置错误: {pii_cfg["errors"][0]}')
         # 先 _init_pii（会无条件重置 pii_enabled=False），再应用配置
         self._init_pii()
         self.pii_enabled = pii_cfg['enabled']
         self.pii_response_side = pii_cfg['response_side']
         self.pii_hold_max = pii_cfg['hold_max']
+        self.pii_fuzzy_restore = pii_cfg.get('fuzzy_restore', False)
+        self.pii_detection_hardening = pii_cfg.get('detection_hardening', False)
 
         audit_cfg = parse_audit_env_config(require_whitelist=True)
         self._audit_startup_errors = audit_cfg['errors']

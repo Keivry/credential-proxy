@@ -28,6 +28,24 @@ logger = logging.getLogger('credential-proxy')
 
 TRUNCATED_MESSAGE = '上游流式响应被截断（未收到终止事件），请重试。'
 
+# ── utils/json_walk 共享导入（design D1，存在则复用）──
+try:
+    from utils.json_walk import json_walk as _shared_json_walk  # type: ignore
+    from utils.json_walk import json_walk_async as _shared_json_walk_async  # type: ignore
+    from utils.json_walk import _jloads as _shared_jloads  # type: ignore
+    from utils.json_walk import _jdumps as _shared_jdumps  # type: ignore
+    from utils.json_walk import _strip_bom as _shared_strip_bom  # type: ignore
+    from utils.json_walk import _validate_json_roundtrip as _shared_validate  # type: ignore
+    _SHARED_WALK_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    _shared_json_walk = None  # type: ignore
+    _shared_json_walk_async = None  # type: ignore
+    _shared_jloads = None  # type: ignore
+    _shared_jdumps = None  # type: ignore
+    _shared_strip_bom = None  # type: ignore
+    _shared_validate = None  # type: ignore
+    _SHARED_WALK_AVAILABLE = False
+
 # ── orjson 加速封装（与 _token/_pii 同口径）──
 try:
     import orjson as _orjson  # type: ignore
@@ -39,12 +57,16 @@ except ImportError:  # pragma: no cover
 
 
 def _jloads(s: str):  # noqa: D103
+    if _shared_jloads is not None:  # type: ignore[truthy-function]
+        return _shared_jloads(s)  # type: ignore
     if _USE_ORJSON:
         return _orjson.loads(s)  # type: ignore
     return json.loads(s)
 
 
 def _jdumps(obj) -> str:  # noqa: D103
+    if _shared_jdumps is not None:  # type: ignore[truthy-function]
+        return _shared_jdumps(obj)  # type: ignore
     if _USE_ORJSON:
         return _orjson.dumps(obj).decode()  # type: ignore
     return json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
@@ -107,8 +129,11 @@ UPSTREAM_TOTAL_TIMEOUT = 600  # 上游总超时 (s)
 UPSTREAM_CONNECT_TIMEOUT = 30  # 上游连接超时 (s)
 MAX_UPSTREAM_RETRIES = 3  # 上游连接重试次数（含首次）
 UPSTREAM_RETRY_BACKOFF = 0.5  # 上游连接重试退避基数 (s)，指数增长
-SSE_CHUNK_SIZE = 4096  # SSE 流式块大小
+SSE_CHUNK_SIZE = 4096  # SSE 分片大小
 SSE_MAX_BUF = 1_048_576  # SSE 缓冲区上限 (1MB)
+LINE_BUF_FLUSH = 16384  # 单逻辑行超长强制阈值 (16KB)
+LINE_BUF_MAX_AGE = 30  # 持有超长阈值 (30s)
+KEEPALIVE_INTERVAL = 10  # 保活间隔 (10s, `: keepalive\\n\\n` comment)
 # 流末清理：匹配 token 前缀/残缺形态（含完整但未还原的幻觉 token）。
 # 真实 token 会被 _restore 先行还原为明文，不会落此正则。
 _PARTIAL_TOKEN_RE = _re.compile(r'__VG_C(?:R(?:E(?:D(?:_?\d*)?)?)?)?_*$')
@@ -296,6 +321,14 @@ def _responses_event(parsed: dict) -> tuple[str, str | None] | None:
         'response.output_text.delta': 'output_text',
         'response.reasoning_text.delta': 'reasoning_text',
         'response.function_call_arguments.delta': 'function_call_arguments',
+        'response.refusal.delta': 'output_text',
+        'response.reasoning_summary_text.delta': 'reasoning_text',
+        'response.reasoning_summary.delta': 'reasoning_text',
+        'response.audio.transcript.delta': 'output_text',
+        'response.code_interpreter_call_code.delta': 'function_call_arguments',
+        'response.shell_call_command.delta': 'function_call_arguments',
+        'response.mcp_call_arguments.delta': 'function_call_arguments',
+        'response.custom_tool_call_input.delta': 'function_call_arguments',
     }
     kind = kind_map.get(evt_type, 'other')
     if evt_type.endswith('.done'):
@@ -304,6 +337,9 @@ def _responses_event(parsed: dict) -> tuple[str, str | None] | None:
         # function_call_arguments.delta 可能跨 item 拼接伪还原
         kind = 'item_done'
     delta_text = parsed.get('delta') if kind not in ('other', 'item_done') else None
+    # audio.delta is audio bytes (not text), ignore -> treat as other
+    if evt_type == 'response.audio.delta':
+        return 'other', None
     if kind not in ('other', 'item_done') and not isinstance(delta_text, str):
         # delta 字段缺失/非字符串 → 当作普通事件透传
         return 'other', None
@@ -1181,6 +1217,18 @@ class LlmMixin(AuditMixin):
         except Exception:
             return await self._pii_response_process(text, active_t2p)
         scope = self._pii_scope_or_none()
+        # ── D1 thin wrapper: 优先复用共享 walk（utils/json_walk）──
+        if _shared_json_walk_async is not None and isinstance(obj, (dict, list)):  # type: ignore[truthy-function]
+            async def _shared_leaf(s: str) -> str:  # type: ignore[no-redef]
+                if scope is None:
+                    return self._restore(s, active_t2p)
+                restored, spans = self._pii_restore(s, active_t2p, scope)
+                return await self._pii_response_scan(restored, spans, scope)
+            try:
+                walked = await _shared_json_walk_async(obj, _shared_leaf, depth_limit=5)  # type: ignore
+                return _jdumps(walked)
+            except Exception:
+                pass
 
         async def _walk(node, path: str = '$', _depth: int = 0):
             if _depth > 5:
@@ -2101,6 +2149,7 @@ class LlmMixin(AuditMixin):
                                 0  # D3：实际写入字节数守门（仅成功 write 计数）
                             )
                             seen_terminal = False  # 是否已收到终止事件（responses: completed/failed/incomplete, chat: [DONE]）
+                            seen_global_terminal = False  # 全局终止，仅全局置位；item_done/block_stop 仅清 arg_buf
 
                             async def _tracked_write(data: bytes):
                                 nonlocal bytes_written
@@ -2308,6 +2357,7 @@ class LlmMixin(AuditMixin):
                                                     rc=reasoning_buf,
                                                 )
                                             seen_terminal = True
+                                            seen_global_terminal = True
                                             await _tracked_write(
                                                 b'data: [DONE]\n',
                                             )
@@ -2388,6 +2438,7 @@ class LlmMixin(AuditMixin):
                                                     'response.incomplete',
                                                 ):
                                                     seen_terminal = True
+                                                    seen_global_terminal = True
                                                 (
                                                     content_buf,
                                                     reasoning_buf,
@@ -2424,6 +2475,7 @@ class LlmMixin(AuditMixin):
                                             if parsed.get('type') == 'message_stop':
                                                 seen_terminal = True
 
+                                                seen_global_terminal = True
                                             choices = parsed.get('choices', [])
                                             choice = choices[0] if choices else {}
                                             delta = choice.get('delta', {})
@@ -2433,6 +2485,7 @@ class LlmMixin(AuditMixin):
                                             if finish_reason is not None:
                                                 seen_terminal = True
 
+                                                seen_global_terminal = True
                                             # ── OpenAI tool_calls 分片累积 ──
                                             # 全程缓冲至审计 verdict 前不 flush
                                             # （design D4：未出 verdict 无 tool call 事件流出）
@@ -2657,6 +2710,7 @@ class LlmMixin(AuditMixin):
                                                         'response.incomplete',
                                                     ):
                                                         seen_terminal = True
+                                                        seen_global_terminal = True
                                                     (
                                                         content_buf,
                                                         reasoning_buf,
@@ -2679,6 +2733,7 @@ class LlmMixin(AuditMixin):
                                                         == 'message_stop'
                                                     ):
                                                         seen_terminal = True
+                                                        seen_global_terminal = True
                                                     (
                                                         content_buf,
                                                         reasoning_buf,
@@ -2695,6 +2750,7 @@ class LlmMixin(AuditMixin):
                                                     continue
                                                 if parsed.get('type') == 'message_stop':
                                                     seen_terminal = True
+                                                    seen_global_terminal = True
                                                 choices = parsed.get(
                                                     'choices',
                                                     [],
@@ -2708,6 +2764,7 @@ class LlmMixin(AuditMixin):
                                                 if finish_reason is not None:
                                                     seen_terminal = True
 
+                                                    seen_global_terminal = True
                                                 # reasoning_content 独立处理
                                                 rc_val = delta.get('reasoning_content')
                                                 if rc_val is not None:
@@ -2977,7 +3034,7 @@ class LlmMixin(AuditMixin):
                                 )
                                 # 丢弃破损残余，不直接转发避免下游 JSONDecodeError
                             if (
-                                not seen_terminal
+                                not seen_global_terminal
                                 and bytes_written > 0
                                 and sse_event_count > 0
                             ):
@@ -3002,6 +3059,7 @@ class LlmMixin(AuditMixin):
                                         _fb = self._build_truncated_event()
                                     await _tracked_write(_fb.encode('utf-8'))
                                     seen_terminal = True
+                                    seen_global_terminal = True
                                 except SSE_CLIENT_GONE:
                                     logger.debug('SSE 截断合成写入失败，客户端已断连')
                                 except Exception:
@@ -3129,6 +3187,9 @@ class LlmMixin(AuditMixin):
                             fast_seen_terminal = (
                                 False  # 是否已收到终止事件（fast 路径）
                             )
+                            fast_seen_global_terminal = (
+                                False  # 全局终止（fast）
+                            )
 
                             async def _tracked_write(data: bytes):
                                 nonlocal fast_bytes_written
@@ -3184,6 +3245,7 @@ class LlmMixin(AuditMixin):
                                                 or '"finish_reason"' in payload
                                             ):
                                                 fast_seen_terminal = True
+                                                fast_seen_global_terminal = True
                                             if _debug_save_eligible:
                                                 try:
                                                     await _debug_append_line(
@@ -3295,7 +3357,7 @@ class LlmMixin(AuditMixin):
                                     _preview,
                                 )
                             if (
-                                not fast_seen_terminal
+                                not fast_seen_global_terminal
                                 and fast_bytes_written > 0
                                 and fast_sse_event_count > 0
                             ):
@@ -3319,6 +3381,7 @@ class LlmMixin(AuditMixin):
                                         _fb = self._build_truncated_event()
                                     await _tracked_write(_fb.encode('utf-8'))
                                     fast_seen_terminal = True
+                                    fast_seen_global_terminal = True
                                 except SSE_CLIENT_GONE:
                                     logger.debug(
                                         'SSE 截断合成写入失败(fast)，客户端已断连'

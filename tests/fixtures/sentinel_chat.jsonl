@@ -1,0 +1,8 @@
+{"kind": "request", "body": {"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "查询 13812345678 的订单"}], "tools": [{"type": "function", "function": {"name": "query_order", "parameters": {"type": "object", "properties": {"phone": {"type": "string"}}}}}], "stream": true}}
+{"kind": "sse", "line": "data: {\"choices\":[{\"delta\":{\"content\":\"订单\"},\"index\":0}]}\n\n"}
+{"kind": "sse", "line": "data: {\"choices\":[{\"delta\":{\"content\":\"查询中\"},\"index\":0}]}\n\n"}
+{"kind": "sse", "line": ": keepalive\n\n"}
+{"kind": "sse", "line": "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"query_order\",\"arguments\":\"{\\\"phone\\\":\\\"__PII_1_ab12cd34__\\\"}\"}}]},\"index\":0}]}\n\n"}
+{"kind": "sse", "line": "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\",\"index\":0}]}\n\n"}
+{"kind": "sse", "line": "data: [DONE]\n\n"}
+{"kind": "audit", "audit": {"line_buf_flush": "newline", "arg_buf_walk": "json_aware_once", "byte_buf_bom": "stripped_once"}}

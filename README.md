@@ -187,11 +187,18 @@ get revoke --name "check-mail"
 | `PII_REDACTION_ENABLED` | 启用 PII 脱敏（请求/响应检测） | `0`（默认关闭） |
 | `PII_RESPONSE_SIDE` | 启用响应侧 PII 检测（还原后新明文掩码） | `1` |
 | `PII_HOLD_MAX` | 流式响应尾部持有上限（字符） | `64` |
+| `PII_FUZZY_RESTORE` | 模糊还原（大小写不敏感，仅 `re.IGNORECASE`，默认精确匹配，不含编辑距离） | `0` |
+| `PII_DETECTION_HARDENING` | 检测侧硬化总闸（`1` 时启用：保留地址精确前缀 `fc:/fd:`/`10.` 等含尾点/冒号+`lower()`+`ip_network` 兜底 / ReDoS `ThreadPool(2)+timeout 0.1s` / 字典 CJK 边界 `(?<![\\w\\u4e00-\\u9fff])` / `@lru_cache(4)`，默认关闭不改变既有行为） | `0` |
+| `PII_VAULT_GAP_AWARE` | 内置稳态下标（非开关，`next_available_index` 空洞跳过，`__PII_<seq>_<rand8>__` 其中 `rand8=secrets.token_hex(4)`） | —（内置） |
 | `AUDIT_MODE` | 输出审计模式：`off`/`block`/`approve` | `off`（默认关闭） |
 | `AUDIT_TIMEOUT` | 审批超时（秒）；**禁止 110-130s**（上游断连竞态窗口） | `90` |
 | `AUDIT_HOLD_MAX_BYTES` | 审批挂起缓冲上限（字节） | `1048576` |
 | `AUDIT_POLICY_FILE` | 审计策略文件（JSON 或极简 YAML） | 空（内置默认策略） |
 | `APPROVAL_WHITELIST` | 审批人 Matrix user id（逗号分隔），`AUDIT_MODE=approve` 必填 | 空 |
+
+> **流式阈值（WHATWG 三层缓冲，硬编码）**：`SSE_MAX_BUF=1MB` / `LINE_BUF_FLUSH=16KB` / `LINE_BUF_MAX_AGE=30s` / `KEEPALIVE_INTERVAL=10s`。`line_buf` 主触发为 `\\n` 行内还原，`16KB/30s` 仅兜底；持有期每 10s 发 SSE 注释 `: keepalive\\n\\n`（`comment` 非 `data:`，不计 `sse_event_count`，真数据 `_tracked_write` 重置计时，30s 持有至少 2 次保活，避免 `hermes inactivity 120s / aiohttp total 600s` 断连）；WHATWG SSE 按 `CRLF/LF/CR` 切行、`:` 注释透传、`retry:` 仅 ASCII 数字、`data:` 冒号后单空格 `U+0020` 剥离。
+
+> **保留地址精确前缀（`PII_DETECTION_HARDENING=1` 时严格）**：`lower()` 后 `startswith` 含尾点/冒号前缀表 `10./127./169.254./192.168./172.16.-172.31./224.-239./240.-255./100.64.-100.127./fc:/fd:/fe80:-febf:/::1/2001:db8:`（`fc`/`fd` 仅冒号形态，裸 `10`/`2001:db8`/`fcfake` 不豁免）。
 
 > **⚠️ 安全警示：PII 脱敏与输出审计默认关闭（fail-open）**
 >
@@ -291,6 +298,7 @@ cd get && make build  # → /tmp/get-credential-linux-amd64
 
 ## 版本历史
 
+- **v0.9.17** — 三层缓冲/keepalive/WHATWG 帧声明：共享 `utils/json_walk.py` 薄包装三处、Vault `next_available_index` 空洞跳过/`rand8=secrets.token_hex(4)`/`__PII_<seq>_<rand8>__`/`PII_FUZZY_RESTORE=0`（`re.IGNORECASE`）、流式 `byte_buf` WHATWG/`line_buf 16KB/30s`/`arg_buf 一次性 walk`/`keepalive 10s`/截断合成 `seen_global_terminal`、检测硬化 `PII_DETECTION_HARDENING=0/1` 总闸（`fc:/fd:` 精确前缀/ReDoS/CJK/`lru_cache(4)`）；新增 3 测试 + `sentinel_{chat,anthropic,responses}.jsonl`（`scripts/sentinel_record.py --check`）
 - **v0.9.14** — 细化 `byte_buf` 残余 `data:` 前缀走 SSE 行级 `json-aware`，避免残余 `plain` 回退破坏
 - **v0.9.12** — 补全剩余流式 JSON-aware 遗漏：快路径 `data:`/`event:` 与 `byte_buf` 残余双路径改走 `json-aware` 且残余清理改用 `_strip_token_forms_json_aware`，修复 `p@ss"quote`/`\u` 在 fast/残余路径的 `Expecting value: line 1 column 1 (char 0)` 闭环
 - **v0.9.11** — 补全增量 JSON-aware 遗漏：`_llm._flush_anthropic_buf/_flush_responses_buf` 与增量 `arg_buf`（`response.function_call_arguments.delta`/`input_json_delta.partial_json`）改走 `_pii_response_process_json_aware`，覆盖完整 `arg_buf` 的 `p@ss"quote`/`\u` 等特殊字符，片段不完整时自动回退 plain，修复 `{"key":"p@ss"quote"}` 未转义导致 `Expecting ',' delimiter` 闭环；继续沿用 `len>1M`/`depth>5` 守卫 + safe/pending 分割

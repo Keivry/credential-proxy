@@ -1,0 +1,8 @@
+{"kind": "request", "body": {"model": "gpt-4o", "input": "查询张三的工号", "stream": true}}
+{"kind": "sse", "line": "data: {\"type\":\"response.output_text.delta\",\"delta\":\"张三\"}\n\n"}
+{"kind": "sse", "line": ": keepalive\n\n"}
+{"kind": "sse", "line": "data: {\"type\":\"response.output_text.delta\",\"delta\":\"的订单\"}\n\n"}
+{"kind": "sse", "line": "data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"name\\\":\\\"张三\\\"}\"}\n\n"}
+{"kind": "sse", "line": "data: {\"type\":\"response.function_call_arguments.done\"}\n\n"}
+{"kind": "sse", "line": "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\"}}\n\n"}
+{"kind": "audit", "audit": {"data_buffer_joined": true, "seen_global_terminal": "response.completed"}}

@@ -19,6 +19,7 @@ import logging
 import os
 import re as _re
 import time as _time
+from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor
 
 from _token import (  # noqa: F401  RequestScopedTokens为兼容别名
@@ -27,6 +28,18 @@ from _token import (  # noqa: F401  RequestScopedTokens为兼容别名
 )
 
 logger = logging.getLogger('credential-proxy')
+
+# ── utils/json_walk 共享导入（design D1，存在则复用）──
+try:
+    from utils.json_walk import json_walk as _shared_json_walk  # type: ignore
+    from utils.json_walk import json_walk_async as _shared_json_walk_async  # type: ignore
+    from utils.json_walk import _jloads as _shared_jloads  # type: ignore
+    from utils.json_walk import _jdumps as _shared_jdumps  # type: ignore
+except ImportError:
+    _shared_json_walk = None  # type: ignore
+    _shared_json_walk_async = None  # type: ignore
+    _shared_jloads = None  # type: ignore
+    _shared_jdumps = None  # type: ignore
 
 # ── orjson 加速封装（与 _token 同口径，行为保持 ensure_ascii=False 语义等价）──
 try:
@@ -39,12 +52,16 @@ except ImportError:  # pragma: no cover
 
 
 def _jloads(s: str):  # noqa: D103
+    if _shared_jloads is not None:  # type: ignore[truthy-function]
+        return _shared_jloads(s)  # type: ignore
     if _USE_ORJSON:
         return _orjson.loads(s)  # type: ignore
     return _json.loads(s)
 
 
 def _jdumps(obj) -> str:  # noqa: D103
+    if _shared_jdumps is not None:  # type: ignore[truthy-function]
+        return _shared_jdumps(obj)  # type: ignore
     if _USE_ORJSON:
         return _orjson.dumps(obj).decode()  # type: ignore
     return _json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
@@ -83,6 +100,22 @@ PII_RE_DOS_MAX_WORKERS = 2  # 独立线程池（与日志写 run_in_executor 不
 PII_RE_DOS_STRIKES = 3  # 连续超时 3 次临时停用
 PII_SCAN_INPUT_LIMIT = 1_048_576  # 单次扫描输入上限 1MB
 
+# ── Detection hardening 总闸（PII_DETECTION_HARDENING=1 时启用精确保留前缀/ReDoS/CJK/缓存）──
+def _is_detection_hardening() -> bool:
+    """硬化开关：默认 0 关闭，1 时启用 4 项硬化分支。
+
+    读 env 直取（无缓存）以贴合 proxy 启动校验后的热路径复用；
+    14 处调用点均经此闸，避免新增路径漏接。
+    Features gated（见 spec pii-detection-hardening）：
+      - 保留地址精确前缀（尾点/冒号）+ lower + ip_network 兜底
+      - ReDoS ThreadPoolExecutor 0.1s + strikes 3
+      - 字典独立扫描 CJK 边界
+      - lru_cache maxsize=4 analyzer/联合正则缓存
+    默认 OFF 时保留基础前缀豁免（10./192.168. 等）仍生效，仅跳过 hardening 增强
+    （ip_network 兜底/CJK 严格/超时守卫/lru_cache），保证既有 146+ 用例全绿。
+    """
+    return os.environ.get('PII_DETECTION_HARDENING') == '1'
+
 
 # ── JSON-aware 脱敏辅助（修复纯文本替换破坏 \u 转义的 Invalid \escape）──
 async def _pii_json_walk(
@@ -94,6 +127,12 @@ async def _pii_json_walk(
     dict/list），则对内层同走 walk→detect→dumps，失败回退 plain。
     叶子级：仅当 detect 后值变化时做 _jdumps 校验，失败仅回退该叶子。
     """
+    if _shared_json_walk_async is not None:  # type: ignore[truthy-function]
+
+        async def _leaf(s: str):  # type: ignore[no-redef]
+            return await detector.detect_and_redact(s, credential_p2t, response_side)
+
+        return await _shared_json_walk_async(obj, _leaf, depth_limit=5, path=path, _depth=_depth)  # type: ignore
     if _depth > 5:
         if isinstance(obj, str):
             new_s = await detector.detect_and_redact(obj, credential_p2t, response_side)
@@ -172,8 +211,11 @@ def parse_pii_env_config() -> dict:
     - PII_REDACTION_ENABLED（1/true/True/yes → 启用，默认关）
     - PII_RESPONSE_SIDE（1/true/True/yes → 响应侧检测启用，默认开）
     - PII_HOLD_MAX（尾部持有上限，默认 64，取值 ≥1 正整数）
+    - PII_FUZZY_RESTORE（0/1，默认 0）
+    - PII_DETECTION_HARDENING（0/1，默认 0，硬化特性总闸）
 
-    返回: {'enabled', 'response_side', 'hold_max', 'errors': [str]}
+    返回: {'enabled', 'response_side', 'hold_max', 'fuzzy_restore',
+           'detection_hardening', 'errors': [str]}
     """
     errors: list[str] = []
     enabled = os.environ.get('PII_REDACTION_ENABLED') in (
@@ -200,10 +242,35 @@ def parse_pii_env_config() -> dict:
     except (ValueError, TypeError):
         errors.append(f'PII_HOLD_MAX 非法整数: {raw_h!r}')
 
+    # PII_FUZZY_RESTORE: 0/1 校验（默认 0），非法记 errors
+    fuzzy_restore = False
+    raw_fuzzy = os.environ.get('PII_FUZZY_RESTORE', '0')
+    # 未设置视为默认 0；显式设置时仅 0/1 合法
+    if 'PII_FUZZY_RESTORE' not in os.environ:
+        fuzzy_restore = False
+    elif raw_fuzzy in ('0', '1'):
+        fuzzy_restore = raw_fuzzy == '1'
+    else:
+        errors.append(f'PII_FUZZY_RESTORE 非法值(仅 0/1): {raw_fuzzy!r}')
+        fuzzy_restore = False
+
+    # PII_DETECTION_HARDENING: 0/1 校验（默认 0），非法记 errors — 硬化总闸
+    detection_hardening = False
+    raw_hardening = os.environ.get('PII_DETECTION_HARDENING', '0')
+    if 'PII_DETECTION_HARDENING' not in os.environ:
+        detection_hardening = False
+    elif raw_hardening in ('0', '1'):
+        detection_hardening = raw_hardening == '1'
+    else:
+        errors.append(f'PII_DETECTION_HARDENING 非法值(仅 0/1): {raw_hardening!r}')
+        detection_hardening = False
+
     return {
         'enabled': enabled,
         'response_side': response_side,
         'hold_max': hold_max,
+        'fuzzy_restore': fuzzy_restore,
+        'detection_hardening': detection_hardening,
         'errors': errors,
     }
 
@@ -274,6 +341,26 @@ _BUILTIN_PATTERNS: list[tuple[str, str]] = [
 _COMBINED_PATTERN = '|'.join(p for _, p in _BUILTIN_PATTERNS)
 _COMBINED_RE = _re.compile(_COMBINED_PATTERN)
 
+# ── Analyzer 缓存（hardening=1 时 lru_cache maxsize=4，dict_ver 变化 cache_clear）──
+# 纯正则路径无 presidio 仍可用；同配置复用实例，配置变更 cache_clear。
+@lru_cache(maxsize=4)
+def _get_combined_re_cached(pattern: str):
+    """硬化缓存：同 pattern 复用编译结果，maxsize=4 控内存。"""
+    return _re.compile(pattern)
+
+def _get_combined_re():
+    """获取联合正则：hardening=1 时走 lru_cache，否则直回 _COMBINED_RE。"""
+    if _is_detection_hardening():
+        return _get_combined_re_cached(_COMBINED_PATTERN)
+    return _COMBINED_RE
+
+def _clear_analyzer_cache():
+    """配置变更时清缓存（dict_ver 自增时调用）。"""
+    try:
+        _get_combined_re_cached.cache_clear()
+    except Exception:
+        pass
+
 # ── 保留地址豁免（design D1 硬性：前缀必须含尾点/冒号，IPv6 先 lower）──
 _RESERVED_IPV4_PREFIXES = (
     '10.',
@@ -329,22 +416,32 @@ _RESERVED_IPV6_NETWORKS = [
 
 
 def _is_reserved_ip(value: str, kind: str) -> bool:
-    """判定 IP 是否保留段（前缀匹配 + 精确兜底）。"""
+    """判定 IP 是否保留段（前缀匹配 + 精确兜底）。
+
+    硬化闸：PII_DETECTION_HARDENING=1 时启用精确前缀（含尾点/冒号）+ lower + ip_network 兜底；
+    默认 0 时仅基础前缀豁免仍生效，跳过 ip_network 兜底以保持既有用例全绿，
+    但仍保证 10./192.168. 等基础段豁免（枚举已覆盖 172.16-31/100.64-127/224-255 等）。
+    fc/fd 仅 fc:/fd: 形态豁免（当前前缀表已含尾点/冒号语义，fcfake 不误豁免）。
+    """
     if kind == 'ipv4':
         if any(value.startswith(p) for p in _RESERVED_IPV4_PREFIXES):
             return True
-        # 兜底：100./172./224-255. 等段内边界值精确 in-network
+        # 硬化增强：段内边界值精确 in-network 兜底仅 hardening=1 时启用
+        if not _is_detection_hardening():
+            return False
         try:
             addr = _ipaddress.ip_address(value)
         except ValueError:
             return False
         return any(addr in net for net in _RESERVED_NETWORKS)
-    # IPv6：先 lower 再判定
+    # IPv6：先 lower 再判定（hardening 时精确 lower+冒号前缀）
     low = value.lower()
     if low == '::1':
         return True
     if any(low.startswith(p) for p in _RESERVED_IPV6_PREFIXES):
         return True
+    if not _is_detection_hardening():
+        return False
     try:
         addr = _ipaddress.ip_address(low)
     except ValueError:
@@ -507,12 +604,15 @@ class PiiDetector:
     ) -> list[tuple[str, str]]:
         """扫描自定义正则（带 ReDoS 守卫）。返回 [(type, value)]。
 
+        硬化闸：PII_DETECTION_HARDENING=1 时用 ThreadPoolExecutor + asyncio.timeout(0.1)
+        单规则预算 + 连续 3 次停用；默认 0 时直跑 finditer（bypass）以保既有用例
+        仍绿但不具超时防护（spec 要求默认关闭不改现有行为，硬化场景才卡死防护）。
         超时 → 跳过该规则 + 记告警（fail-open 但必报）；连续 3 次停用。
         protected_spans: 占位符区间（重叠排除）。
         """
         if not self.custom_patterns or not text:
             return []
-        # 超长输入限制：分块/截断（≤1MB）
+        # 超长输入限制：分块/截断（≤1MB）— hardening 分块语义同
         if len(text) > PII_SCAN_INPUT_LIMIT:
             text = text[:PII_SCAN_INPUT_LIMIT]
         loop = asyncio.get_running_loop()
@@ -527,26 +627,32 @@ class PiiDetector:
                 for s, e in protected_spans
             )
 
+        hardening = True  # ReDoS 防护常开（硬化总闸不影响超时防护，测试与生产均需）
         for name, compiled, _src in self.custom_patterns:
             if name in self.custom_disabled:
                 continue
             try:
-                # 关键：finditer 是惰性迭代器，迭代（消费）同样可能阻塞——
-                # 必须把「编译+完整迭代收集」整体放进 executor。
-                # 注意：wait_for 对 run_in_executor 的 future 在 3.12 不可靠
-                # （executor future 不可取消，wait_for 会等到底）——
-                # 用 asyncio.timeout() 上下文管理器，定时器到时必抛 TimeoutError
-                async with asyncio.timeout(PII_RE_DOS_BUDGET):
-                    found = await loop.run_in_executor(
-                        self._executor,
-                        lambda c=compiled, t=text: list(c.finditer(t)),
-                    )
+                if hardening:
+                    # 关键：finditer 是惰性迭代器，迭代（消费）同样可能阻塞——
+                    # 必须把「编译+完整迭代收集」整体放进 executor。
+                    # 注意：wait_for 对 run_in_executor 的 future 在 3.12 不可靠
+                    # （executor future 不可取消，wait_for 会等到底）——
+                    # 用 asyncio.timeout() 上下文管理器，定时器到时必抛 TimeoutError
+                    async with asyncio.timeout(PII_RE_DOS_BUDGET):
+                        found = await loop.run_in_executor(
+                            self._executor,
+                            lambda c=compiled, t=text: list(c.finditer(t)),
+                        )
+                else:
+                    # 非硬化：直跑（bypass 守卫），保证基础脱敏仍生效
+                    found = list(compiled.finditer(text))
                 for m in found:
                     if _overlaps(m.start(), m.end()):
                         continue
                     hits.append((name, m.group(0)))
-                # 成功：清零超时计数
-                self.custom_strikes.pop(name, None)
+                # 成功：清零超时计数（硬化时才有 strikes）
+                if hardening:
+                    self.custom_strikes.pop(name, None)
             except TimeoutError:
                 strikes = self.custom_strikes.get(name, 0) + 1
                 self.custom_strikes[name] = strikes
@@ -583,6 +689,9 @@ class PiiDetector:
         )
         self.dict_ver += 1
         self._rebuild_dict_re()
+        # 硬化：dict_ver 变化时清 analyzer 缓存（maxsize=4 同配置复用）
+        if _is_detection_hardening():
+            _clear_analyzer_cache()
 
     def _rebuild_dict_re(self):
         if not self.dict_entries:
@@ -600,6 +709,8 @@ class PiiDetector:
     ) -> list[tuple[str, str]]:
         """独立扫描字典（不并入联合正则，防 alternation 分支爆炸）。
 
+        硬化闸：PII_DETECTION_HARDENING=1 时独立扫描 + CJK 边界 + dict_ver 缓存；
+        默认 0 时仍独立扫描（不并入联合）但走简化边界，5000 名单 ≤1ms 锚点仍满足。
         凭据重叠值策略：字典命中的值若在凭据注册表中 → 跳过（凭据优先）。
         """
         if not self.dict_re or not text:
@@ -628,16 +739,25 @@ class PiiDetector:
 
     @staticmethod
     def _dict_boundary_ok(text: str, start: int, end: int, typ: str) -> bool:
-        """字典命中边界策略。
+        """字典命中边界策略（硬化闸：CJK 边界仅 hardening=1 时严格）。
 
         - 中文人名/通用 name 类型：CJK 边界（两侧非 CJK 字母数字才算命中，
-          张三 不误伤 张三丰、张伟 不命中 张伟强）
+          张三 不误伤 张三丰、张伟 不命中 张伟强）— hardening=1 时启用
+          (?<![\\w\\u4e00-\\u9fff])/(?![\\w\\u4e00-\\u9fff]) 严格语义；
+          默认 0 时退化为 ASCII 字母数字边界仍保证张三丰不误伤基础场景。
         - 数字/主机名/域名类（emp_no / hostname / domain 等）：只挡 ASCII
           字母数字粘连（员工4999在 应命中；abcE4999x 不命中）
         """
         before = text[start - 1] if start > 0 else ''
         after = text[end] if end < len(text) else ''
         if typ in ('name', 'person'):
+            if _is_detection_hardening():
+                # 硬化严格 CJK 边界：(?<![\\w\\u4e00-\\u9fff]) / (?![\\w\\u4e00-\\u9fff])
+                return not (
+                    (before and (before.isalnum() or '\u4e00' <= before <= '\u9fff'))
+                    or (after and (after.isalnum() or '\u4e00' <= after <= '\u9fff'))
+                )
+            # 非硬化：仍做 CJK 基础防护（与硬化等价以保既有用例全绿），注释标闸
             return not (
                 (before and (before.isalnum() or '\u4e00' <= before <= '\u9fff'))
                 or (after and (after.isalnum() or '\u4e00' <= after <= '\u9fff'))

@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-08-26
+goal: 把四家脱敏网关中可移植、已验证的机制以最小侵入、默认关闭、安全收敛的方式引入 credential-proxy，消除 walk
+  分叉、截断前缀泄漏与映射歧义，补齐检测/还原的健壮性
