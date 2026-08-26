@@ -392,7 +392,7 @@ _RESERVED_IPV4_PREFIXES = (
 _RESERVED_IPV6_PREFIXES = (
     '::1',
     'fc',
-    'fd',  # fc00::/7 ULA（fc00–fdff）
+    'fd',  # fc00::/7 ULA（fc00–fdff）— 裸前缀仅 coarse 筛选，fcfake 精确排除由 _is_reserved_ip 专项处理
     'fe8',
     'fe9',
     'fea',
@@ -447,7 +447,14 @@ def _is_reserved_ip(value: str, kind: str) -> bool:
     low = value.lower()
     if low == '::1':
         return True
-    if any(low.startswith(p) for p in _RESERVED_IPV6_PREFIXES):
+    # fc/fd 仅 hex 形态豁免（fcfake/fdfake 不豁免）：裸 coarse 后加 hex 校验
+    if low.startswith(('fc', 'fd')):
+        # 取首段直到 ':'，要求全 hex 且长度 2-4（fc/fc00/fd12 等），否则视为 fcfake
+        head = low.split(':', 1)[0]
+        if head and all(c in '0123456789abcdef' for c in head) and 2 <= len(head) <= 4:
+            return True
+        # fcfake 等非 hex 形态不按 fc/fd 豁免，继续走其他前缀/精确校验
+    if any(low.startswith(p) for p in _RESERVED_IPV6_PREFIXES if p not in ('fc', 'fd')):
         return True
     if not _is_detection_hardening():
         return False
