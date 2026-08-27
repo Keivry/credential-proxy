@@ -35,7 +35,7 @@
 
 ### Requirement: 上游与 Token 指标采集
 
-系统 SHALL 按上游 `port` 主键维度采集（`tail/stream` 为事件维度不进主键；非对话如 `/v1/models` 计入 `requests_total` 但 `upstream` 分组归 `other`，共享 `is_chat_tail` 判定 `chat/completions|v1/messages|v1/responses`）：`requests_total{status}`（每条请求计 1，上游重试不计多次（重试次数首版不单独暴露，二期可加 `upstream_retry_total`），计数紧贴替换/转发的同一回调内**单锁批递增且锁内禁 `await`**——先锁外收集 `delta` 再 `async with lock` 批递增同步段 <20µs/拷贝段 100~400µs；口径对照：`pii_detected_total` 按次、`pii_cache_hit/miss` 按值、`cred_hit/miss` 按请求 `out!=in` 计 1，不混用）、`upstream_latency`（`1h` 的 p50/p95 由 `recent_events` 的 `latency_ms` 现场 `sorted` 精确计算并置于独立专用 `ThreadPoolExecutor(max_workers=1, thread_name_prefix="p95-worker")`（或等效隔离的 `asyncio.to_thread` 专用池）独立于 `metrics-writer` 单 worker（防排队），低流量/高 TPS（50 RPS+ 时 1h 永 `≈` 属预期）时标注 `≈` 并返回 `ring_coverage_s/is_precise`（`is_precise=(now-oldest_ts)>=3600 and len>=100`，`len==0` 时 `p95=None`），`24h/7d/30d` 的 p95 由对应 `latency_buckets`（12 桶 `LATENCY_BUCKETS=[10,25,50,100,200,400,800,1500,3000,5000,10000,Inf] ms` 桶中位最差约30.4% @[800,1500)（等比约33%））近似并标注 `≈`）、首字节时间 `ttft`、`bytes_in/out`、空体守门注入次数 `empty_guarded`（流式 `bytes_written==0 && 200` 与非流式 `not resp_text.strip() && 200` 两条路径均 +1；**v0.9.14 起非流式 `_is_invalid_json` 判定的非 JSON 响应亦转 502，该场景单列 `invalid_json_guarded` 不计入 `empty_guarded`**）、token usage（归一 OpenAI/Anthropic/Responses 的 `prompt/completion/total`，有 `usage` 则记无则记 `unknown` 不估算；**当前实现仅透传上游 `usage` 字段无解析逻辑，本 change 需新增提取：非流式 `upstream_resp.read()` 分支从 body JSON 提取，流式从 `stream_options.include_usage` 末块或 `usage` delta 聚合**）与客户端提前断连 `client_gone` + `exception`（统一 `try/finally` + `except (ClientConnectionError, ServerDisconnectedError, TimeoutError, SSE_CLIENT_GONE)` 钩子计 `client_gone` 与对应 `status` 含 `exception` 重试不计多次）；流式与非流式两条响应路径 SHALL 均埋点（非流式 `upstream_resp.read()` 分支也记 `requests_total/latency/bytes`，查询 `SELECT ... WHERE hour>=?` 单条拉全量后内存分组求和避免 N+1）。**流式双路径均埋点**：`_llm.py` handler 内 `is_dialog_tail && (active_t2p || _pii_active() || audit_enabled())` 分流 slow 链（JSON-aware 流式还原）与 fast 链（`active_t2p==0` 且无 PII/审计时整行透传，v0.9.24 起为默认热路径），`requests_total/latency/bytes` SHALL 在 handler 外层统一收集（或 slow+fast 双链结束点均埋），fast 链不得漏计；`sse_events` 按 **SSE 事件块**计（`event:`/`id:` 行与 `data:` 行同块写出，`slow_event_pending`/`fast_event_pending` FIFO 拼装，v0.9.23-25），每 data 事件块计 1，`_build_truncated_event*`/`_fast_truncated` 合成终止事件（v0.9.16 起，流未收终止事件且 `bytes_written>0` 时注入）单列 `truncated_total` 不计入 `sse_events`；JSON-aware 全链路（orjson + 叶子级最小回退，v0.9.10-15）计数按成功/叶子回退/全量回退三态 `json_aware_success_total`/`json_leaf_fallback_total`/`json_full_fallback_total`（废弃旧的 `plain str.replace` 度量口径）。
+系统 SHALL 按上游 `port` 主键维度采集（`tail/stream` 为事件维度不进主键；非对话如 `/v1/models` 计入 `requests_total` 但 `upstream` 分组归 `other`，共享 `is_chat_tail` 判定 `chat/completions|v1/messages|v1/responses`）：`requests_total{status}`（每条请求计 1，上游重试不计多次（重试次数首版不单独暴露，二期可加 `upstream_retry_total`），计数紧贴替换/转发的同一回调内**单锁批递增且锁内禁 `await`**——先锁外收集 `delta` 再 `async with lock` 批递增同步段 <20µs/拷贝段 100~400µs；口径对照：`pii_detected_total` 按次、`pii_cache_hit/miss` 按值、`cred_hit/miss` 按请求 `out!=in` 计 1，不混用）、`upstream_latency`（`1h` 的 p50/p95 由 `recent_events` 的 `latency_ms` 现场 `sorted` 精确计算并置于独立专用 `ThreadPoolExecutor(max_workers=1, thread_name_prefix="p95-worker")`（或等效隔离的 `asyncio.to_thread` 专用池）独立于 `metrics-writer` 单 worker（防排队），低流量/高 TPS（50 RPS+ 时 1h 永 `≈` 属预期）时标注 `≈` 并返回 `ring_coverage_s/is_precise`（`is_precise=(now-oldest_ts)>=3600 and len>=100`，`len==0` 时 `p95=None`），`24h/7d/30d` 的 p95 由对应 `latency_buckets`（12 桶 `LATENCY_BUCKETS=[10,25,50,100,200,400,800,1500,3000,5000,10000,Inf] ms` 桶中位最差约30.4% @[800,1500)（等比约33%））近似并标注 `≈`）、首字节时间 `ttft`、`bytes_in/out`、空体守门注入次数 `empty_guarded`（流式 `bytes_written==0 && 200` 与非流式 `not resp_text.strip() && 200` 两条路径均 +1；**v0.9.14 起非流式 `_is_invalid_json` 判定的非 JSON 响应亦转 502，该场景单列 `invalid_json_guarded` 不计入 `empty_guarded`**）、token usage（归一 OpenAI/Anthropic/Responses 的 `prompt/completion/total` **及缓存命中维度**，有 `usage` 则记无则记 `unknown` 不估算；**当前实现仅透传上游 `usage` 字段无解析逻辑，本 change 需新增提取：非流式 `upstream_resp.read()` 分支从 body JSON 提取，流式从 `stream_options.include_usage` 末块或 `usage` delta 聚合**。**缓存命中 token SHALL 归一进 `tokens JSON`**：统一字段 `{prompt, completion, total, input, output, cached_read, cached_write, unknown}`——`cached_read`（缓存命中，按折扣价计费）映射：OpenAI Chat `usage.prompt_tokens_details.cached_tokens` / Anthropic `usage.cache_read_input_tokens` / Responses `usage.input_tokens_details.cached_tokens`；`cached_write`（缓存写入）仅 Anthropic `usage.cache_creation_input_tokens` 有，OpenAI/Responses 无则 `0` 或缺省；无 usage 或字段缺失时该请求 tokens 记 `unknown` 不估算）与客户端提前断连 `client_gone` + `exception`（统一 `try/finally` + `except (ClientConnectionError, ServerDisconnectedError, TimeoutError, SSE_CLIENT_GONE)` 钩子计 `client_gone` 与对应 `status` 含 `exception` 重试不计多次）；流式与非流式两条响应路径 SHALL 均埋点（非流式 `upstream_resp.read()` 分支也记 `requests_total/latency/bytes`，查询 `SELECT ... WHERE hour>=?` 单条拉全量后内存分组求和避免 N+1）。**流式双路径均埋点**：`_llm.py` handler 内 `is_dialog_tail && (active_t2p || _pii_active() || audit_enabled())` 分流 slow 链（JSON-aware 流式还原）与 fast 链（`active_t2p==0` 且无 PII/审计时整行透传，v0.9.24 起为默认热路径），`requests_total/l... [truncated]
 
 #### Scenario: 上游分流可归因
 
@@ -51,6 +51,26 @@
 
 - **WHEN** 上游流式响应未携带 `usage`（未发 `stream_options.include_usage`）
 - **THEN** 该请求的 tokens 记为 `unknown`，不做本地分词估算，聚合中单独列计数
+
+#### Scenario: 缓存命中 token 可核算
+
+- **WHEN** 上游返回 `usage` 且含缓存命中字段（OpenAI Chat `usage.prompt_tokens_details.cached_tokens` / Anthropic `usage.cache_read_input_tokens` / Responses `usage.input_tokens_details.cached_tokens`）
+- **THEN** 该请求 `tokens JSON` 的 `cached_read` 反映缓存命中 token 数（成本核算关键：缓存命中输入 token 按折扣价计费），Anthropic 的 `cache_creation_input_tokens` 归一进 `cached_write`（写入缓存非命中，成本按写入价计费区别于命中折扣价）；无缓存命中时 `cached_read` 为 `0`；`/_admin/metrics` 与大盘可分别查询输入/输出/缓存命中 token 合计
+
+#### Scenario: normalize_usage 归一口径
+
+- **WHEN** `_metrics.py: normalize_usage(obj, protocol)` 收到三协议 usage（OpenAI `prompt_tokens/completion_tokens/total_tokens`、Anthropic/Responses `input_tokens/output_tokens`，含 `prompt_tokens_details.cached_tokens`/`cache_read_input_tokens`/`input_tokens_details.cached_tokens` 与 Anthropic `cache_creation_input_tokens`）
+- **THEN** 输出统一 8 字段 `{prompt, completion, total, input, output, cached_read, cached_write, unknown}`；`total = obj.get("total_tokens") or obj.get("total") or (input+output)`（Anthropic/Responses 无 `total_tokens`，缺失求和，两值均缺 `unknown`）；`cached_read = (obj.get("prompt_tokens_details") or{}).get("cached_tokens", 0)`（`prompt_tokens_details: null` 时返回 `0` 不抛异常）；OpenAI/Responses 无 `cached_write` 归 `0`
+
+#### Scenario: 流式注入协议限定
+
+- **WHEN** 流式请求需注入 `stream_options: {"include_usage": true}`
+- **THEN** 注入仅限 OpenAI Chat/Responses 且 `is_stream==true`，Anthropic `/v1/messages` 严禁注入（严格 JSON Schema 携带 `stream_options` 即 `400 invalid_request_error: extra field`）；注入用 `setdefault` 不覆盖客户端已设的 `include_usage`；非 JSON 请求体不注入原样透传
+
+#### Scenario: tokens JSON 按 model 分桶
+
+- **WHEN** 同一上游 `port` 内多个不同 `model`（`gpt-4o`/`gpt-4o-mini`）的请求发生
+- **THEN** `tokens JSON` 内部按 model 分桶 `{"gpt-4o": {"prompt":..,"cached_read":..}, "gpt-4o-mini": {...}}`（无 model 记 `unknown_model`），主键仍 `(date, upstream)` 不新增列，`/_admin/metrics` 可按 model 归因成本
 
 #### Scenario: 非流式路径同样计数
 

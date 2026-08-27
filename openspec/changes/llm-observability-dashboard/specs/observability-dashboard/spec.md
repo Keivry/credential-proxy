@@ -6,7 +6,7 @@
 
 ### Requirement: 单 HTML 实时大盘展示
 
-系统 SHALL 提供单一静态 `admin.html`（无构建、内联 CSS、内联 `Chart.js` ~200KB，`Chart is not defined` 时降级为 SVG（`try/catch` 包初始化，不泄露脚本错误，数值/表格始终可见），首访经 `fetch('/_admin/health',{credentials:'include'})` 探测无 `__Host-admin_token` Cookie（`HttpOnly`对`document.cookie`不可见）时展示居中密码输入框 `type=password autocomplete=current-password` 回车提交 `X-Admin-Token` 校验（`fetch('/_admin/health', {headers:{'X-Admin-Token':t}})`），成功由服务端 `Set-Cookie: __Host-admin_token=...; HttpOnly; Secure(由`request.scheme`判定，仅https); SameSite=Strict; Path=/; Max-Age=3600` 写入（`admin.html` 不写 `document.cookie`）并 `history.replaceState` 清可能残留的 `?access_token`，失败 401 抖动，`http` 下 `__Host-` 拒写时仅 `ENV==dev && ALLOW_LOOPBACK_NO_TOKEN==1` 回退为普通 `admin_token`（仍 `HttpOnly`; `https` 时 `Secure`/`http` 时不带 `Secure` 否则仍拒写; `SameSite=Lax`; `Path=/; Max-Age=3600` 仅去 `__Host-` 前缀）并黄条提示 TLS（`ENV==prod` 不回退仍 401））在 `/_admin/` 下访问，首帧展示：总览 KPI 卡（今日请求、脱敏请求占比、PII 命中总数、阻断数、上游 p95 延迟，p95 标注 `1h精确(低流量≈或50 RPS+ 永≈属预期)/24h≈/7d≈/30d≈` 含 `is_precise` + `≈` 语义）、时序趋势（`1h` 细粒度/`24h` 小时粒度/`7d` 小时粒度/`30d` 日粒度，请求/token/延迟，分桶 `LATENCY_BUCKETS=[10,25,50,100,200,400,800,1500,3000,5000,10000,Inf] ms` 支撑 `p95≈` 最差约30.4% @[800,1500)（等比约33%））、类型分布（PII 按 `kind`）、上游分布（按 `port`，所有 `*_887x` 端口均暴露同鉴权 `/_admin`）、最近事件表；所有数值 SHALL 精确（个位/小数一位）且与 `/_admin/metrics` 聚合一致。不主动发 `Content-Security-Policy` 头（交由反代），禁用 `onclick` 改 `addEventListener`（所有字段经`textContent`转义防XSS）。
+系统 SHALL 提供单一静态 `admin.html`（无构建、内联 CSS、内联 `Chart.js` ~200KB，`Chart is not defined` 时降级为 SVG（`try/catch` 包初始化，不泄露脚本错误，数值/表格始终可见），首访经 `fetch('/_admin/health',{credentials:'include'})` 探测无 `__Host-admin_token` Cookie（`HttpOnly`对`document.cookie`不可见）时展示居中密码输入框 `type=password autocomplete=current-password` 回车提交 `X-Admin-Token` 校验（`fetch('/_admin/health', {headers:{'X-Admin-Token':t}})`），成功由服务端 `Set-Cookie: __Host-admin_token=...; HttpOnly; Secure(由`request.scheme`判定，仅https); SameSite=Strict; Path=/; Max-Age=3600` 写入（`admin.html` 不写 `document.cookie`）并 `history.replaceState` 清可能残留的 `?access_token`，失败 401 抖动，`http` 下 `__Host-` 拒写时仅 `ENV==dev && ALLOW_LOOPBACK_NO_TOKEN==1` 回退为普通 `admin_token`（仍 `HttpOnly`; `https` 时 `Secure`/`http` 时不带 `Secure` 否则仍拒写; `SameSite=Lax`; `Path=/; Max-Age=3600` 仅去 `__Host-` 前缀）并黄条提示 TLS（`ENV==prod` 不回退仍 401））在 `/_admin/` 下访问，首帧展示：总览 KPI 卡（今日请求、脱敏请求占比、PII 命中总数、阻断数、上游 p95 延迟，p95 标注 `1h精确(低流量≈或50 RPS+ 永≈属预期)/24h≈/7d≈/30d≈` 含 `is_precise` + `≈` 语义）、时序趋势（`1h` 细粒度/`24h` 小时粒度/`7d` 小时粒度/`30d` 日粒度，请求/token/延迟，分桶 `LATENCY_BUCKETS=[10,25,50,100,200,400,800,1500,3000,5000,10000,Inf] ms` 支撑 `p95≈` 最差约30.4% @[800,1500)（等比约33%））、类型分布（PII 按 `kind`）、上游分布（按 `port`，所有 `*_887x` 端口均暴露同鉴权 `/_admin`）、最近事件表；所有数值 SHALL 精确（个位/小数一位）且与 `/_admin/metrics` 聚合一致。**Token 成本核算展示 SHALL 包含输入/输出/缓存命中三维度**：大盘 SHALL 展示「输入 tokens」「输出 tokens」「缓存命中 tokens（cached_read，成本核算关键，按折扣价计费）」「缓存写入 tokens（cached_write，仅 Anthropic 有值时展示，按写入价计费区别于命中折扣价）」合计与趋势（可切换 `1h|24h|7d|30d`），缓存命中 token 与输入/输出 token 分开展示（成本占比可视化），支持按 `upstream` 查看各上游的 token 成本结构。**Token 成本按 model 归因**：大盘 SHALL 提供按 `model` 的 token 分布（`tokens JSON` 按 model 分桶，无 model 记 `unknown_model`），展示各模型输入/输出/缓存命中 token 合计，支撑成本归因（`gpt-4o` vs `gpt-4o-mini` 单价差 20x）。**usage 缺失告警**：当窗口内 `unknown` 占比 >20% 时大盘 SHALL 显示黄条警告「缓存命中/成本核算失真，n% 请求无 usage」，不做估算补值。不主动发 `Content-Security-Policy` 头（交由反代），禁用 `onclick` 改 `addEventListener`（所有字段经`textContent`转义防XSS）。
 
 #### Scenario: 首帧可见且数值精确
 
@@ -22,6 +22,11 @@
 
 - **WHEN** 切换 `1h | 24h | 7d | 30d` 窗口或按 `kind/upstream/verdict` 过滤
 - **THEN** 图表与事件表联动刷新且请求参数与 `/_admin/metrics` 与 `/_admin/events` 的查询语义一致
+
+#### Scenario: 缓存命中 token 成本展示
+
+- **WHEN** 大盘加载（有 token usage 数据的窗口）
+- **THEN** 首帧可见「输入 tokens / 输出 tokens / 缓存命中 tokens / 缓存写入 tokens（仅 Anthropic 有值时）」四卡（或一卡四值），趋势图含缓存命中 token 序列，且合计与 `/_admin/metrics` 的 `tokens JSON`（`prompt/completion/cached_read/cached_write`）一致；按 `upstream` 过滤后各上游 token 成本结构独立显示；按 `model` 过滤后各模型 token 分桶可见（`unknown_model` 单列）；窗口内 `unknown` 占比 >20% 时显示黄条警告
 
 ### Requirement: 事件 Inspector 与实时流
 
