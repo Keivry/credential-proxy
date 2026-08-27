@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-08-27
+goal: 上游断流时，proxy 不再伪造 finish_reason:stop/[DONE] 掩盖真实截断，避免下游执行残缺 tool_calls
+  或误信不完整输出；responses 路径保留 failed 语义

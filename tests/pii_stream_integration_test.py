@@ -274,26 +274,26 @@ async def test_integration_responses_real_handler():
 
 @pytest.mark.asyncio
 async def test_integration_truncated_synthetic_terminal(caplog):
-    """8.7：真实 handler — 上游无终止断流 → 合成终止事件（不空体）。
+    """8.7：真实 handler — 上游无终止断流 → open-ended（不再伪造成功终止）。
 
-    10.11.3 (F-TEST-02): 补正向断言——caplog 含截断 warning、合成事件
-    类型正确（chat 协议 finish_reason:stop + [DONE] 恰 1 个）。
+    11.2 (TSS-02): 未 complete 文本截断不再合成 finish_reason:stop/[DONE]——
+    流以最后一个已透传 chunk 结束，下游靠 finish_reason is None 走 stub/重试保护。
     """
     async with env(), ClientSession() as s:
         body = json.dumps({'case': 'truncated_no_terminal'})
         async with s.post(CHAT_BASE, headers=HEADERS, data=body) as r:
             assert r.status == 200
             raw = await r.text()
-        # 不空体：至少有一个 data 事件 + 合成的终止
+        # 不空体：至少有一个 data 事件（已透传的 chunk）
         assert raw.strip()
         # 中文被 ensure_ascii 转义为 \\uXXXX，断言 unicode 转义形态
         assert '\\u534a\\u622a\\u5185\\u5bb9' in raw or '半截内容' in raw
-        # 10.11.3: 正向合成断言——chat 协议合成 finish_reason:stop 事件
-        # + [DONE] 恰 1 个（去重后）
-        assert 'finish_reason' in raw
-        assert raw.count('data: [DONE]') == 1, f'[DONE] 数量异常: {raw!r}'
-        # caplog 含截断 warning（合成路径触发过告警——「流截断」或
-        # 「未收到终止事件」两个 warning 之一）
+        # 11.2 (TSS-02): 不再合成 finish_reason:stop / [DONE]
+        assert '"finish_reason":"stop"' not in raw, f'伪造成功终止: {raw!r}'
+        assert 'data: [DONE]' not in raw, f'伪造 [DONE]: {raw!r}'
+        # 不注入截断合成文本
+        assert '被截断' not in raw and 'TRUNCATED_MESSAGE' not in raw
+        # caplog 含截断 warning（「流截断」或「未收到终止事件」两个 warning 之一）
         assert any(
             '截断' in r.message or 'truncated' in r.message or '终止' in r.message
             for r in caplog.records

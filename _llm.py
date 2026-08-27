@@ -4285,7 +4285,11 @@ class LlmMixin(AuditMixin):
                             # content_buf/reasoning_buf/arg_buf 是逻辑行/参数缓冲，
                             # 流末 flush 已处理（3500-3514），残留不代表截断（原条件
                             # 过敏感，9.1 修复前 byte_buf 恒残留致正常流误报）
-                            if byte_buf or data_buffer:
+                            # 11.2 (TSS-01): 已 complete（seen_global_terminal=true）时
+                            # byte_buf/data_buffer 残留（尾部 ping/重复对象）不判截断——
+                            # 终止语义已完整传达，残留无内容价值，静默丢弃（stream_meta
+                            # 记 truncated_mode=silent_discard）
+                            if (byte_buf or data_buffer) and not seen_global_terminal:
                                 _truncated = True
                                 # 10.11.1 (F-SEC-03): preview 必须脱敏——
                                 # byte_buf/data_buffer 残留可能含明文手机号/
@@ -4352,30 +4356,45 @@ class LlmMixin(AuditMixin):
                                     pass
                                 keepalive_task = None
                             if _truncated:
+                                # 11.2 (TSS-02): 未 complete 截断不再伪造成功终止——
+                                # chat/anthropic 路径不合成 finish_reason:stop/message_stop/
+                                # [DONE]（下游 Hermes 靠 finish_reason is None 走 stub 保护或
+                                # EmptyStreamError 重试）；仅 responses 路径保留合成
+                                # response.failed（协议原生失败语义，下游报错重试）
                                 try:
                                     if is_responses_stream:
                                         _fb = self._build_truncated_event_responses()
-                                    elif is_anthropic_stream:
-                                        _fb = self._build_truncated_event_anthropic()
+                                        await _tracked_write(_fb.encode('utf-8'))
+                                        seen_terminal = True
+                                        seen_global_terminal = True
+                                    elif not is_anthropic_stream:
+                                        # chat 协议：不合成成功终止，流以最后一个已透传
+                                        # chunk 结束（open-ended）；tool_calls 残缺参数丢弃
+                                        # （TSS-03 在下方统一处理）
+                                        pass
                                     else:
-                                        _fb = self._build_truncated_event()
-                                    await _tracked_write(_fb.encode('utf-8'))
-                                    # 9.2 (F-02): chat 协议合成后补发 [DONE]（不再由
-                                    # _build_truncated_event 自带，避免与流中已透传的
-                                    # [DONE] 重复；seen_global_terminal 为 False 才走到
-                                    # 此分支，说明流中无 [DONE]，补发恰 1 个）
-                                    if (
-                                        not is_responses_stream
-                                        and not is_anthropic_stream
-                                    ):
-                                        await _tracked_write(b'data: [DONE]\n\n')
-                                        _done_sent = True
-                                    seen_terminal = True
-                                    seen_global_terminal = True
+                                        # anthropic 协议：不合成 message_stop，open-ended
+                                        pass
                                 except SSE_CLIENT_GONE:
                                     logger.debug('SSE 截断合成写入失败，客户端已断连')
                                 except Exception:
                                     logger.exception('SSE 截断合成异常')
+                                # 11.2 (TSS-03): 未 complete 截断且 tool_calls 残留——
+                                # 丢弃未透传的残缺分片（不 flush 到下游），让下游识别
+                                # 工具调用不完整而拒绝执行（Hermes mid-tool-call drop）
+                                if (
+                                    not is_responses_stream
+                                    and not seen_global_terminal
+                                    and tool_calls_pending_events
+                                ):
+                                    tool_calls_pending_events.clear()
+                                    tool_calls_blocked = True
+                                    logger.warning(
+                                        'LLM 截断丢弃残缺 tool_calls 分片: %d 事件 req_id=%s tail=%s',
+                                        len(tool_calls_pending_events),
+                                        req_id,
+                                        tail,
+                                    )
                             # 9.4 补 (F-04): chat 协议 CR-only 流末已置位
                             # seen_global_terminal（finish_reason 终止）但上游
                             # 未发 [DONE] → 补发恰 1 个（OpenAI 流必须 [DONE] 收尾；
@@ -4509,6 +4528,23 @@ class LlmMixin(AuditMixin):
                                             'bytes_buf_len': len(byte_buf),
                                             'seen_terminal': seen_terminal,
                                             'truncated': _truncated,
+                                            # 11.2 (TSS-04): 截断处理模式——
+                                            # silent_discard（已 complete 残留静默丢弃）/
+                                            # open_ended（未 complete 不伪造终止）/
+                                            # synthesized_failed（responses 合成 failed）
+                                            'truncated_mode': (
+                                                'synthesized_failed'
+                                                if _truncated and is_responses_stream
+                                                else 'open_ended'
+                                                if _truncated
+                                                else 'silent_discard'
+                                            ),
+                                            # 11.2 (TSS-03): 残缺 tool_calls 是否被丢弃
+                                            'tool_calls_dropped': (
+                                                tool_calls_blocked
+                                                and _truncated
+                                                and not seen_global_terminal
+                                            ),
                                         },
                                     )
                                 except Exception as exc:
@@ -4971,7 +5007,9 @@ class LlmMixin(AuditMixin):
                                 fast_line_buf = ''
                             # ── fast 截断检测 ──
                             _fast_truncated = False
-                            if byte_buf:
+                            # 11.2 (TSS-01): 已 complete（fast_seen_global_terminal=true）
+                            # 时 byte_buf 残留不判截断——终止语义已完整，静默丢弃
+                            if byte_buf and not fast_seen_global_terminal:
                                 _fast_truncated = True
                                 _preview = byte_buf[:200].decode(
                                     'utf-8', errors='replace'
@@ -5000,22 +5038,21 @@ class LlmMixin(AuditMixin):
                                     )
                                 _fast_truncated = True
                             if _fast_truncated:
+                                # 11.2 (TSS-02): fast 路径与 slow 一致——未 complete 截断
+                                # 不再伪造成功终止：chat/anthropic open-ended，responses 保留 failed
                                 try:
                                     _tail_norm = tail.rstrip('/')
                                     if _tail_norm.endswith('v1/responses'):
                                         _fb = self._build_truncated_event_responses()
+                                        await _tracked_write(_fb.encode('utf-8'))
+                                        fast_seen_terminal = True
+                                        fast_seen_global_terminal = True
                                     elif _tail_norm.endswith('v1/messages'):
-                                        _fb = self._build_truncated_event_anthropic()
+                                        # anthropic：不合成 message_stop，open-ended
+                                        pass
                                     else:
-                                        _fb = self._build_truncated_event()
-                                    await _tracked_write(_fb.encode('utf-8'))
-                                    # 9.2 (F-02): chat 协议合成后补发 [DONE]
-                                    if not _tail_norm.endswith(
-                                        ('v1/responses', 'v1/messages')
-                                    ):
-                                        await _tracked_write(b'data: [DONE]\n\n')
-                                    fast_seen_terminal = True
-                                    fast_seen_global_terminal = True
+                                        # chat：不合成 finish_reason:stop/[DONE]，open-ended
+                                        pass
                                 except SSE_CLIENT_GONE:
                                     logger.debug(
                                         'SSE 截断合成写入失败(fast)，客户端已断连'
@@ -5080,6 +5117,18 @@ class LlmMixin(AuditMixin):
                                             'bytes_buf_len': len(byte_buf),
                                             'seen_terminal': fast_seen_terminal,
                                             'truncated': _fast_truncated,
+                                            # 11.2 (TSS-04): 截断处理模式（fast）——
+                                            # silent_discard / open_ended / synthesized_failed
+                                            'truncated_mode': (
+                                                'synthesized_failed'
+                                                if _fast_truncated
+                                                and tail.rstrip('/').endswith(
+                                                    'v1/responses'
+                                                )
+                                                else 'open_ended'
+                                                if _fast_truncated
+                                                else 'silent_discard'
+                                            ),
                                         },
                                     )
                                 except Exception as exc:
