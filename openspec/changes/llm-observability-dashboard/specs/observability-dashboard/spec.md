@@ -69,3 +69,12 @@
 
 - **WHEN** 对 `/_admin/*` 发送 `POST/PUT/DELETE/PATCH/HEAD/OPTIONS/TRACE`（含无 token 的 `POST`）
 - **THEN** 无 token 时返回 `401`（鉴权优先于 `405`）不触 DB，鉴权通过后非法方法才 `405` + `Allow: GET` 且不产生副作用；`HEAD` 显式 `405` 不自动降级 `GET`
+
+#### Requirement: 过渡逃生开关
+
+- 系统 SHALL 支持 `OBSERVABILITY_DISABLE=1` 环境变量在过渡期显式禁用 `/_admin/*`（`/_admin/*` 全部返回 `404` 不注册路由、`MetricsCollector` 不初始化、`OBSERVABILITY_ADMIN_TOKEN` 不再必填校验）；该开关为二期收紧前过渡逃生口，**生产环境默认不设**（未设时 `OBSERVABILITY_ADMIN_TOKEN` 必填校验仍生效）；`health` 在禁用态返回 `404` 而非 `401`
+
+#### Scenario: 过渡逃生开关
+
+- **WHEN** 设置 `OBSERVABILITY_DISABLE=1` 后启动（未设 `OBSERVABILITY_ADMIN_TOKEN`）
+- **THEN** 进程正常启动（不 `SystemExit`），`/_admin/*` 全部 `404`，`metrics.sqlite` 不创建，转发语义完全不受影响；取消开关后需重新启动并配 Token 才恢复
