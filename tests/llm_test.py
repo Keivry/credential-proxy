@@ -1088,7 +1088,7 @@ class TestResponsesEventHandler:
         # B1 修复后：pending 保留（token 前缀等待后续分片），流末才清理
         assert token[:8] in cb or cb == token[:8]
         # 纯前缀残留无 safe 可输出：只透传 completed
-        assert w.text == completed_line + '\n'
+        assert w.text == completed_line + '\n\n'
         assert token[:8] not in w.text
 
     @pytest.mark.asyncio
@@ -1109,7 +1109,7 @@ class TestResponsesEventHandler:
             '',
             '',
         )
-        assert w.text == line + '\n'
+        assert w.text == line + '\n\n'
         assert 'choices' not in w.text
 
     @pytest.mark.asyncio
@@ -1421,7 +1421,7 @@ class TestAnthropicEventHandler:
         cb, rb, ab = await holder._handle_anthropic_event(
             w, evt, 'data: {"type":"message_start"}', t2p, '', '', ''
         )
-        assert w.text == 'data: {"type":"message_start"}\n'
+        assert w.text == 'data: {"type":"message_start"}\n\n'
         assert (cb, rb, ab) == ('', '', '')
 
     @pytest.mark.asyncio

@@ -341,7 +341,7 @@ def _mk_sse_event(
             'object': 'chat.completion.chunk',
         }
     )
-    return f'data: {event}\n'
+    return f'data: {event}\n\n'
 
 
 def _responses_event(parsed: dict) -> tuple[str, str | None] | None:
@@ -391,13 +391,13 @@ def _mk_responses_sse_event(parsed: dict, delta_text: str) -> str:
     """保持 Responses 事件结构，仅替换 delta 字段（已还原文本）。"""
     out = dict(parsed)
     out['delta'] = delta_text
-    return 'data: ' + json.dumps(out, ensure_ascii=False) + '\n'
+    return 'data: ' + json.dumps(out, ensure_ascii=False) + '\n\n'
 
 
 def _mk_responses_flush_event(event_type: str, delta_text: str) -> str:
     """构造一个 Responses delta 事件（流末/非 delta 事件前 flush 残留用）。"""
     out = {'type': event_type, 'delta': delta_text}
-    return 'data: ' + json.dumps(out, ensure_ascii=False) + '\n'
+    return 'data: ' + json.dumps(out, ensure_ascii=False) + '\n\n'
 
 
 # Anthropic delta 类型 → (字段, 输出时使用的 delta.type)
@@ -465,7 +465,7 @@ def _mk_anthropic_delta_event(parsed: dict, text: str, field: str) -> str:
     out = dict(parsed)
     out['delta'] = dict(parsed['delta'])
     out['delta'][field] = text
-    return 'data: ' + json.dumps(out, ensure_ascii=False) + '\n'
+    return 'data: ' + json.dumps(out, ensure_ascii=False) + '\n\n'
 
 
 def _mk_anthropic_flush_event(parsed: dict, text: str, field: str) -> str:
@@ -476,7 +476,7 @@ def _mk_anthropic_flush_event(parsed: dict, text: str, field: str) -> str:
         'index': parsed.get('index', 0),
         'delta': {'type': delta_type, field: text},
     }
-    return 'data: ' + json.dumps(out, ensure_ascii=False) + '\n'
+    return 'data: ' + json.dumps(out, ensure_ascii=False) + '\n\n'
 
 
 def _strip_token_forms(content: str) -> str:
@@ -1591,9 +1591,9 @@ class LlmMixin(AuditMixin):
         for line in buf:
             try:
                 await write(
-                    (await self._pii_process_sse_line(line, active_t2p) + '\n').encode(
-                        'utf-8'
-                    )
+                    (
+                        await self._pii_process_sse_line(line, active_t2p) + '\n\n'
+                    ).encode('utf-8')
                 )
             except SSE_CLIENT_GONE:
                 logger.debug('SSE 挂起放行写入失败')
@@ -1602,7 +1602,8 @@ class LlmMixin(AuditMixin):
             try:
                 await write(
                     (
-                        await self._pii_process_sse_line(extra_line, active_t2p) + '\n'
+                        await self._pii_process_sse_line(extra_line, active_t2p)
+                        + '\n\n'
                     ).encode('utf-8')
                 )
             except SSE_CLIENT_GONE:
@@ -1643,7 +1644,7 @@ class LlmMixin(AuditMixin):
         event = _anthropic_event(parsed)
         if event is None:  # pragma: no cover — 调用方已保证是 Anthropic 事件
             await write(
-                (await self._pii_process_sse_line(line, active_t2p) + '\n').encode(
+                (await self._pii_process_sse_line(line, active_t2p) + '\n\n').encode(
                     'utf-8'
                 )
             )
@@ -1717,7 +1718,7 @@ class LlmMixin(AuditMixin):
                 arg_buf = ''
             self._last_anthropic_tool_name = None
             await write(
-                (await self._pii_process_sse_line(line, active_t2p) + '\n').encode(
+                (await self._pii_process_sse_line(line, active_t2p) + '\n\n').encode(
                     'utf-8'
                 )
             )
@@ -1728,7 +1729,7 @@ class LlmMixin(AuditMixin):
             if delta_text:
                 self._last_anthropic_tool_name = delta_text
             await write(
-                (await self._pii_process_sse_line(line, active_t2p) + '\n').encode(
+                (await self._pii_process_sse_line(line, active_t2p) + '\n\n').encode(
                     'utf-8'
                 )
             )
@@ -1810,7 +1811,9 @@ class LlmMixin(AuditMixin):
             write, parsed, 'partial_json', arg_buf, active_t2p
         )
         await write(
-            (await self._pii_process_sse_line(line, active_t2p) + '\n').encode('utf-8')
+            (await self._pii_process_sse_line(line, active_t2p) + '\n\n').encode(
+                'utf-8'
+            )
         )
         return content_buf, reasoning_buf, arg_buf
 
@@ -1919,7 +1922,7 @@ class LlmMixin(AuditMixin):
         kind, delta_text = _responses_event(parsed)
         if kind is None:  # pragma: no cover — 调用方已保证是 Responses 事件
             await write(
-                (await self._pii_process_sse_line(line, active_t2p) + '\n').encode(
+                (await self._pii_process_sse_line(line, active_t2p) + '\n\n').encode(
                     'utf-8'
                 )
             )
@@ -1991,7 +1994,7 @@ class LlmMixin(AuditMixin):
                 arg_buf = ''
             self._last_responses_tool_name = None
             await write(
-                (await self._pii_process_sse_line(line, active_t2p) + '\n').encode(
+                (await self._pii_process_sse_line(line, active_t2p) + '\n\n').encode(
                     'utf-8'
                 )
             )
@@ -2075,7 +2078,9 @@ class LlmMixin(AuditMixin):
                 if isinstance(name, str) and name:
                     self._last_responses_tool_name = name
         await write(
-            (await self._pii_process_sse_line(line, active_t2p) + '\n').encode('utf-8')
+            (await self._pii_process_sse_line(line, active_t2p) + '\n\n').encode(
+                'utf-8'
+            )
         )
         return content_buf, reasoning_buf, arg_buf
 
@@ -2620,7 +2625,7 @@ class LlmMixin(AuditMixin):
                                                                             ev,
                                                                             active_t2p,
                                                                         )
-                                                                        + '\n'
+                                                                        + '\n\n'
                                                                     ).encode('utf-8')
                                                                 )
                                                             tool_calls_pending_events.clear()
@@ -2682,7 +2687,7 @@ class LlmMixin(AuditMixin):
                                                     seen_global_terminal = True
                                                     _done_sent = True
                                                     await _tracked_write(
-                                                        b'data: [DONE]\n',
+                                                        b'data: [DONE]\n\n',
                                                     )
                                                     continue
 
@@ -2699,7 +2704,7 @@ class LlmMixin(AuditMixin):
                                                                     active_t2p,
                                                                     parsed_obj=parsed,
                                                                 )
-                                                                + '\n'
+                                                                + '\n\n'
                                                             ).encode('utf-8'),
                                                         )
                                                         continue
@@ -2995,7 +3000,7 @@ class LlmMixin(AuditMixin):
                                                                             ev,
                                                                             active_t2p,
                                                                         )
-                                                                        + '\n'
+                                                                        + '\n\n'
                                                                     ).encode('utf-8')
                                                                 )
                                                             tool_calls_pending_events.clear()
@@ -3218,7 +3223,7 @@ class LlmMixin(AuditMixin):
                                                                     active_t2p,
                                                                     parsed_obj=parsed,
                                                                 )
-                                                                + '\n'
+                                                                + '\n\n'
                                                             ).encode('utf-8'),
                                                         )
 
@@ -3286,7 +3291,7 @@ class LlmMixin(AuditMixin):
                                                                         + sanitized,
                                                                         active_t2p,
                                                                     )
-                                                                    + '\n'
+                                                                    + '\n\n'
                                                                 ).encode('utf-8'),
                                                             )
                                                             continue
@@ -3468,7 +3473,7 @@ class LlmMixin(AuditMixin):
                                                                         + sanitized,
                                                                         active_t2p,
                                                                     )
-                                                                    + '\n'
+                                                                    + '\n\n'
                                                                 ).encode('utf-8'),
                                                             )
                                                     else:
@@ -3490,7 +3495,7 @@ class LlmMixin(AuditMixin):
                                                                         'data: ' + _sub,
                                                                         active_t2p,
                                                                     )
-                                                                    + '\n'
+                                                                    + '\n\n'
                                                                 ).encode('utf-8'),
                                                             )
                                                 except (
@@ -3507,7 +3512,7 @@ class LlmMixin(AuditMixin):
                                                             await self._pii_process_sse_line(
                                                                 line, active_t2p
                                                             )
-                                                            + '\n'
+                                                            + '\n\n'
                                                         ).encode('utf-8'),
                                                     )
                                             continue
@@ -3528,7 +3533,7 @@ class LlmMixin(AuditMixin):
                                                         await self._pii_process_sse_line(
                                                             line, active_t2p
                                                         )
-                                                        + '\n'
+                                                        + '\n\n'
                                                     ).encode('utf-8')
                                                 )
                                                 continue
@@ -3544,7 +3549,7 @@ class LlmMixin(AuditMixin):
                                                         await self._pii_process_sse_line(
                                                             line, active_t2p
                                                         )
-                                                        + '\n'
+                                                        + '\n\n'
                                                     ).encode('utf-8')
                                                 )
                                                 continue
@@ -3560,7 +3565,7 @@ class LlmMixin(AuditMixin):
                                                         await self._pii_process_sse_line(
                                                             line, active_t2p
                                                         )
-                                                        + '\n'
+                                                        + '\n\n'
                                                     ).encode('utf-8')
                                                 )
                                                 continue
@@ -3572,7 +3577,7 @@ class LlmMixin(AuditMixin):
                                                         await self._pii_process_sse_line(
                                                             line, active_t2p
                                                         )
-                                                        + '\n'
+                                                        + '\n\n'
                                                     ).encode('utf-8')
                                                 )
                                                 continue
@@ -3637,7 +3642,7 @@ class LlmMixin(AuditMixin):
                                                     await self._pii_process_sse_line(
                                                         _ev, active_t2p
                                                     )
-                                                    + '\n'
+                                                    + '\n\n'
                                                 ).encode('utf-8')
                                             )
                                         except SSE_CLIENT_GONE:
@@ -3799,7 +3804,7 @@ class LlmMixin(AuditMixin):
                                                     )
                                                 )
                                                 await _tracked_write(
-                                                    (_cr_out + '\n').encode('utf-8')
+                                                    (_cr_out + '\n\n').encode('utf-8')
                                                 )
                                     else:
                                         await _tracked_write(
@@ -3807,7 +3812,7 @@ class LlmMixin(AuditMixin):
                                                 await self._pii_process_sse_line(
                                                     _cr_line, active_t2p
                                                 )
-                                                + '\n'
+                                                + '\n\n'
                                             ).encode('utf-8')
                                         )
 
@@ -4334,7 +4339,7 @@ class LlmMixin(AuditMixin):
                                                 )
                                             )
                                 await _tracked_write(
-                                    ('data: ' + _restored_payload + '\n').encode(
+                                    ('data: ' + _restored_payload + '\n\n').encode(
                                         'utf-8'
                                     ),
                                 )
