@@ -361,7 +361,7 @@ def _fast_rebuild_chunk(parsed: dict, content: str) -> str:
         out = copy.deepcopy(parsed)
         if not isinstance(out, dict):
             return _jdumps(parsed) if isinstance(parsed, dict) else str(parsed)
-        for ch in out.get('choices') or[]:
+        for ch in out.get('choices') or []:
             if not isinstance(ch, dict):
                 continue
             d = ch.get('delta')
@@ -2479,12 +2479,12 @@ class LlmMixin(AuditMixin):
                             # ── 6.2 WHATWG / 6.3 line_buf / 6.5 keepalive 新增变量 ──
                             data_buffer: list[
                                 str
-                            ] =[]  # 同事件多 data: 行聚合（WHATWG）
+                            ] = []  # 同事件多 data: 行聚合（WHATWG）
                             # 10.13 (F-12): slow 链 event:/id: 行暂存 ——
                             # 不得立即透传（会把 SSE 块拆成 event 独块 + data 独块，
                             # openai sdk 按块解析 → 无 data 的块 JSONDecodeError）。
                             # 暂存后拼入 data 行同一块写出。
-                            slow_event_pending: list[str] =[]
+                            slow_event_pending: list[str] = []
                             pending_cr = False  # 上 chunk 末孤立 \r 跨块粘合
                             bom_seen = False  # 流首 BOM 单次剥离
                             line_buf_ts = _time.monotonic()  # 6.3/6.5 行缓冲时间戳
@@ -2953,15 +2953,19 @@ class LlmMixin(AuditMixin):
                                                         # event + data 属于同一块，空行分隔）。
                                                         # 避免 event 独块 + data 独块被下游
                                                         # openai sdk 按块解析时报 JSONDecodeError。
+                                                        # 10.14.1 (API-SPEC FIX): 多条 event
+                                                        # 行累积（跨批/非标准上游）时按 FIFO
+                                                        # 弹第一条配对——join 全部会让 SDK
+                                                        # 取最后 event 名配首个 data 载荷
+                                                        # （错配）；FIFO 保真且不吞数据。
                                                         if slow_event_pending:
                                                             line = (
-                                                                '\n'.join(
-                                                                    slow_event_pending
+                                                                slow_event_pending.pop(
+                                                                    0
                                                                 )
                                                                 + '\n'
                                                                 + line
                                                             )
-                                                            slow_event_pending.clear()
                                                         (
                                                             content_buf,
                                                             reasoning_buf,
@@ -3418,6 +3422,14 @@ class LlmMixin(AuditMixin):
                                                         # 不拼装会把块拆成 event 独块 +
                                                         # data 独块 → SDK JSONDecodeError
                                                         # （responses 分支已有同逻辑）。
+                                                        # 注意：此处 join 全部（SSE 覆盖
+                                                        # 语义——anthropic 分支的
+                                                        # content_block_delta 等事件在
+                                                        # _handle_anthropic_event 内部
+                                                        # 输出 data 行不消费 pending，
+                                                        # pending 里的 event 行是留给
+                                                        # 下一个透传 data 行的；FIFO
+                                                        # 弹旧行会错配）。
                                                         if slow_event_pending:
                                                             line = (
                                                                 '\n'.join(
@@ -3542,8 +3554,8 @@ class LlmMixin(AuditMixin):
                                                                 parsed,
                                                                 (
                                                                     (
-                                                                        '\n'.join(
-                                                                            slow_event_pending
+                                                                        slow_event_pending.pop(
+                                                                            0
                                                                         )
                                                                         + '\n'
                                                                     )
@@ -3557,8 +3569,6 @@ class LlmMixin(AuditMixin):
                                                                 reasoning_buf,
                                                                 arg_buf,
                                                             )
-                                                            if slow_event_pending:
-                                                                slow_event_pending.clear()
                                                             continue
                                                         # ── Anthropic Messages API 事件（续行重建路径）──
                                                         if (
@@ -3594,7 +3604,10 @@ class LlmMixin(AuditMixin):
                                                         ):
                                                             seen_terminal = True
                                                             seen_global_terminal = True
-                                                        if parsed.get('type') == 'error':
+                                                        if (
+                                                            parsed.get('type')
+                                                            == 'error'
+                                                        ):
                                                             # 10.14 (API-SPEC): 同主循环——
                                                             # Anthropic error 事件也是正常终止
                                                             seen_terminal = True
@@ -3935,30 +3948,37 @@ class LlmMixin(AuditMixin):
                             # byte_buf 以 \r 结尾 → 立即 dispatch 该行，
                             # 不残留 \r 触发截断误报、不丢该行数据
                             if pending_cr and byte_buf and byte_buf.endswith(b'\r'):
-                                _cr_line = bytes(byte_buf[:-1]).decode(
+                                _cr_text = bytes(byte_buf[:-1]).decode(
                                     'utf-8', errors='replace'
                                 )
                                 byte_buf.clear()
                                 pending_cr = False
-                                if _cr_line:
+                                # 10.14.1 (API-SPEC FIX): EOF 残留可能是
+                                # 多行（CR-only 分批到达时主循环 pending_cr
+                                # break，byte_buf 残留整个未处理批次，如
+                                # `event: a\ndata: {...}\nevent: b\ndata: {...}`）。
+                                # 必须按 \n 切分成行逐行处理——整段当单行会：
+                                # ① event 行与 data 行全拼一块（协议污染，
+                                #    SDK 取最后一个 event 名配第一个 data）；
+                                # ② 顺序颠倒/坏块。
+                                for _cr_line in _cr_text.split('\n'):
+                                    if not _cr_line.strip():
+                                        continue
                                     if _cr_line.startswith(':'):
                                         await _tracked_write(
                                             (_cr_line + '\n').encode('utf-8')
                                         )
                                     elif _cr_line.startswith('data:'):
                                         _pl = _cr_line[5:].removeprefix(' ')
-                                        # 10.5.1 (F-01/R-03): CR-only 的
-                                        # `data: [DONE]` 不得过滤丢弃——单独
-                                        # 透传并原子置位（原实现不入 data_buffer
-                                        # 导致 seen_global_terminal 不置位，
-                                        # finish_reason 未先行时流末误判截断
-                                        # 合成；或 _done_sent 未置位被流末补发
-                                        # 双 [DONE]）
-                                        if _pl.strip() == '[DONE]':
-                                            seen_global_terminal = True
-                                            _done_sent = True
-                                            await _tracked_write(b'data: [DONE]\n\n')
-                                        elif _pl.strip():
+                                        # 10.14.1 (API-SPEC FIX): CR-only 多行流
+                                        # 中 [DONE] 不得立即透传——同一 EOF 批次的
+                                        # 前面 content 行仍在 data_buffer 未 dispatch，
+                                        # 立即透传会颠倒顺序（SDK 收到 [DONE] 即
+                                        # 结束流，后续 content 全丢）。改为入
+                                        # data_buffer 保持行序统一 dispatch。
+                                        # 同时 [DONE] 行与 content 行同批
+                                        # dispatch（行序保持），见下方 9.4。
+                                        if _pl.strip():
                                             data_buffer.append(_pl)
                                         # 9.4 (F-04): CR-only 行流末立即 dispatch，
                                         # 不能等流末统一处理 —— 下方截断检测会把
@@ -3995,6 +4015,14 @@ class LlmMixin(AuditMixin):
                                                         )
                                                         if not _cr_entry_plain:
                                                             continue
+                                                        # 10.14.1 (API-SPEC FIX):
+                                                        # CR-only 多行流中 [DONE] 行
+                                                        # 与 content 行同批 dispatch
+                                                        # （行序保持），逐条判断时
+                                                        # [DONE] 同样置位全局终止
+                                                        if _cr_entry_plain == '[DONE]':
+                                                            _cr_term_found = True
+                                                            break
                                                         try:
                                                             _cr_parsed = json.loads(
                                                                 _cr_entry_plain
@@ -4043,25 +4071,128 @@ class LlmMixin(AuditMixin):
                                                     if _cr_term_found:
                                                         seen_global_terminal = True
                                                 # _pii_process_sse_line 接收完整 SSE 行
-                                                # （含 data: 前缀），返回完整行
-                                                _cr_out = (
-                                                    await self._pii_process_sse_line(
-                                                        'data: ' + _cr_payload,
+                                                # （含 data: 前缀），返回完整行。
+                                                # 10.14.1 (API-SPEC FIX): CR-only 多行
+                                                # 流逐条 dispatch（每行独立 data: 前缀 +
+                                                # 独立空行块），保持行序 content 在前、
+                                                # [DONE] 在后；不能整体 join 后单次传
+                                                # —— [DONE] 行会丢 data: 前缀混入
+                                                # content 块（SDK JSONDecodeError）。
+                                                for _cr_line_out in _cr_payload.split(
+                                                    '\n'
+                                                ):
+                                                    if not _cr_line_out.strip():
+                                                        continue
+                                                    # 10.14.1 (API-SPEC FIX):
+                                                    # 透传 [DONE] 行时置位
+                                                    # _done_sent，防止流末
+                                                    # 9.4 补发逻辑双发
+                                                    if _cr_line_out.strip() == '[DONE]':
+                                                        _done_sent = True
+                                                    # 10.14.1 (API-SPEC FIX):
+                                                    # data 行 dispatch 前把暂存的
+                                                    # event:/id: 行拼入同块（SSE
+                                                    # 规范：event+data 同块，空行
+                                                    # 分隔）——否则 event 独块 +
+                                                    # data 独块被 SDK 按块解析报
+                                                    # JSONDecodeError。多条 event
+                                                    # 累积时按 FIFO 弹第一条配对。
+                                                    _cr_block = ''
+                                                    if slow_event_pending:
+                                                        _cr_block = (
+                                                            slow_event_pending.pop(0)
+                                                            + '\n'
+                                                        )
+                                                    # 事件识别置位（responses /
+                                                    # anthropic 终止事件）：CR-only
+                                                    # 路径绕过主循环 JSON 解析，
+                                                    # 此处补协议判定，防止流末
+                                                    # 误按 chat 协议补 [DONE]
+                                                    try:
+                                                        _cr_parsed2 = json.loads(
+                                                            _cr_line_out
+                                                        )
+                                                        if isinstance(
+                                                            _cr_parsed2, dict
+                                                        ):
+                                                            _cr_t2 = _cr_parsed2.get(
+                                                                'type'
+                                                            )
+                                                            if (
+                                                                _cr_t2
+                                                                and _cr_t2.startswith(
+                                                                    'response.'
+                                                                )
+                                                            ):
+                                                                is_responses_stream = (
+                                                                    True
+                                                                )
+                                                            if _cr_t2 in (
+                                                                'response.completed',
+                                                                'response.failed',
+                                                                'response.incomplete',
+                                                                'response.error',
+                                                                'message_stop',
+                                                                'error',
+                                                            ):
+                                                                seen_global_terminal = (
+                                                                    True
+                                                                )
+                                                            if _cr_t2 in (
+                                                                'message_start',
+                                                                'content_block_start',
+                                                                'content_block_delta',
+                                                                'content_block_stop',
+                                                                'message_delta',
+                                                                'message_stop',
+                                                                'error',
+                                                                'ping',
+                                                            ):
+                                                                is_anthropic_stream = (
+                                                                    True
+                                                                )
+                                                    except Exception:
+                                                        pass
+                                                    _cr_out = await self._pii_process_sse_line(
+                                                        _cr_block
+                                                        + 'data: '
+                                                        + _cr_line_out,
                                                         active_t2p,
                                                     )
-                                                )
-                                                await _tracked_write(
-                                                    (_cr_out + '\n\n').encode('utf-8')
-                                                )
+                                                    await _tracked_write(
+                                                        (_cr_out + '\n\n').encode(
+                                                            'utf-8'
+                                                        )
+                                                    )
                                     else:
-                                        await _tracked_write(
-                                            (
+                                        # 10.14.1 (API-SPEC FIX): event:/id: 行
+                                        # 暂存 slow_event_pending（不立即透传——
+                                        # 立即透传会把 SSE 块拆成 event 独块 +
+                                        # data 独块，SDK JSONDecodeError；且
+                                        # 绕过主循环事件识别导致
+                                        # is_responses_stream 不置位，流末按
+                                        # chat 协议误补 [DONE]）。data 行
+                                        # dispatch 时拼入同块（下方逐条
+                                        # dispatch 前拼装）。
+                                        if _cr_line.startswith(('event:', 'id:')):
+                                            slow_event_pending.append(
                                                 await self._pii_process_sse_line(
                                                     _cr_line, active_t2p
                                                 )
-                                                + '\n\n'
-                                            ).encode('utf-8')
-                                        )
+                                            )
+                                        elif _cr_line.startswith(':'):
+                                            await _tracked_write(
+                                                (_cr_line + '\n').encode('utf-8')
+                                            )
+                                        else:
+                                            await _tracked_write(
+                                                (
+                                                    await self._pii_process_sse_line(
+                                                        _cr_line, active_t2p
+                                                    )
+                                                    + '\n\n'
+                                                ).encode('utf-8')
+                                            )
 
                             # 流结束：flush 残留（含 partial token 前缀清理）
                             if is_responses_stream:
@@ -4138,12 +4269,14 @@ class LlmMixin(AuditMixin):
                             # 10.13 (F-12): 流末 slow_event_pending 残留透传 ——
                             # data 行始终没来（异常流）时，不能把 event 行闷掉；
                             # 透传保留原始信息，客户端自行容错。
+                            # 10.14.1 (API-SPEC FIX): 逐条透传独立块
+                            # （多条 event 残留时 join 全拼成单块，
+                            # SDK 取最后 event 名无 data 反而更乱）。
                             if slow_event_pending:
-                                await _tracked_write(
-                                    (
-                                        '\n'.join(slow_event_pending) + '\n\n'
-                                    ).encode('utf-8'),
-                                )
+                                for _pend in slow_event_pending:
+                                    await _tracked_write(
+                                        (_pend + '\n\n').encode('utf-8'),
+                                    )
                                 slow_event_pending.clear()
                             # ── 截断检测：byte_buf/data_buffer 残留或未收到终止事件则告警并合成 ──
                             _truncated = False
@@ -4393,12 +4526,12 @@ class LlmMixin(AuditMixin):
                             # ── 8.8 修复（F-09）：快链复用 WHATWG 帧状态机 ──
                             fast_pending_cr = False  # 上 chunk 末孤立 \r 跨块粘合
                             fast_bom_seen = False  # 流首 BOM 单次剥离
-                            fast_data_buffer: list[str] =[]  # 同事件多 data: 行聚合
+                            fast_data_buffer: list[str] = []  # 同事件多 data: 行聚合
                             # 10.13 (F-12): fast 链 event:/id: 行暂存 ——
                             # 不得立即透传（会把 SSE 块拆成 event 独块 + data 独块，
                             # openai sdk 按块解析 → 无 data 的块 JSONDecodeError）。
                             # 暂存后随 _fast_emit_data 的 data 行同块写出。
-                            fast_event_pending: list[str] =[]
+                            fast_event_pending: list[str] = []
                             # 9.5 (F-05): 快链 line_buf 行缓冲 —— 跨 data: 事件
                             # 切断的 PII 片段（user@exa + mple.com）合并后统一处理，
                             # 不透漏片段（tasks 8.8 声称的公共行缓冲在快链真实生效）
@@ -4616,10 +4749,15 @@ class LlmMixin(AuditMixin):
                                             )
                                 # 10.13 (F-12): event:/id: 暂存行与 data 行同块写出
                                 # （保持 SSE 块结构：event: xxx\ndata: {...}\n\n）
-                                _fast_block = ''.join(
-                                    _e + '\n' for _e in fast_event_pending
+                                # 10.14.1 (API-SPEC FIX): 多条 event 累积
+                                # （跨批/非标准上游）时按 FIFO 弹第一条配对
+                                # ——join 全部会让 SDK 取最后 event 名配
+                                # 首个 data 载荷（错配）。
+                                _fast_block = (
+                                    fast_event_pending.pop(0) + '\n'
+                                    if fast_event_pending
+                                    else ''
                                 )
-                                fast_event_pending.clear()
                                 await _tracked_write(
                                     (
                                         _fast_block
@@ -4727,25 +4865,63 @@ class LlmMixin(AuditMixin):
                                 logger.debug('SSE 客户端断连: %s', e)
                             # ── 8.8 EOF 残留处理（同慢链 8.5）──
                             # CR-only 行流末：byte_buf 以 \r 结尾 → 视为行终止符
+                            # 10.14.1 (API-SPEC FIX): 整个流全 CR-only（每行 \r
+                            # 结尾）时 byte_buf 里有多行——不能只取末尾一段，
+                            # 必须按 \r 切分逐行 dispatch（保持行序，中间行
+                            # 不得丢失）。每行独立 data: 前缀 + 独立空行块，
+                            # [DONE] 在 content 之后按序透传。
                             if byte_buf.endswith(b'\r'):
-                                _cr_line = bytes(byte_buf[:-1]).decode(
+                                _cr_text = bytes(byte_buf).decode(
                                     'utf-8', errors='replace'
                                 )
                                 byte_buf.clear()
                                 fast_pending_cr = False
-                                if _cr_line.startswith('data:'):
-                                    _pl = _cr_line[5:].removeprefix(' ')
-                                    # 10.5.1 (F-01/R-03): 快链 CR-only
-                                    # `data: [DONE]` 不得静默丢弃——单独透传
-                                    # 并置位（原实现过滤后既不入 buffer 也
-                                    # 不透传 → fast_seen_global 保持 False
-                                    # → 流末误判截断合成）
-                                    if _pl.strip() == '[DONE]':
-                                        fast_seen_terminal = True
-                                        fast_seen_global_terminal = True
-                                        await _tracked_write(b'data: [DONE]\n\n')
-                                    elif _pl.strip():
-                                        fast_data_buffer.append(_pl)
+                                for _cr_raw in _cr_text.split('\r'):
+                                    _cr_line = _cr_raw.strip('\r')
+                                    if not _cr_line:
+                                        continue
+                                    if _cr_line.startswith('data:'):
+                                        _pl = _cr_line[5:].removeprefix(' ')
+                                        # 10.14.1 (API-SPEC FIX): CR-only 多行
+                                        # 流保持行序 dispatch——content 行立即
+                                        # 走 _fast_emit_data（还原+透传），
+                                        # [DONE] 行最后透传（不得提前，否则
+                                        # SDK 收到 [DONE] 即结束流，后续
+                                        # content 全丢）。
+                                        if _pl.strip() == '[DONE]':
+                                            fast_seen_terminal = True
+                                            fast_seen_global_terminal = True
+                                            await _tracked_write(b'data: [DONE]\n\n')
+                                        elif _pl.strip():
+                                            fast_sse_event_count += 1
+                                            await _fast_emit_data(_pl)
+                                    else:
+                                        # 10.14.1 (API-SPEC FIX): 非 data 行
+                                        # （event:/id:）暂存 fast_event_pending，
+                                        # data 行 dispatch 前拼入同块（FIFO
+                                        # 弹第一条配对）——立即透传会把 SSE
+                                        # 块拆成 event 独块 + data 独块，
+                                        # SDK JSONDecodeError（与主循环
+                                        # 4821-4826 一致）。
+                                        if _cr_line.startswith(('event:', 'id:')):
+                                            fast_event_pending.append(
+                                                await self._pii_process_sse_line(
+                                                    _cr_line, active_t2p
+                                                )
+                                            )
+                                        elif _cr_line.startswith(':'):
+                                            await _tracked_write(
+                                                (_cr_line + '\n').encode('utf-8')
+                                            )
+                                        else:
+                                            await _tracked_write(
+                                                (
+                                                    await self._pii_process_sse_line(
+                                                        _cr_line, active_t2p
+                                                    )
+                                                    + '\n\n'
+                                                ).encode('utf-8')
+                                            )
                             # data_buffer 残留 → dispatch
                             if fast_data_buffer:
                                 _fast_payload = '\n'.join(fast_data_buffer)
@@ -4759,15 +4935,12 @@ class LlmMixin(AuditMixin):
                             # 10.13 (F-12): 流末 event_pending 残留透传 ——
                             # data 行始终没来（异常流）时，不能把 event 行闷掉；
                             # 透传保留原始信息，客户端自行容错。
+                            # 10.14.1 (API-SPEC FIX): 逐条透传独立块。
                             if fast_event_pending:
-                                await _tracked_write(
-                                    (
-                                        ''.join(
-                                            _e + '\n' for _e in fast_event_pending
-                                        )
-                                        + '\n'
-                                    ).encode('utf-8'),
-                                )
+                                for _pend in fast_event_pending:
+                                    await _tracked_write(
+                                        (_pend + '\n\n').encode('utf-8'),
+                                    )
                                 fast_event_pending.clear()
                             # 9.5 (F-05): 快链 line_buf 流末 flush（持有行不丢）
                             if fast_line_buf:
