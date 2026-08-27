@@ -357,6 +357,12 @@ def _responses_event(parsed: dict) -> tuple[str, str | None] | None:
     """
     evt_type = parsed.get('type') if isinstance(parsed, dict) else None
     if not isinstance(evt_type, str) or not evt_type.startswith('response.'):
+        # 10.13 (F-12): ping 事件也识别为 'other' ——
+        # 上游 responses 流中 `event: ping\ndata: {"type":"ping"}`
+        # 若不识别，data 行走普通透传（不拼暂存 event 行），
+        # event 行被流末单独透传 → 拆块 → 下游 sdk JSONDecodeError。
+        if evt_type == 'ping':
+            return 'other', None
         return None
     kind_map = {
         'response.output_text.delta': 'output_text',
@@ -2389,7 +2395,12 @@ class LlmMixin(AuditMixin):
                             # ── 6.2 WHATWG / 6.3 line_buf / 6.5 keepalive 新增变量 ──
                             data_buffer: list[
                                 str
-                            ] = []  # 同事件多 data: 行聚合（WHATWG）
+                            ] =[]  # 同事件多 data: 行聚合（WHATWG）
+                            # 10.13 (F-12): slow 链 event:/id: 行暂存 ——
+                            # 不得立即透传（会把 SSE 块拆成 event 独块 + data 独块，
+                            # openai sdk 按块解析 → 无 data 的块 JSONDecodeError）。
+                            # 暂存后拼入 data 行同一块写出。
+                            slow_event_pending: list[str] =[]
                             pending_cr = False  # 上 chunk 末孤立 \r 跨块粘合
                             bom_seen = False  # 流首 BOM 单次剥离
                             line_buf_ts = _time.monotonic()  # 6.3/6.5 行缓冲时间戳
@@ -2782,6 +2793,20 @@ class LlmMixin(AuditMixin):
                                                         ):
                                                             seen_terminal = True
                                                             seen_global_terminal = True
+                                                        # 10.13 (F-12): 把暂存的 event:/id:
+                                                        # 行拼入 data 行同一块写出（SSE 规范：
+                                                        # event + data 属于同一块，空行分隔）。
+                                                        # 避免 event 独块 + data 独块被下游
+                                                        # openai sdk 按块解析时报 JSONDecodeError。
+                                                        if slow_event_pending:
+                                                            line = (
+                                                                '\n'.join(
+                                                                    slow_event_pending
+                                                                )
+                                                                + '\n'
+                                                                + line
+                                                            )
+                                                            slow_event_pending.clear()
                                                         (
                                                             content_buf,
                                                             reasoning_buf,
@@ -3317,12 +3342,25 @@ class LlmMixin(AuditMixin):
                                                             ) = await self._handle_responses_event(
                                                                 _tracked_write,
                                                                 parsed,
-                                                                'data: ' + sanitized,
+                                                                (
+                                                                    (
+                                                                        '\n'.join(
+                                                                            slow_event_pending
+                                                                        )
+                                                                        + '\n'
+                                                                    )
+                                                                    if slow_event_pending
+                                                                    else ''
+                                                                )
+                                                                + 'data: '
+                                                                + sanitized,
                                                                 active_t2p,
                                                                 content_buf,
                                                                 reasoning_buf,
                                                                 arg_buf,
                                                             )
+                                                            if slow_event_pending:
+                                                                slow_event_pending.clear()
                                                             continue
                                                         # ── Anthropic Messages API 事件（续行重建路径）──
                                                         if (
@@ -3528,13 +3566,16 @@ class LlmMixin(AuditMixin):
                                                 data_buffer.append(value)
                                                 continue
                                             elif field == 'event' or field == 'id':
-                                                await _tracked_write(
-                                                    (
-                                                        await self._pii_process_sse_line(
-                                                            line, active_t2p
-                                                        )
-                                                        + '\n\n'
-                                                    ).encode('utf-8')
+                                                # 10.13 (F-12): 暂存不立即透传 ——
+                                                # 立即透传会把 SSE 块拆成 event 独块 +
+                                                # data 独块，openai sdk 按块解析 →
+                                                # JSONDecodeError。暂存后拼入 data 行
+                                                # 同一块写出（见 _handle_responses_event
+                                                # 调用点前的拼装）。
+                                                slow_event_pending.append(
+                                                    await self._pii_process_sse_line(
+                                                        line, active_t2p
+                                                    )
                                                 )
                                                 continue
                                             elif field == 'retry':
@@ -3560,13 +3601,12 @@ class LlmMixin(AuditMixin):
                                                 data_buffer.append(value)
                                                 continue
                                             elif field in ('event', 'id'):
-                                                await _tracked_write(
-                                                    (
-                                                        await self._pii_process_sse_line(
-                                                            line, active_t2p
-                                                        )
-                                                        + '\n\n'
-                                                    ).encode('utf-8')
+                                                # 10.13 (F-12): 暂存不立即透传
+                                                # （同上方 event/id 分支）
+                                                slow_event_pending.append(
+                                                    await self._pii_process_sse_line(
+                                                        line, active_t2p
+                                                    )
                                                 )
                                                 continue
                                             elif field == 'retry':
@@ -3888,6 +3928,16 @@ class LlmMixin(AuditMixin):
                                         )
                                     except SSE_CLIENT_GONE:
                                         logger.debug('SSE 残余写入失败')
+                            # 10.13 (F-12): 流末 slow_event_pending 残留透传 ——
+                            # data 行始终没来（异常流）时，不能把 event 行闷掉；
+                            # 透传保留原始信息，客户端自行容错。
+                            if slow_event_pending:
+                                await _tracked_write(
+                                    (
+                                        '\n'.join(slow_event_pending) + '\n\n'
+                                    ).encode('utf-8'),
+                                )
+                                slow_event_pending.clear()
                             # ── 截断检测：byte_buf/data_buffer 残留或未收到终止事件则告警并合成 ──
                             _truncated = False
                             # 9.2 (F-02): 截断判定收紧 —— 仅 byte_buf（未消费的部分行）
@@ -4136,7 +4186,12 @@ class LlmMixin(AuditMixin):
                             # ── 8.8 修复（F-09）：快链复用 WHATWG 帧状态机 ──
                             fast_pending_cr = False  # 上 chunk 末孤立 \r 跨块粘合
                             fast_bom_seen = False  # 流首 BOM 单次剥离
-                            fast_data_buffer: list[str] = []  # 同事件多 data: 行聚合
+                            fast_data_buffer: list[str] =[]  # 同事件多 data: 行聚合
+                            # 10.13 (F-12): fast 链 event:/id: 行暂存 ——
+                            # 不得立即透传（会把 SSE 块拆成 event 独块 + data 独块，
+                            # openai sdk 按块解析 → 无 data 的块 JSONDecodeError）。
+                            # 暂存后随 _fast_emit_data 的 data 行同块写出。
+                            fast_event_pending: list[str] =[]
                             # 9.5 (F-05): 快链 line_buf 行缓冲 —— 跨 data: 事件
                             # 切断的 PII 片段（user@exa + mple.com）合并后统一处理，
                             # 不透漏片段（tasks 8.8 声称的公共行缓冲在快链真实生效）
@@ -4338,10 +4393,19 @@ class LlmMixin(AuditMixin):
                                                     _payload, active_t2p
                                                 )
                                             )
+                                # 10.13 (F-12): event:/id: 暂存行与 data 行同块写出
+                                # （保持 SSE 块结构：event: xxx\ndata: {...}\n\n）
+                                _fast_block = ''.join(
+                                    _e + '\n' for _e in fast_event_pending
+                                )
+                                fast_event_pending.clear()
                                 await _tracked_write(
-                                    ('data: ' + _restored_payload + '\n\n').encode(
-                                        'utf-8'
-                                    ),
+                                    (
+                                        _fast_block
+                                        + 'data: '
+                                        + _restored_payload
+                                        + '\n\n'
+                                    ).encode('utf-8'),
                                 )
 
                             try:
@@ -4412,14 +4476,16 @@ class LlmMixin(AuditMixin):
                                             fast_data_buffer.append(payload)
                                             continue
                                         # 非 data 行（event:/id:）走 SSE 行 JSON-aware
+                                        # 10.13 (F-12): 暂存不立即透传 ——
+                                        # 立即透传会把 SSE 块拆成 event 独块 + data 独块，
+                                        # openai sdk 按块解析 → JSONDecodeError。
+                                        # 暂存后随 _fast_emit_data 的 data 行同块写出。
                                         restored_line = (
                                             await self._pii_process_sse_line(
                                                 line, active_t2p
                                             )
                                         )
-                                        await _tracked_write(
-                                            (restored_line + '\n').encode('utf-8'),
-                                        )
+                                        fast_event_pending.append(restored_line)
                                     # Trim processed portion
                                     if pos > 0:
                                         del byte_buf[:pos]
@@ -4469,6 +4535,19 @@ class LlmMixin(AuditMixin):
                                         fast_seen_terminal = True
                                         fast_seen_global_terminal = True
                                     await _fast_emit_data(_fast_payload)
+                            # 10.13 (F-12): 流末 event_pending 残留透传 ——
+                            # data 行始终没来（异常流）时，不能把 event 行闷掉；
+                            # 透传保留原始信息，客户端自行容错。
+                            if fast_event_pending:
+                                await _tracked_write(
+                                    (
+                                        ''.join(
+                                            _e + '\n' for _e in fast_event_pending
+                                        )
+                                        + '\n'
+                                    ).encode('utf-8'),
+                                )
+                                fast_event_pending.clear()
                             # 9.5 (F-05): 快链 line_buf 流末 flush（持有行不丢）
                             if fast_line_buf:
                                 _rest = await self._pii_response_process(
