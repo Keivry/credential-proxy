@@ -62,9 +62,14 @@ THEN proxy 合成 `response.failed` 事件（含 truncated 语义），下游（
 
 ### Requirement: 截断模式可观测记录
 
-proxy SHALL 在 stream_meta.json 记录每次截断的处理模式 `truncated_mode`，取值 `silent_discard`（已 complete 静默丢弃）、`open_ended`（未 complete 不伪造终止）、`synthesized_failed`（responses 合成 failed），便于审计与排查。
+proxy SHALL 在 stream_meta.json 记录每次截断的处理模式 `truncated_mode`，取值 `silent_discard`（已 complete 静默丢弃）、`open_ended`（未 complete 不伪造终止）、`synthesized_failed`（responses 合成 failed）、`none`（无截断正常完成流），便于审计与排查。
 
 #### Scenario: 截断模式写入 stream_meta
 
 WHEN 任何截断场景发生（已 complete 或未 complete）
 THEN stream_meta.json 的 `truncated_mode` 字段记录对应模式值，且与截断处理分支一致
+
+#### Scenario: 正常完成流记 none
+
+WHEN 流正常完成（`_truncated=false`，无截断）
+THEN stream_meta.json 的 `truncated_mode` 字段记录 `none`，与截断场景的 `silent_discard` 区分，监控可准确识别「无截断」

@@ -11,6 +11,7 @@
 
 import asyncio
 import json
+import re
 import sys
 
 # 清除 llm_test 的 aiohttp mock（与 sse_stream_loop_test.py 一致）
@@ -142,7 +143,7 @@ async def test_tss01_complete_residual_silent_discard():
     # 无截断合成文本
     assert '被截断' not in raw, f'误判截断合成: {raw!r}'
     # 无重复合成 finish_reason:stop（上游已发，proxy 不补）
-    stops = [d for _, d in blocks if '"finish_reason":"stop"' in d]
+    stops = [d for _, d in blocks if re.search(r'"finish_reason"\s*:\s*"stop"', d)]
     assert len(stops) == 1, f'finish_reason:stop 数量异常: {blocks}'
     # 尾部残留的半个 ping：event 行经 slow_event_pending 保真透传（无害，非合成终止），
     # data 行丢弃；核心是「已 complete 不合成截断事件」
@@ -192,7 +193,7 @@ async def test_tss02_mid_text_truncation_open_ended():
     # 已透传的 reasoning 分片保留
     assert 'step1' in raw and 'step2' in raw, f'已透传分片丢失: {raw!r}'
     # 不合成 finish_reason:stop
-    assert '"finish_reason":"stop"' not in raw, f'伪造成功终止: {raw!r}'
+    assert not re.search(r'"finish_reason"\s*:\s*"stop"', raw), f'伪造成功终止: {raw!r}'
     # 不补发 [DONE]
     assert '[DONE]' not in raw, f'伪造 [DONE]: {raw!r}'
     # 无截断合成文本
@@ -240,7 +241,7 @@ async def test_tss03_mid_tool_calls_truncation_drop():
             raw = await r.text()
 
     # 不合成 finish_reason:stop（下游 Hermes 会因 finish_reason is None 走 drop 保护）
-    assert '"finish_reason":"stop"' not in raw, f'伪造成功终止: {raw!r}'
+    assert not re.search(r'"finish_reason"\s*:\s*"stop"', raw), f'伪造成功终止: {raw!r}'
     # 不补发 [DONE]
     assert '[DONE]' not in raw, f'伪造 [DONE]: {raw!r}'
     # 无截断合成文本

@@ -13,6 +13,7 @@
 
 import asyncio
 import json
+import re
 import sys
 from contextlib import asynccontextmanager
 
@@ -289,7 +290,9 @@ async def test_integration_truncated_synthetic_terminal(caplog):
         # 中文被 ensure_ascii 转义为 \\uXXXX，断言 unicode 转义形态
         assert '\\u534a\\u622a\\u5185\\u5bb9' in raw or '半截内容' in raw
         # 11.2 (TSS-02): 不再合成 finish_reason:stop / [DONE]
-        assert '"finish_reason":"stop"' not in raw, f'伪造成功终止: {raw!r}'
+        assert not re.search(r'"finish_reason"\s*:\s*"stop"', raw), (
+            f'伪造成功终止: {raw!r}'
+        )
         assert 'data: [DONE]' not in raw, f'伪造 [DONE]: {raw!r}'
         # 不注入截断合成文本
         assert '被截断' not in raw and 'TRUNCATED_MESSAGE' not in raw

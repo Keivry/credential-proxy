@@ -1268,55 +1268,6 @@ class LlmMixin(AuditMixin):
         )
         return ''.join(lines)
 
-    def _build_truncated_event(self) -> str:
-        """构造 chat/completions 截断合成终止事件（避免空体 JSONDecodeError）。
-
-        9.2 (F-02): 不再附带 `data: [DONE]` —— 由合成分支统一补发并去重，
-        避免与流中已透传的 [DONE] 重复（OpenAI 单 [DONE] 约定）。
-        """
-        payload = {
-            'choices': [
-                {
-                    'index': 0,
-                    'delta': {'role': 'assistant', 'content': TRUNCATED_MESSAGE},
-                    'finish_reason': 'stop',
-                }
-            ]
-        }
-        return f'data: {json.dumps(payload, ensure_ascii=False)}\n\n'
-
-    def _build_truncated_event_anthropic(self) -> str:
-        """构造 Anthropic 截断合成终止事件（text_delta + message_stop）。"""
-        lines = []
-        lines.append(
-            'data: '
-            + json.dumps(
-                {
-                    'type': 'content_block_delta',
-                    'index': 0,
-                    'delta': {'type': 'text_delta', 'text': TRUNCATED_MESSAGE},
-                },
-                ensure_ascii=False,
-            )
-            + '\n\n'
-        )
-        lines.append(
-            'data: '
-            + json.dumps(
-                {
-                    'type': 'message_delta',
-                    'delta': {'stop_reason': 'end_turn'},
-                    'usage': {'output_tokens': 1},
-                },
-                ensure_ascii=False,
-            )
-            + '\n\n'
-        )
-        lines.append(
-            'data: ' + json.dumps({'type': 'message_stop'}, ensure_ascii=False) + '\n\n'
-        )
-        return ''.join(lines)
-
     def _build_truncated_event_responses(self) -> str:
         """构造 Responses 截断合成终止事件（failed 避免下游空体）。"""
         lines = []
@@ -4387,11 +4338,14 @@ class LlmMixin(AuditMixin):
                                     and not seen_global_terminal
                                     and tool_calls_pending_events
                                 ):
+                                    # 11.2 (TSS-03) F-01 修复：先取 len 再 clear，
+                                    # 否则日志恒记 0 事件
+                                    _tss_dropped = len(tool_calls_pending_events)
                                     tool_calls_pending_events.clear()
                                     tool_calls_blocked = True
                                     logger.warning(
                                         'LLM 截断丢弃残缺 tool_calls 分片: %d 事件 req_id=%s tail=%s',
-                                        len(tool_calls_pending_events),
+                                        _tss_dropped,
                                         req_id,
                                         tail,
                                     )
@@ -4528,7 +4482,9 @@ class LlmMixin(AuditMixin):
                                             'bytes_buf_len': len(byte_buf),
                                             'seen_terminal': seen_terminal,
                                             'truncated': _truncated,
-                                            # 11.2 (TSS-04): 截断处理模式——
+                                            # 11.2 (TSS-04) F-03 修复：正常完成流（_truncated=False）
+                                            # 记 none，与「已 complete 残留静默丢弃」区分——
+                                            # 否则监控无法区分无截断 vs silent_discard
                                             # silent_discard（已 complete 残留静默丢弃）/
                                             # open_ended（未 complete 不伪造终止）/
                                             # synthesized_failed（responses 合成 failed）
@@ -4537,7 +4493,7 @@ class LlmMixin(AuditMixin):
                                                 if _truncated and is_responses_stream
                                                 else 'open_ended'
                                                 if _truncated
-                                                else 'silent_discard'
+                                                else 'none'
                                             ),
                                             # 11.2 (TSS-03): 残缺 tool_calls 是否被丢弃
                                             'tool_calls_dropped': (
@@ -5011,9 +4967,19 @@ class LlmMixin(AuditMixin):
                             # 时 byte_buf 残留不判截断——终止语义已完整，静默丢弃
                             if byte_buf and not fast_seen_global_terminal:
                                 _fast_truncated = True
-                                _preview = byte_buf[:200].decode(
+                                # 11.2 (TSS-01) F-13 修复：fast 预览与 slow 同款脱敏——
+                                # 先剥离 PII/凭据 token 残缺形态，再过 redact_summary
+                                # （手机号/邮箱等明文 → ***），空结果用 hex 兜底
+                                _preview_raw = byte_buf[:200].decode(
                                     'utf-8', errors='replace'
                                 )
+                                _preview = _strip_partials(_preview_raw)
+                                _preview = redact_summary(_preview)
+                                if not _preview:
+                                    _preview = (
+                                        f'len={len(byte_buf)} '
+                                        f'hex_head={bytes(byte_buf[:16]).hex()}'
+                                    )
                                 logger.warning(
                                     'LLM 流截断(fast): bytes_buf_len=%d sse_events=%d bytes_written=%d req_id=%s tail=%s preview=%r',
                                     len(byte_buf),
@@ -5117,7 +5083,8 @@ class LlmMixin(AuditMixin):
                                             'bytes_buf_len': len(byte_buf),
                                             'seen_terminal': fast_seen_terminal,
                                             'truncated': _fast_truncated,
-                                            # 11.2 (TSS-04): 截断处理模式（fast）——
+                                            # 11.2 (TSS-04) F-03 修复：正常完成流记 none
+                                            # （与 slow 同构，区分无截断 vs silent_discard）
                                             # silent_discard / open_ended / synthesized_failed
                                             'truncated_mode': (
                                                 'synthesized_failed'
@@ -5127,7 +5094,7 @@ class LlmMixin(AuditMixin):
                                                 )
                                                 else 'open_ended'
                                                 if _fast_truncated
-                                                else 'silent_discard'
+                                                else 'none'
                                             ),
                                         },
                                     )

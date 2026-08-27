@@ -38,4 +38,6 @@
 - [x] 4.1 用真实截断 session dump（如 `req_1492e320eafb451c`、`req_ffaa34a13da4403d`）做隔离回归：喂入 `response_original.jsonl` payload，确认输出行为符合 spec（不伪造成功终止）
   - 验收：隔离测试输出与 spec 的 Scenario 一致；无 `finish_reason:stop` 合成（chat）、tool_calls 残缺不执行
 - [ ] 4.2 Docker 镜像重建 + tag 升级（当前 master 流程）
+- [x] 4.3 上线后复审修复（2026-08-28，4 维并行审查）：F-01 日志取数时序（先 len 再 clear）、F-13 fast 预览脱敏（补 _strip_partials + redact_summary）、F-17 测试断言正则化（防 json.dumps 空格假绿）、F-03 truncated_mode 正常流记 none（slow+fast）、F-02b 删除死代码（_build_truncated_event/_build_truncated_event_anthropic）
+  - 验收：`_llm.py` 4343 先取 len；4973 fast 预览脱敏；tests 断言含 `re.search(r'"finish_reason"\s*:\s*"stop"')`；4496/5097 truncated_mode 含 'none'；`grep _build_truncated_event_anthropic` 零命中；541 passed + ruff 全绿
   - 验收：`docker build` 成功，镜像 tag 更新

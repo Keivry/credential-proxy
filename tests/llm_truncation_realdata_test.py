@@ -10,6 +10,7 @@
 
 import asyncio
 import json
+import re
 import sys
 
 for _mod in [m for m in sys.modules if m == 'aiohttp' or m.startswith('aiohttp.')]:
@@ -128,7 +129,7 @@ async def test_real_reasoning_truncation_open_ended():
     # 已透传的 reasoning 保留
     assert 'reasoning' in raw, f'reasoning 丢失: {raw!r}'
     # 不合成 finish_reason:stop / [DONE]
-    assert '"finish_reason":"stop"' not in raw, f'伪造成功终止: {raw!r}'
+    assert not re.search(r'"finish_reason"\s*:\s*"stop"', raw), f'伪造成功终止: {raw!r}'
     assert 'data: [DONE]' not in raw, f'伪造 [DONE]: {raw!r}'
     # 无截断合成文本
     assert '被截断' not in raw, f'截断合成: {raw!r}'
@@ -151,7 +152,7 @@ async def test_real_toolcalls_truncation_no_fake_success():
     # 已透传的 tool_calls 分片保留
     assert 'tool_calls' in raw, f'tool_calls 丢失: {raw!r}'
     # 不合成 finish_reason:stop / [DONE]（下游 Hermes 走 mid-tool-call drop 保护）
-    assert '"finish_reason":"stop"' not in raw, f'伪造成功终止: {raw!r}'
+    assert not re.search(r'"finish_reason"\s*:\s*"stop"', raw), f'伪造成功终止: {raw!r}'
     assert 'data: [DONE]' not in raw, f'伪造 [DONE]: {raw!r}'
     # 无截断合成文本
     assert '被截断' not in raw, f'截断合成: {raw!r}'
