@@ -25,12 +25,12 @@
 
 ### Requirement: 事件 Inspector 与实时流
 
-系统 SHALL 提供 `GET /_admin/events?limit&kind&upstream&verdict` 的环形缓冲视图（数据源仅 `recent_events`，`audit.log` 仅作 `raw-tail` 排障，不 merge）以及 `GET /_admin/events/stream` 的 SSE 实时推送（鉴权三选一严格优先级 `X-Admin-Token` 头优先（`hmac.compare_digest`（等长摘要）时序安全比较）> `Cookie: __Host-admin_token`（`HttpOnly; Secure(由`request.scheme`判定，仅https); SameSite=Strict; Path=/; Max-Age=3600`，`ENV==dev` 回退为 `admin_token` 仍 `HttpOnly` 且 `https` 才 `Secure`/`http` 不带 `Secure`、`SameSite=Lax`）> `?access_token` 查询参数仅作 `EventSource` 兼容回退且仅限 SSE（`?access_token` 非空且 `path != /_admin/events/stream` 无条件 `401` 不评估 header/cookie），日志掩码 `access_token`，`history.replaceState` 清 URL，且 `GET /_admin/metrics` / `/_admin/events` 带 `?access_token` SHALL 返回 `401`；SSE 限 `max 5 concurrent SSE/IP` + `60s :ping` 心跳 + `5min` 服务端 `retry` 强制断开重连，超限 `429 + Retry-After` 不泄露指标；管理接口额外 `10/min/IP` 限流超限 `429 + Retry-After`（`on_disconnect` 清理计数器防泄漏））；事件 SHALL 仅含脱敏摘要（`redact_summary(raw,120)` 先脱敏后 `truncate(120)` 的 `[REDACTED:<kind>]` 单一路径，PII 明文不落 `recent_events` 与 SSE），不含明文；点击事件 SHALL 可查看 `request_id` 级摘要（命中类型、上游、tokens、verdict、延迟）。首版 SHALL 不注册 `GET /_admin/metrics/prometheus`（请求返回 404，预留 `credential_proxy_*`）。不主动发 `CSP` 头。
+系统 SHALL 提供 `GET /_admin/events?limit&kind&upstream&verdict` 的环形缓冲视图（数据源仅 `recent_events`，`audit.log` 仅作 `raw-tail` 排障，不 merge；`verdict` 过滤值域为真实实现的 `allow/deny` 两值）以及 `GET /_admin/events/stream` 的 SSE 实时推送（鉴权三选一严格优先级 `X-Admin-Token` 头优先（`hmac.compare_digest`（等长摘要）时序安全比较）> `Cookie: __Host-admin_token`（`HttpOnly; Secure(由`request.scheme`判定，仅https); SameSite=Strict; Path=/; Max-Age=3600`，`ENV==dev` 回退为 `admin_token` 仍 `HttpOnly` 且 `https` 才 `Secure`/`http` 不带 `Secure`、`SameSite=Lax`）> `?access_token` 查询参数仅作 `EventSource` 兼容回退且仅限 SSE（`?access_token` 非空且 `path != /_admin/events/stream` 无条件 `401` 不评估 header/cookie），日志掩码 `access_token`，`history.replaceState` 清 URL，且 `GET /_admin/metrics` / `/_admin/events` 带 `?access_token` SHALL 返回 `401`；SSE 限 `max 5 concurrent SSE/IP` + `60s :ping` 心跳 + `5min` 服务端 `retry` 强制断开重连，超限 `429 + Retry-After` 不泄露指标；管理接口额外 `10/min/IP` 限流超限 `429 + Retry-After`（`on_disconnect` 清理计数器防泄漏））；事件 SHALL 仅含脱敏摘要（`redact_summary(raw,120)` 先脱敏后 `truncate(120)` 的 `[REDACTED:<kind>]` 单一路径，PII 明文不落 `recent_events` 与 SSE），不含明文；事件 `sse_events` 计数按 SSE 事件块（`event:`/`id:`+`data:` 同块计 1，v0.9.23-25 同块写出），合成终止事件（`truncated`）单列不计入；点击事件 SHALL 可查看 `request_id` 级摘要（命中类型、上游、tokens、verdict、延迟）。首版 SHALL 不注册 `GET /_admin/metrics/prometheus`（请求返回 404，预留 `credential_proxy_*`）。不主动发 `CSP` 头。
 
 #### Scenario: 事件可过滤可追溯
 
-- **WHEN** 查询 `/_admin/events?verdict=block&limit=20`
-- **THEN** 返回最近 20 条 `block` 事件，每条含 `ts/request_id/upstream/pii_hits/cred_hits/tokens/verdict/latency` 且不含明文
+- **WHEN** 查询 `/_admin/events?verdict=deny&limit=20`
+- **THEN** 返回最近 20 条 `deny` 事件，每条含 `ts/request_id/upstream/pii_hits/cred_hits/tokens/verdict/latency` 且不含明文
 
 #### Scenario: 实时推送
 
@@ -44,7 +44,7 @@
 
 ### Requirement: 健康检查
 
-系统 SHALL 提供 `GET /_admin/health` 返回 `{pii_enabled, audit_mode, metrics_age_s, sqlite_ok, ring_len, ring_coverage_s, is_precise, dropped_snapshots, first_dropped_ts, last_dropped_ts, audit_pending_total, audit_hold_overflows, sqlite_error}`（`sqlite_error` 为最近 ENOSPC 等错误截断，`first_dropped_ts` 辅助排障）（`pii_enabled`/`audit_mode` 来自当前进程配置，`metrics_age_s` 为距上次 flush 秒数，`sqlite_ok` 为 `SELECT 1` 探活，`ring_len/coverage/is_precise` 来自 `recent_events`（`is_precise=(now-oldest_ts)>=3600 and len>=100`），`dropped_snapshots` + `last_dropped_ts` 来自 Queue 满丢计数（递增时 `logger.warning`），`audit_pending_total/hold_overflows` 为内存 gauge 瞬态（重启归零，`health` 标注“瞬态”），），同 `/_admin/*` 鉴权（`401` 不泄露，`401` 前不触 DB），无 `OBSERVABILITY_ADMIN_TOKEN` 时同样 `SystemExit` 前置。
+系统 SHALL 提供 `GET /_admin/health` 返回 `{pii_enabled, audit_mode, placeholder_prompt_enabled, metrics_age_s, sqlite_ok, ring_len, ring_coverage_s, is_precise, dropped_snapshots, first_dropped_ts, last_dropped_ts, audit_pending_total, audit_hold_overflows, truncated_total, json_aware_success, json_leaf_fallback, json_full_fallback, placeholder_prompt_injected, sqlite_error}`（`sqlite_error` 为最近 ENOSPC 等错误截断，`first_dropped_ts` 辅助排障）（`pii_enabled`/`audit_mode`/`placeholder_prompt_enabled` 来自当前进程配置，`metrics_age_s` 为距上次 flush 秒数，`sqlite_ok` 为 `SELECT 1` 探活，`ring_len/coverage/is_precise` 来自 `recent_events`（`is_precise=(now-oldest_ts)>=3600 and len>=100`），`dropped_snapshots` + `last_dropped_ts` 来自 Queue 满丢计数（递增时 `logger.warning`），`audit_pending_total/hold_overflows` 为内存 gauge 瞬态（重启归零，`health` 标注"瞬态"），`truncated_total`/`json_*`/`placeholder_prompt_injected` 为 v0.9.16-25 新基线指标，），同 `/_admin/*` 鉴权（`401` 不泄露，`401` 前不触 DB），无 `OBSERVABILITY_ADMIN_TOKEN` 时同样 `SystemExit` 前置。
 
 #### Scenario: 健康探活
 
