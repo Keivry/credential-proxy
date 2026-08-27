@@ -344,6 +344,38 @@ def _mk_sse_event(
     return f'data: {event}\n\n'
 
 
+def _fast_rebuild_chunk(parsed: dict, content: str) -> str:
+    """10.14 (API-SPEC): 快链重建 chat.completion.chunk JSON。
+
+    保留原 chunk 的 id/object/model/choices 结构，仅把
+    choices[].delta.content 替换为还原后的文本。原实现把整个
+    payload 换成裸文本，破坏 OpenAI chunk 结构（下游 SDK
+    JSONDecodeError），本函数保持规范符合性。
+
+    保守策略：deepcopy 原解析对象，替换 content 字段；解析失败
+    时回退为原 payload（不破坏结构）。
+    """
+    try:
+        import copy
+
+        out = copy.deepcopy(parsed)
+        if not isinstance(out, dict):
+            return _jdumps(parsed) if isinstance(parsed, dict) else str(parsed)
+        for ch in out.get('choices') or[]:
+            if not isinstance(ch, dict):
+                continue
+            d = ch.get('delta')
+            if isinstance(d, dict):
+                d['content'] = content
+        return _jdumps(out)
+    except Exception:
+        # 解析失败：原样返回（保持 JSON 结构，避免破坏流）
+        try:
+            return _jdumps(parsed)
+        except Exception:
+            return str(parsed)
+
+
 def _responses_event(parsed: dict) -> tuple[str, str | None] | None:
     """识别 OpenAI Responses API SSE 事件（/v1/responses）。
 
@@ -1478,7 +1510,54 @@ class LlmMixin(AuditMixin):
           不再二次守门；对非 data: 前缀行直接回退 plain。
         - 8.10 优化（F-11）：`parsed_obj` 传调用方已 `json.loads` 的结果，
           跳过二次 loads（慢链主循环复用）。
+        - 10.14 (API-SPEC): 支持多行 SSE 块（`event:/id:` 前缀行 + `data:` 行）——
+          slow 链暂存 event 行后拼入 data 行同块透传（10.13 F-12），
+          `_handle_responses_event`/`_handle_anthropic_event` 的
+          other/item_done/block_stop 分支用拼块后的 line 调用本函数。
+          旧实现只对 `data:` 开头的行做 JSON-aware，拼块行（以 event: 开头）
+          整体走 plain 文本还原 → 含引号/反斜杠密码被文本 replace 进 JSON
+          破坏结构（JSONDecodeError）。修复：逐行解析块，data 行走
+          JSON-aware，其余行原样保留，再重组输出。
         """
+        # 多行 SSE 块（event:/id: 前缀 + data: 行）逐行处理
+        if '\n' in line:
+            parts = line.split('\n')
+            out_parts = []
+            for part in parts:
+                stripped = part.strip()
+                if not stripped:
+                    continue
+                if stripped.startswith('data:'):
+                    # data 行走 JSON-aware
+                    try:
+                        payload = stripped.split(':', 1)[1].lstrip(' \t')
+                    except Exception:
+                        payload = stripped
+                    stripped_payload = payload.lstrip('\ufeff').strip()
+                    if stripped_payload in ('', '[DONE]'):
+                        out_parts.append(stripped)
+                    elif not stripped_payload.startswith(('{', '[')):
+                        out_parts.append(
+                            await self._pii_response_process(stripped, active_t2p)
+                        )
+                    else:
+                        try:
+                            payload_aware = await self._pii_response_process_json_aware(
+                                payload, active_t2p, parsed_obj=parsed_obj
+                            )
+                            out_parts.append('data: ' + payload_aware)
+                        except Exception:
+                            logger.debug(
+                                '_pii_process_sse_line 多行块 data 回退',
+                                exc_info=True,
+                            )
+                            out_parts.append(
+                                await self._pii_response_process(stripped, active_t2p)
+                            )
+                else:
+                    # event:/id:/其他非 data 行原样保留（无需还原）
+                    out_parts.append(stripped)
+            return '\n'.join(out_parts)
         if not line.startswith('data:'):
             return await self._pii_response_process(line, active_t2p)
         # 统一剥离前缀（含 data:[DONE] 无空格与 data:  多空格）
@@ -1714,8 +1793,13 @@ class LlmMixin(AuditMixin):
                     )
                     restored_arg = _strip_partials(restored_arg)
                     if restored_arg:
+                        # 10.14 (API-SPEC): 用 _mk_anthropic_flush_event 构造
+                        # content_block_delta 事件（原 _mk_anthropic_delta_event
+                        # 访问 parsed['delta']——block_stop 事件无 delta 字段，
+                        # KeyError 被吞 → delta 事件静默丢失，规范破坏）。
+                        # pending 中对应 event 行由主循环 block_stop 分支清理。
                         await write(
-                            _mk_anthropic_delta_event(
+                            _mk_anthropic_flush_event(
                                 parsed, restored_arg, 'partial_json'
                             ).encode('utf-8')
                         )
@@ -2511,26 +2595,93 @@ class LlmMixin(AuditMixin):
                                 rc: str = '',
                                 fr: str | None = None,
                             ):
-                                """flush 内容作为 SSE 事件并清空缓冲区。"""
+                                """flush 内容作为 SSE 事件并清空缓冲区。
+
+                                10.14 (API-SPEC): 协议感知 —— 在 anthropic /
+                                responses 流中，非 content 事件（message_delta
+                                等）落 chat 分支时不能把残留缓冲用 chat 格式
+                                刷出（协议污染，SDK JSONDecodeError / 事件
+                                语义错误）。anthropic → content_block_delta
+                                text/thinking，responses → 对应 delta 事件，
+                                chat → 原 _mk_sse_event。
+                                """
                                 nonlocal content_buf, reasoning_buf
                                 if c or rc or fr:
-                                    if c:
-                                        c = await self._pii_response_process(
-                                            c, active_t2p
+                                    if is_anthropic_stream:
+                                        # 残留按 anthropic delta 类型输出
+                                        _dummy = {
+                                            'type': 'content_block_delta',
+                                            'index': 0,
+                                        }
+                                        if c:
+                                            c = await self._pii_response_process(
+                                                c, active_t2p
+                                            )
+                                            c = _strip_partials(c)
+                                            if c:
+                                                await _tracked_write(
+                                                    _mk_anthropic_flush_event(
+                                                        _dummy, c, 'text'
+                                                    ).encode('utf-8')
+                                                )
+                                        if rc:
+                                            rc = await self._pii_response_process(
+                                                rc, active_t2p
+                                            )
+                                            rc = _strip_partials(rc)
+                                            if rc:
+                                                await _tracked_write(
+                                                    _mk_anthropic_flush_event(
+                                                        _dummy, rc, 'thinking'
+                                                    ).encode('utf-8')
+                                                )
+                                    elif is_responses_stream:
+                                        _dummy = {
+                                            'type': 'response.output_text.delta',
+                                            'index': 0,
+                                        }
+                                        if c:
+                                            c = await self._pii_response_process(
+                                                c, active_t2p
+                                            )
+                                            c = _strip_partials(c)
+                                            if c:
+                                                await _tracked_write(
+                                                    _mk_responses_flush_event(
+                                                        'response.output_text.delta',
+                                                        c,
+                                                    ).encode('utf-8')
+                                                )
+                                        if rc:
+                                            rc = await self._pii_response_process(
+                                                rc, active_t2p
+                                            )
+                                            rc = _strip_partials(rc)
+                                            if rc:
+                                                await _tracked_write(
+                                                    _mk_responses_flush_event(
+                                                        'response.reasoning_text.delta',
+                                                        rc,
+                                                    ).encode('utf-8')
+                                                )
+                                    else:
+                                        if c:
+                                            c = await self._pii_response_process(
+                                                c, active_t2p
+                                            )
+                                            c = _strip_partials(c)
+                                        if rc:
+                                            rc = await self._pii_response_process(
+                                                rc, active_t2p
+                                            )
+                                            rc = _strip_partials(rc)
+                                        await _tracked_write(
+                                            _mk_sse_event(
+                                                content=c,
+                                                finish_reason=fr,
+                                                reasoning_content=rc,
+                                            ).encode(),
                                         )
-                                        c = _strip_partials(c)
-                                    if rc:
-                                        rc = await self._pii_response_process(
-                                            rc, active_t2p
-                                        )
-                                        rc = _strip_partials(rc)
-                                    await _tracked_write(
-                                        _mk_sse_event(
-                                            content=c,
-                                            finish_reason=fr,
-                                            reasoning_content=rc,
-                                        ).encode(),
-                                    )
                                 content_buf = ''
                                 reasoning_buf = ''
 
@@ -2790,6 +2941,10 @@ class LlmMixin(AuditMixin):
                                                             'response.completed',
                                                             'response.failed',
                                                             'response.incomplete',
+                                                            # 10.14 (API-SPEC): response.error
+                                                            # 是正常终止事件（错误后流结束）。
+                                                            # 不置位会误判截断合成注入假事件。
+                                                            'response.error',
                                                         ):
                                                             seen_terminal = True
                                                             seen_global_terminal = True
@@ -2873,6 +3028,23 @@ class LlmMixin(AuditMixin):
                                                             reasoning_buf,
                                                             arg_buf,
                                                         )
+                                                        # 10.14 (API-SPEC): block_stop 时
+                                                        # arg_buf 被 flush 为合成 delta 事件
+                                                        # （_mk_anthropic_flush_event），
+                                                        # 被持有的 input_json_delta 原始
+                                                        # event 行已多余——从 pending 清除
+                                                        # 对应 content_block_delta 行，
+                                                        # 避免流末残留透传成裸 event 块。
+                                                        if (
+                                                            parsed.get('type')
+                                                            == 'content_block_stop'
+                                                        ):
+                                                            slow_event_pending = [
+                                                                _ln
+                                                                for _ln in slow_event_pending
+                                                                if 'event: content_block_delta'
+                                                                not in _ln
+                                                            ]
                                                         _proto_text_ts = (
                                                             _time.monotonic()
                                                         )
@@ -2884,6 +3056,13 @@ class LlmMixin(AuditMixin):
                                                     ):
                                                         seen_terminal = True
 
+                                                        seen_global_terminal = True
+                                                    if parsed.get('type') == 'error':
+                                                        # 10.14 (API-SPEC): Anthropic 流
+                                                        # `event: error` 是正常终止事件
+                                                        # （错误后流结束，不再发 message_stop）。
+                                                        # 不置位会误判截断合成注入假事件。
+                                                        seen_terminal = True
                                                         seen_global_terminal = True
                                                     choices = parsed.get('choices', [])
                                                     # 9.3 (F-03): choices 全量遍历（spec
@@ -3230,6 +3409,24 @@ class LlmMixin(AuditMixin):
                                                             c=content_buf,
                                                             rc=reasoning_buf,
                                                         )
+                                                        # 10.14 (API-SPEC): 透传前把
+                                                        # 暂存的 event:/id: 行拼入同一块
+                                                        # （SSE 规范：event+data 同块，
+                                                        # 空行分隔）。anthropic 的
+                                                        # message_start/message_delta
+                                                        # 等非 delta 事件在这里透传，
+                                                        # 不拼装会把块拆成 event 独块 +
+                                                        # data 独块 → SDK JSONDecodeError
+                                                        # （responses 分支已有同逻辑）。
+                                                        if slow_event_pending:
+                                                            line = (
+                                                                '\n'.join(
+                                                                    slow_event_pending
+                                                                )
+                                                                + '\n'
+                                                                + line
+                                                            )
+                                                            slow_event_pending.clear()
                                                         # 审计阻断：抑制 tool_calls 事件流出
                                                         # （design D4：拒绝后 tool call 不发给客户端）
                                                         # 9.3: 用原始 line 判断（聚合 delta 可能为空）
@@ -3330,6 +3527,7 @@ class LlmMixin(AuditMixin):
                                                                 'response.completed',
                                                                 'response.failed',
                                                                 'response.incomplete',
+                                                                'response.error',
                                                             ):
                                                                 seen_terminal = True
                                                                 seen_global_terminal = (
@@ -3394,6 +3592,11 @@ class LlmMixin(AuditMixin):
                                                             parsed.get('type')
                                                             == 'message_stop'
                                                         ):
+                                                            seen_terminal = True
+                                                            seen_global_terminal = True
+                                                        if parsed.get('type') == 'error':
+                                                            # 10.14 (API-SPEC): 同主循环——
+                                                            # Anthropic error 事件也是正常终止
                                                             seen_terminal = True
                                                             seen_global_terminal = True
                                                         choices = parsed.get(
@@ -3823,7 +4026,11 @@ class LlmMixin(AuditMixin):
                                                                 'response.completed',
                                                                 'response.failed',
                                                                 'response.incomplete',
+                                                                # 10.14 (API-SPEC):
+                                                                # error 事件也是正常终止
+                                                                'response.error',
                                                                 'message_stop',
+                                                                'error',
                                                             )
                                                             if isinstance(
                                                                 _cr_parsed, dict
@@ -4237,7 +4444,10 @@ class LlmMixin(AuditMixin):
                                         'response.completed',
                                         'response.failed',
                                         'response.incomplete',
+                                        # 10.14 (API-SPEC): error 事件也是正常终止
+                                        'response.error',
                                         'message_stop',
+                                        'error',
                                     ):
                                         fast_seen_terminal = True
                                         fast_seen_global_terminal = True
@@ -4331,7 +4541,14 @@ class LlmMixin(AuditMixin):
                                             )
                                             _safe = _strip_partials(_rest)
                                             if _safe:
-                                                _restored_payload = _safe
+                                                # 10.14 (API-SPEC): 保留 chunk JSON 结构，
+                                                # 仅替换 choices[].delta.content 字段
+                                                # （原实现把整个 payload 换成裸文本，
+                                                # 破坏 chat.completion.chunk 结构，下游
+                                                # SDK JSONDecodeError）
+                                                _restored_payload = _fast_rebuild_chunk(
+                                                    _fp, _safe
+                                                )
                                             else:
                                                 return
                                         else:
@@ -4376,7 +4593,11 @@ class LlmMixin(AuditMixin):
                                                 fast_line_buf = _pend
                                                 fast_line_buf_ts = _time.monotonic()
                                             if _out_c:
-                                                _restored_payload = ''.join(_out_c)
+                                                # 10.14 (API-SPEC): 同上——保留 chunk JSON
+                                                # 结构，仅替换 delta.content
+                                                _restored_payload = _fast_rebuild_chunk(
+                                                    _fp, ''.join(_out_c)
+                                                )
                                             else:
                                                 # 无完整行可发：跳过本次 emit（行内持有）
                                                 return

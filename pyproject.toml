@@ -1,6 +1,6 @@
 [project]
 name = "credential-proxy"
-version = "0.9.23"
+version = "0.9.24"
 description = "三因子认证凭据代理服务 — Matrix 审批 + TPM 硬件解封 + KeePassXC 后端 + LLM 脱敏反向代理"
 requires-python = ">=3.12"
 license = {text = "MIT"}
@@ -21,6 +21,9 @@ Repository = "https://github.com/Keivry/credential-proxy"
 dev = [
     'pytest>=9.1.1',
     'pytest-asyncio>=1.4.0',
+    # 仅测试：真实 SDK 端到端验证三协议 SSE 规范符合性（10.14 API-SPEC）
+    'openai>=1.60.0',
+    'anthropic>=0.40.0',
 ]
 orjson = [
     'orjson>=3.9',
