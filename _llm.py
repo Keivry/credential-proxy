@@ -250,7 +250,9 @@ def _capture_usage_ctx(payload: str, metrics_ctx: dict, protocol: str) -> None:
             if isinstance(v, int):
                 cur[k] = cur.get(k, 0) + v
         if norm.get('unknown'):
-            cur['unknown'] = cur.get('unknown', 0) + 1
+            # 幂等：unknown 表示“该请求无法归一”，按请求计 1 次而非按 chunk 累加
+            # （Anthropic message_start + message_delta 两段式会重复计数）
+            cur['unknown'] = max(cur.get('unknown', 0), 1)
     except Exception:
         logger.debug('usage 归一失败（fail-open）', exc_info=True)
 
@@ -2343,6 +2345,11 @@ class LlmMixin(AuditMixin):
                 else:
                     # 非对话尾：透传原文，不走 walk/脱敏
                     out_body = body_text.encode('utf-8') if body_text else body
+                # 事件摘要：请求体（已脱敏 out_body）存入，供最近事件展示与 ?kind= 过滤
+                # （redact_summary 在 incr_event 内二次脱敏 + 截断 120 字符）
+                _metrics_ctx['raw_summary'] = (
+                    out_body.decode('utf-8', errors='replace') if out_body else ''
+                )
                 # 快速路径：无 token 时不扫描（门控扩展：PII token 同样触发还原路径）
                 pii_scope = self._pii_scope_or_none()
                 has_cred = snapshot_t2p and b'__VG_CRED_' in out_body

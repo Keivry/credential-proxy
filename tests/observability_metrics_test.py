@@ -240,15 +240,44 @@ class TestCollectorCore:
         conn.close()
 
     def test_queue_full_dropped(self, collector):
-        # 填满队列（maxsize=128）：直接塞 130 个快照触发 dropped（丢最老再入队）
+        # 填满队列（maxsize=512）：直接塞 520 个快照触发 dropped（丢最老再入队）
         snap = [{'date': '2026-08-28', 'upstream': '8878', 'requests': 1}]
-        for _ in range(130):
+        for _ in range(520):
             collector._enqueue(snap)
         assert collector._dropped_snapshots > 0
         assert collector._first_dropped_ts is not None
         assert collector._last_dropped_ts is not None
         # 队列内仍保留最新（丢最老）且不超过 maxsize
-        assert collector._queue.qsize() <= 128
+        assert collector._queue.qsize() <= 512
+
+    def test_incr_event_summary_redacted(self, collector):
+        """raw_summary 经 redact_summary 脱敏后入 recent_events（PII 占位符 → [REDACTED:token]）。"""
+        run(
+            collector.incr_event(
+                request_id='req-1',
+                upstream='8878',
+                status=200,
+                raw_summary=(
+                    'user said __PII_608_f7cff63a__ and __PII_123_abcdef12__ '
+                    'and __PII_609_b1f9c4ca__'
+                ),
+            )
+        )
+        ev = collector.events(limit=5)[-1]
+        assert '__PII_608_f7cff63a__' not in ev['summary']
+        assert '__PII_123_abcdef12__' not in ev['summary']
+        assert '__PII_609_b1f9c4ca__' not in ev['summary']
+        assert '[REDACTED:token]' in ev['summary']
+
+    def test_incr_event_tokens_deep_copy(self, collector):
+        """tokens 内层 dict 也须防御性拷贝：外部突变不污染 recent_events/聚合。"""
+        tokens = {'gpt-4o': {'prompt': 10, 'completion': 5}}
+        run(collector.incr_event(request_id='req-t', upstream='8878', status=200, tokens=tokens))
+        tokens['gpt-4o']['prompt'] = 999
+        tokens['gpt-4o']['new'] = 1
+        ev = collector.events(limit=5)[-1]
+        assert ev['tokens']['gpt-4o']['prompt'] == 10
+        assert 'new' not in ev['tokens']['gpt-4o']
 
     def test_wal_and_version(self, collector):
         run(collector.flush())

@@ -157,9 +157,16 @@ class _RateLimiter:
         self.limit = limit
         self.window_s = window_s
         self._hits: dict[str, list[float]] = {}
+        self._calls = 0
 
     def allow(self, key: str) -> tuple[bool, int]:
         now = _time.time()
+        # 惰性清扫：每 1000 次调用清一次过期 key，防 IP 轮转/扫描器撑爆字典（防御性）
+        self._calls += 1
+        if self._calls % 1000 == 0:
+            cutoff = now - self.window_s
+            for k in [k for k, v in self._hits.items() if not v or v[-1] < cutoff]:
+                self._hits.pop(k, None)
         had = key in self._hits
         lst = [t for t in self._hits.get(key, []) if now - t < self.window_s]
         if had and not lst:
@@ -308,8 +315,9 @@ def init_observability(app: web.Application, collector) -> None:
         )
         set_cookie = ''
         if cookie_src and path != '/_admin/events/stream':
-            # tok 过字符集消毒：仅保留可打印 ASCII（防 ; \r \n 头注入）
-            cookie_val = re.sub(r'[^\x21-\x7E]', '', tok)
+            # tok 收紧为 RFC6265 cookie-octet 安全子集（排除 ; , = 空格等分隔符，
+            # 防 Set-Cookie 属性注入；比前轮的 [^\x21-\x7E] 更严）
+            cookie_val = re.sub(r'[^A-Za-z0-9._~+/=-]', '', tok)
             # __Host- 前缀要求 Secure + Path=/（且仅 HTTPS 可用）；回退 admin_token 兼容 http
             scheme = request.scheme
             if scheme == 'https':
@@ -437,7 +445,8 @@ async def _handle_sse(request: web.Request, collector) -> web.StreamResponse:
     try:
         while True:
             # 推送新事件（自上次推送以来，按 request_id 去重）
-            evs = collector.events(limit=50)
+            # 取数窗口 200：2s 轮询间隔内 QPS≤100 不丢（50 在 >25 rps 时截断丢事件）
+            evs = collector.events(limit=200)
             new_evs = [
                 e
                 for e in evs

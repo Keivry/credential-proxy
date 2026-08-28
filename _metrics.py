@@ -22,6 +22,7 @@ import re as _re
 import sqlite3
 import threading
 import time
+import urllib.parse
 from collections import OrderedDict, deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -59,7 +60,10 @@ BUILTIN_KINDS = {
 
 RING_MAXLEN = 10000
 FLUSH_INTERVAL_S = 300  # 5min
-QUEUE_MAXSIZE = 128
+# 有界队列上限：单 upstream 满 30d+168h 时 _snapshot 产出 198 条快照，
+# 128 会固定丢最老 70 条；512 覆盖单 U 198 + 多 U 积压余量
+# （flush 后立即 _drain_async 消费，队列主要缓冲单次 flush 积压）
+QUEUE_MAXSIZE = 512
 DAILY_RETENTION_DAYS = 30
 HOURLY_RETENTION_HOURS = 24 * 7
 DB_FILE = 'metrics.sqlite'
@@ -202,7 +206,8 @@ def redact_summary(raw: str, limit: int = 120) -> str:
     if not raw:
         return ''
     out = _PII_TOKEN_RE.sub('[REDACTED:token]', raw)
-    out = _CRED_TOKEN_RE.sub('[REDACTED:cred]', out)
+    # _CRED_TOKEN_RE 已被 _PII_TOKEN_RE 覆盖（__VG_CRED_\d{4,}__ 是后者的子集），
+    # 删除冗余 sub 避免死分支（保留正则定义供诊断/测试引用）
     out = _API_KEY_RE.sub('[REDACTED:key]', out)
     out = _EMAIL_RE.sub('[REDACTED:email]', out)
     out = _PHONE_RE.sub('[REDACTED:phone]', out)
@@ -401,9 +406,10 @@ class MetricsCollector:
 
     def _connect_db(self) -> None:
         try:
-            os.makedirs(self.data_dir, exist_ok=True)
             old_umask = os.umask(0o077)
             try:
+                # makedirs 也须在 umask 窗口内：裸机首启 DATA_DIR 应 700 而非 755
+                os.makedirs(self.data_dir, exist_ok=True)
                 conn = sqlite3.connect(
                     self.db_path, timeout=5.0, check_same_thread=False
                 )
@@ -683,9 +689,14 @@ class MetricsCollector:
             delta_pii[sk] = delta_pii.get(sk, 0) + v
         delta_verdict: dict[str, int] = dict(audit_by_verdict or {})
         delta_rule: dict[str, int] = dict(audit_by_rule or {})
-        # 防御性拷贝：metrics_ctx['tokens'] 是请求局部 dict，后续 _capture_usage_ctx
-        # 流式增量修改会污染 recent_events/聚合已引用的同一对象
-        tokens_d = dict(tokens) if tokens else {}
+        # 防御性拷贝（内层也拷）：metrics_ctx['tokens'] 是请求局部 dict，流式增量修改
+        # 会污染 recent_events/聚合已引用的同一对象；tokens 结构为 {model: {k: int}}，
+        # 内层 dict 也须隔离（浅拷贝外层不足以防止内层共享引用）
+        tokens_d = (
+            {k: dict(v) if isinstance(v, dict) else v for k, v in tokens.items()}
+            if tokens
+            else {}
+        )
         latency_ms_v = latency_ms if latency_ms is not None else None
         # 锁外做脱敏（5 个正则替换，避免占用全局锁）
         summary_redacted = redact_summary(raw_summary, 120) if raw_summary else ''
@@ -1054,8 +1065,11 @@ class MetricsCollector:
         cutoff_hour = _hour_key(_utc_now() - hours * 3600)
         cutoff_date = _day_key(_utc_now() - hours * 3600)
         try:
+            # DATA_DIR 可能含空格/?/#，须 URL 编码后再拼 URI
             ro_conn = sqlite3.connect(
-                f'file:{self.db_path}?mode=ro', uri=True, timeout=5.0
+                f'file:{urllib.parse.quote(self.db_path, safe="/")}?mode=ro',
+                uri=True,
+                timeout=5.0,
             )
         except sqlite3.Error:
             return self._query_memory_fallback(hours, model_filter)
