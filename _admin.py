@@ -264,23 +264,25 @@ def init_observability(app: web.Application, collector) -> None:
         if not path.startswith(_ADMIN_PATH_PREFIX):
             return web.Response(status=404)
 
-        # 401 优先于 405：未鉴权直接 401 不触 DB（含 POST 无 token）
         # 管理接口 10/min/IP 限流（IP 维度，鉴权前计数——防坏 token 爆破）
         # 空/None remote 归一为 'unknown' 单列桶，防全局坍缩
         remote = request.remote or 'unknown'
-        if path != '/_admin/events/stream':
-            ok, retry = rate.allow(remote)
-            if not ok:
-                return _too_many(retry_after=retry)
-        # ④ 回环免 token（仅 ENV==dev && ALLOW_LOOPBACK_NO_TOKEN==1 && GET）
+        # 回环免 token（仅 ENV==dev && ALLOW_LOOPBACK_NO_TOKEN==1 && GET）
         # spec：Docker/反代下回环不可靠，仅 dev 调试时精确回环放行 + warning
-        tok = ''
-        if (
+        # 判定先于限流：dev 回环合法请求不计入 10/min 桶（防 dev 自锁）
+        is_loopback_grace = (
             os.environ.get('ENV', 'prod') == 'dev'
             and os.environ.get('ALLOW_LOOPBACK_NO_TOKEN') == '1'
             and method == 'GET'
             and _is_loopback(remote)
-        ):
+        )
+        if path != '/_admin/events/stream' and not is_loopback_grace:
+            ok, retry = rate.allow(remote)
+            if not ok:
+                return _too_many(retry_after=retry)
+        # ④ 回环免 token 放行（上述判定）→ 跳过鉴权
+        tok = ''
+        if is_loopback_grace:
             logger.warning('回环免 token 放行（dev 调试）: remote=%s', remote)
         else:
             # ① 非 SSE 带 ?access_token 恒 401（不评估 header/cookie）
@@ -344,7 +346,7 @@ def init_observability(app: web.Application, collector) -> None:
                 sse_reg.release(remote)
         else:
             if path == '/_admin/metrics':
-                resp = _handle_metrics(request, collector)
+                resp = await _handle_metrics(request, collector)
             elif path == '/_admin/events':
                 resp = _handle_events(request, collector)
             elif path == '/_admin/health':
@@ -370,14 +372,20 @@ def _cookie_token(request: web.Request) -> str:
     return ''
 
 
-def _handle_metrics(request: web.Request, collector) -> web.Response:
-    """GET /_admin/metrics?range=1h|24h|7d|30d。"""
+async def _handle_metrics(request: web.Request, collector) -> web.Response:
+    """GET /_admin/metrics?range=1h|24h|7d|30d。
+
+    查询在 executor 中执行（_query_db 有 SQLite 建连 + JSON 解析，同步执行会阻塞 event loop）。
+    """
     range_ = request.query.get('range', '1h')
     if range_ not in ('1h', '24h', '7d', '30d'):
         range_ = '1h'
     model_filter = request.query.get('model') or None
+    loop = asyncio.get_running_loop()
     try:
-        data = collector.query_range(range_, model_filter=model_filter)
+        data = await loop.run_in_executor(
+            None, collector.query_range, range_, model_filter
+        )
     except Exception as e:  # pragma: no cover — 防御
         logger.warning('metrics 查询异常: %s', e)
         data = {'error': 'metrics_unavailable', 'range': range_}
@@ -437,11 +445,21 @@ async def _handle_sse(request: web.Request, collector) -> web.StreamResponse:
         },
     )
     await resp.prepare(request)
+    # 已推送事件去重：set 提供 O(1) 判重，deque 维持 2000 淘汰（set+deque 双结构防 O(n·m) 扫描）
+    sent_set: set[str] = set()
+    sent_ids: deque[str] = deque(maxlen=2000)
+    # 连接时先推最近历史快照，避免"刚连上空白"（dashboard 打开即有数据）
+    for e in reversed(collector.events(limit=50)):
+        _rid = e.get('request_id', '')
+        if _rid and _rid not in sent_set:
+            sent_set.add(_rid)
+            sent_ids.append(_rid)
+        await resp.write(
+            f'event: event\ndata: {json.dumps(e, ensure_ascii=False)}\n\n'.encode()
+        )
     last_push_ts = _time.time()
     last_ping_ts = _time.time()
     start = _time.time()
-    # 已推送事件去重游标：同秒多请求（同 ts）也能全部推送，防 `> last_ts` 丢同 ts 事件
-    sent_ids: deque[str] = deque(maxlen=2000)
     try:
         while True:
             # 推送新事件（自上次推送以来，按 request_id 去重）
@@ -451,12 +469,16 @@ async def _handle_sse(request: web.Request, collector) -> web.StreamResponse:
                 e
                 for e in evs
                 if e.get('ts', 0) >= last_push_ts
-                and e.get('request_id', '') not in sent_ids
+                and e.get('request_id', '') not in sent_set
             ]
             for e in reversed(new_evs):
                 _rid = e.get('request_id', '')
-                if _rid:
+                if _rid and _rid not in sent_set:
+                    sent_set.add(_rid)
                     sent_ids.append(_rid)
+                    if len(sent_ids) >= 2000:
+                        # deque 已满：重建 set 防残留（O(n) 重建，2000 次推送一次）
+                        sent_set = set(sent_ids)
                 await resp.write(
                     f'event: event\ndata: {json.dumps(e, ensure_ascii=False)}\n\n'.encode()
                 )

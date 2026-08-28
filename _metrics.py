@@ -188,12 +188,21 @@ def _chmod_0600(path: str) -> None:
 
 _PII_TOKEN_RE = _re.compile(r'__PII_\d+_[0-9a-fA-F]{8}__|__VG_CRED_\d{4,}__')
 _CRED_TOKEN_RE = _re.compile(r'__VG_CRED_\d{4,}__')
+# 常见密钥形态：sk-*（OpenAI 含 sk-proj-/sk-ant-）、xox*（Slack）、ghp_/gho_/github_pat_（GitHub）、
+# AKIA*（AWS）、Bearer JWT（eyJ...）。raw_summary 来自已脱敏请求体，此处兜底防遗漏形态明文入库。
 _API_KEY_RE = _re.compile(
-    r'(?i)\b(sk-[A-Za-z0-9_\-]{16,}|xox[baprs]-[A-Za-z0-9\-]{10,})\b'
+    r'(?i)\b(sk-[A-Za-z0-9_\-]{16,}|xox[baprs]-[A-Za-z0-9\-]{10,}|'
+    r'ghp_[A-Za-z0-9_]{30,}|gho_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{20,}|'
+    r'AKIA[0-9A-Z]{16}|Bearer\s+eyJ[A-Za-z0-9_\-\.]{20,}|'
+    r'sk-[A-Za-z0-9_\-]{20,})\b'
 )
 _EMAIL_RE = _re.compile(r'\b[\w.+-]+@[\w-]+\.[\w.-]{2,}\b')
 # 手机号明文（与 _pii.py 同款模式：前缀段验证 13x-19x，防误伤长数字串）
-_PHONE_RE = _re.compile(r'(?<!\d)(?:86[- ]?)?1[3-9]\d{9}(?!\d)')
+# 覆盖连续 11 位 + 带分隔符形态（138-0013-8000 / 138 0013 8000 / +86 138 0013 8000）
+_PHONE_RE = _re.compile(
+    r'(?<!\d)(?:(?:86|\+86)[- ]?)?(?:1[3-9]\d{9}|'
+    r'1[3-9]\d[- ]?\d{4}[- ]?\d{4})(?!\d)'
+)
 
 
 def redact_summary(raw: str, limit: int = 120) -> str:
@@ -1350,9 +1359,23 @@ class MetricsCollector:
             except (asyncio.CancelledError, Exception):
                 pass
         await self.flush()
-        # 等待写盘 executor 排空
+        # 等待写盘 executor 排空；shutdown 也移出 event loop（writer 卡 busy_timeout/ENOSPC 时
+        # 不阻塞事件循环；shutdown(wait=True) 在后台线程完成）
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(self._writer_executor, self._drain_queue)
+
+        def _shutdown_writers() -> None:
+            # 两个 executor 的 shutdown(wait=True) 在后台线程执行，避免阻塞 event loop
+            try:
+                self._writer_executor.shutdown(wait=True)
+            except RuntimeError:
+                pass
+            try:
+                self._p95_executor.shutdown(wait=True)
+            except RuntimeError:
+                pass
+
+        await loop.run_in_executor(None, _shutdown_writers)
         if self._conn is not None:
             try:
                 self._conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
@@ -1365,8 +1388,7 @@ class MetricsCollector:
             except sqlite3.Error:
                 pass
             self._conn = None
-        self._p95_executor.shutdown(wait=True)
-        self._writer_executor.shutdown(wait=True)
+        # executor shutdown 已在 _shutdown_writers（run_in_executor 后台）完成
 
     def _drain_queue(self) -> None:
         while True:
