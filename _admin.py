@@ -158,7 +158,12 @@ class _RateLimiter:
 
     def allow(self, key: str) -> tuple[bool, int]:
         now = _time.time()
+        had = key in self._hits
         lst = [t for t in self._hits.get(key, []) if now - t < self.window_s]
+        if had and not lst:
+            # 已有 key 但窗口内无记录 → 清空防残留（全新 key 走正常写入）
+            self._hits.pop(key, None)
+            return True, 0
         if len(lst) >= self.limit:
             retry = int(self.window_s - (now - lst[0])) + 1
             self._hits[key] = lst
@@ -250,40 +255,71 @@ def init_observability(app: web.Application, collector) -> None:
 
         # 401 优先于 405：未鉴权直接 401 不触 DB（含 POST 无 token）
         # 管理接口 10/min/IP 限流（IP 维度，鉴权前计数——防坏 token 爆破）
-        remote = request.remote or ''
+        # 空/None remote 归一为 'unknown' 单列桶，防全局坍缩
+        remote = request.remote or 'unknown'
         if path != '/_admin/events/stream':
             ok, retry = rate.allow(remote)
             if not ok:
                 return _too_many(retry_after=retry)
-        # ① 非 SSE 带 ?access_token 恒 401（不评估 header/cookie）
-        q = request.query.get('access_token', '')
-        if q and path != '/_admin/events/stream':
-            return _unauthorized()
-        # ② 三路凭证：header > cookie > query（query 仅 SSE）
-        tok = request.headers.get('X-Admin-Token', '')
-        if not tok:
-            tok = _cookie_token(request)
-        if not tok and path == '/_admin/events/stream':
-            tok = q
-        if not tok:
-            return _unauthorized()
-        # ③ 时序安全比较（等长 sha256 摘要）
-        expected = _obs_token()
-        if not expected or not hmac.compare_digest(
-            hashlib.sha256(tok.encode('utf-8')).hexdigest(),
-            hashlib.sha256(expected.encode('utf-8')).hexdigest(),
-        ):
-            return _unauthorized()
-
         # ④ 回环免 token（仅 ENV==dev && ALLOW_LOOPBACK_NO_TOKEN==1 && GET）
-        # 已通过上面凭证校验才到这里——回环是额外放行，不是替代
-        # （按 spec：ALLOW_LOOPBACK 是「放行」逻辑，放在凭证校验后）
+        # spec：Docker/反代下回环不可靠，仅 dev 调试时精确回环放行 + warning
+        tok = ''
+        if (
+            os.environ.get('ENV', 'prod') == 'dev'
+            and os.environ.get('ALLOW_LOOPBACK_NO_TOKEN') == '1'
+            and method == 'GET'
+            and _is_loopback(remote)
+        ):
+            logger.warning('回环免 token 放行（dev 调试）: remote=%s', remote)
+        else:
+            # ① 非 SSE 带 ?access_token 恒 401（不评估 header/cookie）
+            q = request.query.get('access_token', '')
+            if q and path != '/_admin/events/stream':
+                return _unauthorized()
+            # ② 三路凭证：header > cookie > query（query 仅 SSE）
+            tok = request.headers.get('X-Admin-Token', '')
+            if not tok:
+                tok = _cookie_token(request)
+            if not tok and path == '/_admin/events/stream':
+                tok = q
+            if not tok:
+                return _unauthorized()
+            # ③ 时序安全比较（等长 sha256 摘要）
+            expected = _obs_token()
+            if not expected or not hmac.compare_digest(
+                hashlib.sha256(tok.encode('utf-8')).hexdigest(),
+                hashlib.sha256(expected.encode('utf-8')).hexdigest(),
+            ):
+                return _unauthorized()
 
         # ⑤ 鉴权通过后：非法方法 405
         if method != 'GET':
             return _method_not_allowed()
 
-        # 管理接口 10/min/IP 限流（已在鉴权前计数；此处仅 SSE 并发限流）
+        # ⑥ 凭证来自 header（非 cookie）时签发登录 Cookie（HttpOnly/SameSite=Strict）
+        # 仅非 SSE 路径签发——SSE 保持 header/query，避免每帧 Set-Cookie
+        # tok 非空才签（回环免 token 放行时 tok='' 不签空 Cookie）
+        cookie_src = (
+            'header' if (request.headers.get('X-Admin-Token', '') and tok) else ''
+        )
+        set_cookie = ''
+        if cookie_src and path != '/_admin/events/stream':
+            # __Host- 前缀要求 Secure + Path=/（且仅 HTTPS 可用）；回退 admin_token 兼容 http
+            scheme = request.scheme
+            if scheme == 'https':
+                set_cookie = (
+                    '__Host-admin_token='
+                    + tok
+                    + '; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=3600'
+                )
+            else:
+                set_cookie = (
+                    'admin_token='
+                    + tok
+                    + '; HttpOnly; SameSite=Lax; Path=/; Max-Age=3600'
+                )
+
+        # ⑦ 管理接口 10/min/IP 限流（已在鉴权前计数；此处仅 SSE 并发限流）
         if path == '/_admin/events/stream':
             if not sse_reg.try_acquire(remote):
                 return _too_many(retry_after=60)
@@ -293,13 +329,17 @@ def init_observability(app: web.Application, collector) -> None:
                 sse_reg.release(remote)
         else:
             if path == '/_admin/metrics':
-                return _handle_metrics(request, collector)
-            if path == '/_admin/events':
-                return _handle_events(request, collector)
-            if path == '/_admin/health':
-                return _handle_health(request, collector)
-            # 其余（含 metrics/prometheus）404
-            return web.Response(status=404)
+                resp = _handle_metrics(request, collector)
+            elif path == '/_admin/events':
+                resp = _handle_events(request, collector)
+            elif path == '/_admin/health':
+                resp = _handle_health(request, collector)
+            else:
+                # 其余（含 metrics/prometheus）404
+                return web.Response(status=404)
+            if cookie_src:
+                resp.headers['Set-Cookie'] = set_cookie
+            return resp
 
     app.router.add_route('*', '/_admin/{tail:.*}', _admin_handler)
     app.router.add_route('*', '/_admin', _admin_handler)

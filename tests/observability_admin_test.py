@@ -193,3 +193,57 @@ def _read_admin_html() -> str:
 
     p = Path(__file__).parent.parent / 'admin.html'
     return p.read_text(encoding='utf-8')
+
+
+# ── 审查修复回归（2026-08-28 四维审查）──
+
+
+class TestRateLimiterCleanup:
+    def test_expired_key_removed(self):
+        rl = _RateLimiter(limit=10, window_s=60)
+        rl.allow('1.2.3.4')
+        # 模拟时间流逝（直接篡改内部时间戳为过期）
+        import time as _t
+
+        rl._hits['1.2.3.4'] = [_t.time() - 120]
+        ok, _ = rl.allow('1.2.3.4')
+        assert ok is True
+        # 空窗口 key 应被清理（防空列表永久残留）
+        assert '1.2.3.4' not in rl._hits
+
+    def test_active_key_kept(self):
+        rl = _RateLimiter(limit=10, window_s=60)
+        rl.allow('1.2.3.4')
+        ok, _ = rl.allow('1.2.3.4')
+        assert ok is True
+        assert '1.2.3.4' in rl._hits
+
+
+class TestSseRegistryIdempotent:
+    def test_release_below_one_pops(self):
+        reg = _SseRegistry(max_concurrent=5)
+        assert reg.try_acquire('9.9.9.9') is True
+        reg.release('9.9.9.9')
+        # 二次 release 幂等（不抛、不把计数扣成负数）
+        reg.release('9.9.9.9')
+        assert '9.9.9.9' not in reg._conns
+
+
+class TestEventsSummaryRedacted:
+    def test_summary_never_contains_raw_secret(self, collector):
+        import asyncio as _a
+
+        async def _run():
+            await collector.incr_event(
+                upstream='8878',
+                status=200,
+                request_id='r-redact-1',
+                raw_summary='call tool with key-sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 and phone 13800138000',
+            )
+
+        _a.run(_run())
+        evs = collector.events(limit=10)
+        assert evs, '应有事件'
+        s = evs[0].get('summary', '')
+        assert 'ABCDEFGHIJKLMNOPQRSTUVWXYZ123456' not in s
+        assert '13800138000' not in s

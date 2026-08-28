@@ -243,8 +243,9 @@
       headers: { 'X-Admin-Token': t }
     }).then(function (r) {
       if (r.status === 200) {
-        state.token = t;
-        // 服务端已 Set-Cookie；清除 URL 残留 ?access_token
+        // 服务端已 Set-Cookie（HttpOnly）——后续请求与 SSE 全走 Cookie，
+        // 内存不留明文 token，URL 不拼 ?access_token（防日志/历史泄漏）
+        state.token = '__cookie__';
         history.replaceState({}, '', '/_admin/');
         showApp();
       } else {

@@ -23,6 +23,7 @@ import sqlite3
 import threading
 import time
 from collections import OrderedDict, deque
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
@@ -187,6 +188,8 @@ _API_KEY_RE = _re.compile(
     r'(?i)\b(sk-[A-Za-z0-9_\-]{16,}|xox[baprs]-[A-Za-z0-9\-]{10,})\b'
 )
 _EMAIL_RE = _re.compile(r'\b[\w.+-]+@[\w-]+\.[\w.-]{2,}\b')
+# 手机号明文（与 _pii.py 同款模式：前缀段验证 13x-19x，防误伤长数字串）
+_PHONE_RE = _re.compile(r'(?<!\d)(?:86[- ]?)?1[3-9]\d{9}(?!\d)')
 
 
 def redact_summary(raw: str, limit: int = 120) -> str:
@@ -202,6 +205,7 @@ def redact_summary(raw: str, limit: int = 120) -> str:
     out = _CRED_TOKEN_RE.sub('[REDACTED:cred]', out)
     out = _API_KEY_RE.sub('[REDACTED:key]', out)
     out = _EMAIL_RE.sub('[REDACTED:email]', out)
+    out = _PHONE_RE.sub('[REDACTED:phone]', out)
     if len(out) <= limit:
         return out
     # 截断边界半字符保护：逐字符回退直到落在 UTF-8 边界
@@ -617,7 +621,23 @@ class MetricsCollector:
         for (hour, up), hagg in list(self._hourly.items()):
             s = {'hour': hour, 'upstream': up, **_copy_hourly(hagg).to_dict()}
             out.append(s)
+        self._trim_memory(now)
         return out
+
+    def _trim_memory(self, now: float) -> None:
+        """内存累计滚动清理：_daily 保留 30d、_hourly 保留 7d（与 DB 保留一致）。"""
+        day_cutoff = time.strftime(
+            '%Y-%m-%d',
+            time.gmtime(now - DAILY_RETENTION_DAYS * 86400),
+        )
+        hour_cutoff = time.strftime(
+            '%Y-%m-%dT%H:00:00Z',
+            time.gmtime(now - HOURLY_RETENTION_HOURS * 3600),
+        )
+        for key in [k for k in self._daily if k[0] < day_cutoff]:
+            del self._daily[key]
+        for key in [k for k in self._hourly if k[0] < hour_cutoff]:
+            del self._hourly[key]
 
     # ── 事件递增 ──
 
@@ -735,7 +755,7 @@ class MetricsCollector:
                         'cred_miss': cred_miss,
                         'tokens': tokens_d,
                         'verdict': verdict,
-                        'summary': raw_summary[:120],
+                        'summary': redact_summary(raw_summary, 120),
                         'client_gone': client_gone,
                         'exception': exception,
                     }
@@ -847,8 +867,15 @@ class MetricsCollector:
             while True:
                 await asyncio.sleep(FLUSH_INTERVAL_S)
                 await self.flush()
+                # 立即消费队列（单写者 executor 串行写盘）——避免有界队列只入不出的断流
+                await self._drain_async()
         except asyncio.CancelledError:
             pass
+
+    async def _drain_async(self) -> None:
+        """把队列中的快照交给单写者线程写盘（背压保留：队列仍是有界的）。"""
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._writer_executor, self._drain_queue)
 
     def start(self) -> None:
         """启动 5min 定时 flush（需在运行事件循环内调用；无循环时惰性跳过）。"""
@@ -1297,69 +1324,108 @@ class MetricsCollector:
 
     # ── 线程安全入口（供锁外同步路径调用）──
 
+    def _sync_fail_open(self, fn: Callable[[], None]) -> None:
+        """热路径埋点 fail-open：观测异常绝不阻断业务（脱敏/审计/注册）。"""
+        try:
+            fn()
+        except Exception as e:
+            logger.debug('metrics 同步埋点失败（fail-open）: %s', e)
+
     def incr_sync_lru(self, cred: int = 0, pii: int = 0) -> None:
         """同步 LRU 淘汰递增（无事件循环环境；直接写内存累计）。"""
-        now = _utc_now()
-        day = _day_key(now)
-        hour = _hour_key(now)
-        # 事件循环单线程中同步调用不会并发 → 直接改（无 await）
-        d = self._daily.setdefault((day, 'other'), _DailyAgg())
-        h = self._hourly.setdefault((hour, 'other'), _HourlyAgg())
-        d.cred_lru_evictions += cred
-        d.pii_lru_evictions += pii
-        h.cred_lru_evictions += cred
-        h.pii_lru_evictions += pii
+
+        def _do() -> None:
+            now = _utc_now()
+            day = _day_key(now)
+            hour = _hour_key(now)
+            # 事件循环单线程中同步调用不会并发 → 直接改（无 await）
+            d = self._daily.setdefault((day, 'other'), _DailyAgg())
+            h = self._hourly.setdefault((hour, 'other'), _HourlyAgg())
+            d.cred_lru_evictions += cred
+            d.pii_lru_evictions += pii
+            h.cred_lru_evictions += cred
+            h.pii_lru_evictions += pii
+
+        self._sync_fail_open(_do)
 
     def incr_sync_pii_cache(self, hit: int = 0, miss: int = 0) -> None:
         """同步 pii_cache_hit/miss 递增（register 钩子调用）。"""
-        now = _utc_now()
-        day = _day_key(now)
-        d = self._daily.setdefault((day, 'other'), _DailyAgg())
-        d.pii_hits += hit
-        d.pii_miss += miss
+
+        def _do() -> None:
+            now = _utc_now()
+            day = _day_key(now)
+            d = self._daily.setdefault((day, 'other'), _DailyAgg())
+            d.pii_hits += hit
+            d.pii_miss += miss
+
+        self._sync_fail_open(_do)
 
     def incr_sync_pii_detected(self, by_kind: dict[str, int]) -> None:
         """同步 pii_detected_total{kind} 递增（scan 钩子调用，sanitize 后）。"""
-        now = _utc_now()
-        day = _day_key(now)
-        d = self._daily.setdefault((day, 'other'), _DailyAgg())
-        for kind, n in by_kind.items():
-            d.pii_by_type[kind] = d.pii_by_type.get(kind, 0) + n
+
+        def _do() -> None:
+            now = _utc_now()
+            day = _day_key(now)
+            d = self._daily.setdefault((day, 'other'), _DailyAgg())
+            for kind, n in by_kind.items():
+                d.pii_by_type[kind] = d.pii_by_type.get(kind, 0) + n
+
+        self._sync_fail_open(_do)
 
     def incr_sync_placeholder_injected(self) -> None:
         """同步 placeholder_prompt_injected_total 递增（注入发生与否）。"""
-        now = _utc_now()
-        day = _day_key(now)
-        d = self._daily.setdefault((day, 'other'), _DailyAgg())
-        d.placeholder_prompt_injected += 1
+
+        def _do() -> None:
+            now = _utc_now()
+            day = _day_key(now)
+            d = self._daily.setdefault((day, 'other'), _DailyAgg())
+            d.placeholder_prompt_injected += 1
+
+        self._sync_fail_open(_do)
 
     def incr_sync_cred(self, hit: int = 0, miss: int = 0) -> None:
         """同步 cred_hit/miss 递增（_register_secret 钩子调用）。"""
-        now = _utc_now()
-        day = _day_key(now)
-        d = self._daily.setdefault((day, 'other'), _DailyAgg())
-        d.cred_hits += hit
-        d.cred_miss += miss
+
+        def _do() -> None:
+            now = _utc_now()
+            day = _day_key(now)
+            d = self._daily.setdefault((day, 'other'), _DailyAgg())
+            d.cred_hits += hit
+            d.cred_miss += miss
+
+        self._sync_fail_open(_do)
 
     def incr_sync_audit(self, verdict: str, rule: str) -> None:
         """同步 audit_by_verdict / audit_by_rule 递增（audit_tool_call 钩子）。"""
-        now = _utc_now()
-        day = _day_key(now)
-        d = self._daily.setdefault((day, 'other'), _DailyAgg())
-        d.audit_by_verdict[verdict] = d.audit_by_verdict.get(verdict, 0) + 1
-        if rule:
-            d.audit_by_rule[rule] = d.audit_by_rule.get(rule, 0) + 1
+
+        def _do() -> None:
+            now = _utc_now()
+            day = _day_key(now)
+            d = self._daily.setdefault((day, 'other'), _DailyAgg())
+            d.audit_by_verdict[verdict] = d.audit_by_verdict.get(verdict, 0) + 1
+            if rule:
+                d.audit_by_rule[rule] = d.audit_by_rule.get(rule, 0) + 1
+
+        self._sync_fail_open(_do)
 
     def incr_sync_audit_log_write_fail(self) -> None:
         """同步 audit_log_write_fail 计数（内存 gauge，不进聚合）。"""
-        self.counters['audit_log_write_fail'] = (
-            self.counters.get('audit_log_write_fail', 0) + 1
-        )
+
+        def _do() -> None:
+            self.counters['audit_log_write_fail'] = (
+                self.counters.get('audit_log_write_fail', 0) + 1
+            )
+
+        self._sync_fail_open(_do)
 
     def incr_sync_audit_approval(self, result: str) -> None:
         """同步 audit_approval_result 分布（内存计数，重启归零）。"""
-        cur = self.counters.setdefault('audit_approval_result', {})
-        cur[result] = cur.get(result, 0) + 1
+
+        def _do() -> None:
+            cur = self.counters.setdefault('audit_approval_result', {})
+            cur[result] = cur.get(result, 0) + 1
+
+        self._sync_fail_open(_do)
 
 
 _collector_singleton: MetricsCollector | None = None

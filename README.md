@@ -179,6 +179,7 @@ get revoke --name "check-mail"
 - Cookie：`HttpOnly` + `Secure`（仅 https；`ENV=dev` 且 `ALLOW_LOOPBACK_NO_TOKEN=1` 时 http 回退不带 `Secure`）；前端 `history.replaceState` 清除 URL 中的 `?access_token`；`admin.html` 密码输入框 `type=password autocomplete=current-password`。
 - **端口绑定**：docker-compose 默认 `127.0.0.1:887x:887x`（仅回环）；`0.0.0.0` 直出 `/_admin` 无 TLS 风险极大，外部访问必须经 TLS 反代。
 - **限流**：管理接口 `10/min/IP` 超限 `429 + Retry-After`；SSE `max 5 并发/IP` + `60s :ping` 心跳 + `5min` 服务端强制重连。
+- **限流 IP 维度说明**：限流按 `request.remote`（直连对端 IP）计数，**不读代理头**（`X-Forwarded-For` 等，防伪造绕过）；空/None remote 归一为 `unknown` 单列桶。经 TLS 反代/负载均衡访问时对端 IP 为反代地址，**所有客户端共享同一限流桶**（合法管理员与攻击者互相挤占）——此场景请直连或让反代透传真实 IP（aiohttp `trust_proxy_headers` 需显式开启并配置可信代理白名单）。
 - `OBSERVABILITY_DISABLE=1`：过渡逃生开关，`/_admin/*` 全 404（二期收紧）。
 
 ### 指标与存储

@@ -227,26 +227,29 @@ def _capture_usage_ctx(payload: str, metrics_ctx: dict, protocol: str) -> None:
             usage = msg_inner['usage']
     if not isinstance(usage, dict):
         return
-    from _metrics import normalize_usage
+    try:
+        from _metrics import normalize_usage
 
-    norm = normalize_usage(usage, protocol)
-    model = metrics_ctx.get('model', 'unknown_model')
-    tokens = metrics_ctx.setdefault('tokens', {})
-    cur = tokens.setdefault(model, {})
-    for k in (
-        'prompt',
-        'completion',
-        'total',
-        'input',
-        'output',
-        'cached_read',
-        'cached_write',
-    ):
-        v = norm.get(k)
-        if isinstance(v, int):
-            cur[k] = cur.get(k, 0) + v
-    if norm.get('unknown'):
-        cur['unknown'] = cur.get('unknown', 0) + 1
+        norm = normalize_usage(usage, protocol)
+        model = metrics_ctx.get('model', 'unknown_model')
+        tokens = metrics_ctx.setdefault('tokens', {})
+        cur = tokens.setdefault(model, {})
+        for k in (
+            'prompt',
+            'completion',
+            'total',
+            'input',
+            'output',
+            'cached_read',
+            'cached_write',
+        ):
+            v = norm.get(k)
+            if isinstance(v, int):
+                cur[k] = cur.get(k, 0) + v
+        if norm.get('unknown'):
+            cur['unknown'] = cur.get('unknown', 0) + 1
+    except Exception:
+        logger.debug('usage 归一失败（fail-open）', exc_info=True)
 
 
 def parse_llm_proxy_env() -> dict[int, str]:
@@ -2403,7 +2406,10 @@ class LlmMixin(AuditMixin):
                 if isinstance(_req_obj, dict):
                     _m = _req_obj.get('model')
                     if isinstance(_m, str) and _m:
-                        _req_model = _m
+                        # model label 消毒：截断过长 + 去控制字符（防脏标签入 tokens dict/大盘）
+                        _req_model = (
+                            _m[:128].replace('\x00', '').strip() or 'unknown_model'
+                        )
                     _is_stream = bool(_req_obj.get('stream', False))
                     _tail_n = tail.rstrip('/')
                     if (
@@ -5663,7 +5669,7 @@ class LlmMixin(AuditMixin):
                         # 非对话尾归 other（不丢 requests_total）
                         if not is_dialog_tail:
                             _upstream = 'other'
-                        _mc.incr_event(
+                        await _mc.incr_event(
                             upstream=_upstream,
                             status=_status,
                             latency_ms=_lat,
