@@ -266,8 +266,10 @@
   function renderKpis(metrics) {
     var el = document.getElementById('kpis');
     var req = metrics.requests || 0;
+    var piiReqs = metrics.pii_requests || 0;
+    // 脱敏占比 = 含 PII 请求数 / 总请求数（天然 ≤100%；pii_hits 是命中次数，可一次多中）
+    var redactedRatio = req > 0 ? (piiReqs / req * 100) : 0;
     var piiHits = (metrics.pii_hits || 0) + (metrics.pii_miss || 0);
-    var redactedRatio = req > 0 ? (piiHits / req * 100) : 0;
     var deny = (metrics.audit_by_verdict && metrics.audit_by_verdict.deny) || 0;
     var p95 = metrics.latency ? metrics.latency.p95 : null;
     var precise = metrics.latency ? metrics.latency.is_precise : false;
@@ -277,7 +279,7 @@
       : (state.range + '≈ 桶中位');
     el.innerHTML =
       '<div class="kpi"><div class="label">今日请求</div><div class="value">' + fmtNum(req) + '</div></div>' +
-      '<div class="kpi"><div class="label">脱敏占比</div><div class="value">' + redactedRatio.toFixed(1) + '%</div><div class="hint">PII 命中 ' + fmtNum(piiHits) + '</div></div>' +
+      '<div class="kpi"><div class="label">脱敏占比</div><div class="value">' + redactedRatio.toFixed(1) + '%</div><div class="hint">含 PII 请求 ' + fmtNum(piiReqs) + '</div></div>' +
       '<div class="kpi"><div class="label">PII 命中</div><div class="value">' + fmtNum(piiHits) + '</div><div class="hint">hit ' + fmtNum(metrics.pii_hits || 0) + ' / miss ' + fmtNum(metrics.pii_miss || 0) + '</div></div>' +
       '<div class="kpi"><div class="label">阻断数</div><div class="value">' + fmtNum(deny) + '</div><div class="hint">deny verdict</div></div>' +
       '<div class="kpi"><div class="label">p95 延迟</div><div class="value">' + p95Txt + '</div><div class="hint">' + p95Hint + '</div></div>';
@@ -451,13 +453,18 @@
   }
 
   // ── 数据加载 ──
+  // 请求序号：快速切换 range 时丢弃过期响应，防慢查询（SQLite）覆盖新查询（内存）
+  var loadSeq = 0;
   function loadAll() {
+    var seq = ++loadSeq;
     api('/_admin/metrics?range=' + state.range).then(function (m) {
+      if (seq !== loadSeq) return;
       renderKpis(m);
       renderTokens4(m);
       renderCharts(m);
       renderTrend(m);
       return api('/_admin/events?limit=100').then(function (d) {
+        if (seq !== loadSeq) return;
         var evs = d.events || [];
         renderEvents(evs);
         renderUpstream(m, evs);

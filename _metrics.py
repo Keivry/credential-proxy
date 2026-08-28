@@ -249,6 +249,7 @@ class _DailyAgg:
         'pii_hits',
         'pii_lru_evictions',
         'pii_miss',
+        'pii_requests',
         'placeholder_prompt_injected',
         'requests',
         'requests_by_status',
@@ -260,6 +261,7 @@ class _DailyAgg:
         self.pii_by_type: dict[str, int] = {}
         self.pii_hits = 0
         self.pii_miss = 0
+        self.pii_requests = 0
         self.cred_hits = 0
         self.cred_miss = 0
         self.cred_lru_evictions = 0
@@ -282,6 +284,7 @@ class _DailyAgg:
             'pii_by_type': self.pii_by_type,
             'pii_hits': self.pii_hits,
             'pii_miss': self.pii_miss,
+            'pii_requests': self.pii_requests,
             'cred_hits': self.cred_hits,
             'cred_miss': self.cred_miss,
             'cred_lru_evictions': self.cred_lru_evictions,
@@ -307,7 +310,10 @@ class _HourlyAgg:
         'cred_lru_evictions',
         'latency_buckets',
         'pii_by_type',
+        'pii_hits',
         'pii_lru_evictions',
+        'pii_miss',
+        'pii_requests',
         'requests',
         'requests_by_status',
         'tokens',
@@ -319,6 +325,9 @@ class _HourlyAgg:
         self.tokens: dict[str, dict[str, Any]] = {}
         self.latency_buckets: dict[str, int] = {}
         self.pii_by_type: dict[str, int] = {}
+        self.pii_hits = 0
+        self.pii_miss = 0
+        self.pii_requests = 0
         self.pii_lru_evictions = 0
         self.cred_lru_evictions = 0
 
@@ -330,6 +339,9 @@ class _HourlyAgg:
             'tokens': self.tokens,
             'latency_buckets': self.latency_buckets,
             'pii_by_type': self.pii_by_type,
+            'pii_hits': self.pii_hits,
+            'pii_miss': self.pii_miss,
+            'pii_requests': self.pii_requests,
             'pii_lru_evictions': self.pii_lru_evictions,
             'cred_lru_evictions': self.cred_lru_evictions,
         }
@@ -341,6 +353,7 @@ def _deep_copy_snapshot(agg: _DailyAgg) -> _DailyAgg:
     copy.pii_by_type = dict(agg.pii_by_type)
     copy.pii_hits = agg.pii_hits
     copy.pii_miss = agg.pii_miss
+    copy.pii_requests = agg.pii_requests
     copy.cred_hits = agg.cred_hits
     copy.cred_miss = agg.cred_miss
     copy.cred_lru_evictions = agg.cred_lru_evictions
@@ -366,6 +379,9 @@ def _copy_hourly(agg: _HourlyAgg) -> _HourlyAgg:
     copy.tokens = json.loads(json.dumps(agg.tokens)) if agg.tokens else {}
     copy.latency_buckets = dict(agg.latency_buckets)
     copy.pii_by_type = dict(agg.pii_by_type)
+    copy.pii_hits = agg.pii_hits
+    copy.pii_miss = agg.pii_miss
+    copy.pii_requests = agg.pii_requests
     copy.pii_lru_evictions = agg.pii_lru_evictions
     copy.cred_lru_evictions = agg.cred_lru_evictions
     return copy
@@ -448,6 +464,7 @@ class MetricsCollector:
                 pii_by_type JSON,
                 pii_hits INT,
                 pii_miss INT,
+                pii_requests INT,
                 cred_hits INT,
                 cred_miss INT,
                 cred_lru_evictions INT,
@@ -477,12 +494,26 @@ class MetricsCollector:
                 tokens JSON,
                 latency_buckets JSON,
                 pii_by_type JSON,
+                pii_hits INT,
+                pii_miss INT,
+                pii_requests INT,
                 pii_lru_evictions INT,
                 cred_lru_evictions INT,
                 PRIMARY KEY(hour, upstream)
             )
             """
         )
+        # 轻量迁移：旧库（无 pii_hits/pii_miss/pii_requests 列）升级补列
+        # CREATE TABLE IF NOT EXISTS 不会给已存在的表加列，需显式 ALTER
+        for table, col in (
+            ('daily_agg', 'pii_requests'),
+            ('hourly_agg', 'pii_hits'),
+            ('hourly_agg', 'pii_miss'),
+            ('hourly_agg', 'pii_requests'),
+        ):
+            cols = {r[1] for r in conn.execute(f'PRAGMA table_info({table})')}
+            if col not in cols:
+                conn.execute(f'ALTER TABLE {table} ADD COLUMN {col} INT')
 
     def _write_flush(self, snapshot: dict[str, Any]) -> None:
         """单写者覆盖式 UPSERT（线程中运行）。"""
@@ -497,18 +528,19 @@ class MetricsCollector:
                 conn.execute(
                     """
                     INSERT INTO daily_agg (
-                        date, upstream, pii_by_type, pii_hits, pii_miss,
+                        date, upstream, pii_by_type, pii_hits, pii_miss, pii_requests,
                         cred_hits, cred_miss, cred_lru_evictions,
                         pii_lru_evictions, requests, requests_by_status,
                         tokens, audit_by_verdict, audit_by_rule,
                         latency_buckets, placeholder_prompt_injected,
                         truncated_total, json_aware_success,
                         json_leaf_fallback, json_full_fallback
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(date, upstream) DO UPDATE SET
                         pii_by_type=excluded.pii_by_type,
                         pii_hits=excluded.pii_hits,
                         pii_miss=excluded.pii_miss,
+                        pii_requests=excluded.pii_requests,
                         cred_hits=excluded.cred_hits,
                         cred_miss=excluded.cred_miss,
                         cred_lru_evictions=excluded.cred_lru_evictions,
@@ -531,6 +563,7 @@ class MetricsCollector:
                         json.dumps(snapshot.get('pii_by_type', {}), ensure_ascii=False),
                         snapshot.get('pii_hits', 0),
                         snapshot.get('pii_miss', 0),
+                        snapshot.get('pii_requests', 0),
                         snapshot.get('cred_hits', 0),
                         snapshot.get('cred_miss', 0),
                         snapshot.get('cred_lru_evictions', 0),
@@ -562,14 +595,18 @@ class MetricsCollector:
                     INSERT INTO hourly_agg (
                         hour, upstream, requests, requests_by_status,
                         tokens, latency_buckets, pii_by_type,
+                        pii_hits, pii_miss, pii_requests,
                         pii_lru_evictions, cred_lru_evictions
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(hour, upstream) DO UPDATE SET
                         requests=excluded.requests,
                         requests_by_status=excluded.requests_by_status,
                         tokens=excluded.tokens,
                         latency_buckets=excluded.latency_buckets,
                         pii_by_type=excluded.pii_by_type,
+                        pii_hits=excluded.pii_hits,
+                        pii_miss=excluded.pii_miss,
+                        pii_requests=excluded.pii_requests,
                         pii_lru_evictions=excluded.pii_lru_evictions,
                         cred_lru_evictions=excluded.cred_lru_evictions
                     """,
@@ -585,6 +622,9 @@ class MetricsCollector:
                             snapshot.get('latency_buckets', {}), ensure_ascii=False
                         ),
                         json.dumps(snapshot.get('pii_by_type', {}), ensure_ascii=False),
+                        snapshot.get('pii_hits', 0),
+                        snapshot.get('pii_miss', 0),
+                        snapshot.get('pii_requests', 0),
                         snapshot.get('pii_lru_evictions', 0),
                         snapshot.get('cred_lru_evictions', 0),
                     ),
@@ -752,6 +792,11 @@ class MetricsCollector:
                 h.pii_by_type[k] = h.pii_by_type.get(k, 0) + v
             d.pii_hits += pii_hits
             d.pii_miss += pii_miss
+            h.pii_hits += pii_hits
+            h.pii_miss += pii_miss
+            if pii_hits > 0:
+                d.pii_requests += 1
+                h.pii_requests += 1
             d.cred_hits += cred_hits
             d.cred_miss += cred_miss
             for k, v in delta_verdict.items():
@@ -1018,7 +1063,7 @@ class MetricsCollector:
         by_status: dict[str, int] = {}
         pii_by_type: dict[str, int] = {}
         tokens: dict[str, dict[str, Any]] = {}
-        pii_hits = pii_miss = cred_hits = cred_miss = 0
+        pii_hits = pii_miss = pii_requests = cred_hits = cred_miss = 0
         for e in evs:
             s = e['status']
             by_status[s] = by_status.get(s, 0) + 1
@@ -1035,6 +1080,7 @@ class MetricsCollector:
             self._merge_tokens(tokens, agg.tokens)
             pii_hits += agg.pii_hits
             pii_miss += agg.pii_miss
+            pii_requests += agg.pii_requests
             cred_hits += agg.cred_hits
             cred_miss += agg.cred_miss
             for k, v in agg.audit_by_verdict.items():
@@ -1050,6 +1096,7 @@ class MetricsCollector:
             'pii_by_type': pii_by_type,
             'pii_hits': pii_hits,
             'pii_miss': pii_miss,
+            'pii_requests': pii_requests,
             'cred_hits': cred_hits,
             'cred_miss': cred_miss,
             'tokens': tokens,
@@ -1110,6 +1157,7 @@ class MetricsCollector:
             'pii_by_type': {},
             'pii_hits': 0,
             'pii_miss': 0,
+            'pii_requests': 0,
             'cred_hits': 0,
             'cred_miss': 0,
             'cred_lru_evictions': 0,
@@ -1130,7 +1178,8 @@ class MetricsCollector:
             if hours < 24 * 30:
                 rows = conn.execute(
                     'SELECT hour, upstream, requests, requests_by_status, tokens, '
-                    'latency_buckets, pii_by_type, pii_lru_evictions, cred_lru_evictions '
+                    'latency_buckets, pii_by_type, pii_hits, pii_miss, pii_requests, '
+                    'pii_lru_evictions, cred_lru_evictions '
                     'FROM hourly_agg WHERE hour >= ?',
                     (cutoff_hour,),
                 ).fetchall()
@@ -1142,6 +1191,9 @@ class MetricsCollector:
                     tokens,
                     buckets,
                     pii_by_type,
+                    pii_hits,
+                    pii_miss,
+                    pii_requests,
                     pii_lru,
                     cred_lru,
                 ) in rows:
@@ -1152,12 +1204,15 @@ class MetricsCollector:
                     )
                     self._merge_json_counter(out['latency_buckets'], buckets)
                     self._merge_json_counter(out['pii_by_type'], pii_by_type)
+                    out['pii_hits'] += pii_hits or 0
+                    out['pii_miss'] += pii_miss or 0
+                    out['pii_requests'] += pii_requests or 0
                     out['pii_lru_evictions'] += pii_lru or 0
                     out['cred_lru_evictions'] += cred_lru or 0
             # daily: 30d 窗口（含扩展列）
             if hours >= 24 * 30:
                 rows_d = conn.execute(
-                    'SELECT date, upstream, pii_hits, pii_miss, cred_hits, cred_miss, '
+                    'SELECT date, upstream, pii_hits, pii_miss, pii_requests, cred_hits, cred_miss, '
                     'cred_lru_evictions, pii_lru_evictions, requests, requests_by_status, '
                     'tokens, audit_by_verdict, audit_by_rule, latency_buckets, '
                     'placeholder_prompt_injected, truncated_total, json_aware_success, '
@@ -1171,6 +1226,7 @@ class MetricsCollector:
                         _up,
                         pii_hits,
                         pii_miss,
+                        pii_requests,
                         cred_hits,
                         cred_miss,
                         cred_lru,
@@ -1190,6 +1246,7 @@ class MetricsCollector:
                     out['requests'] += requests or 0
                     out['pii_hits'] += pii_hits or 0
                     out['pii_miss'] += pii_miss or 0
+                    out['pii_requests'] += pii_requests or 0
                     out['cred_hits'] += cred_hits or 0
                     out['cred_miss'] += cred_miss or 0
                     out['cred_lru_evictions'] += cred_lru or 0
@@ -1232,6 +1289,7 @@ class MetricsCollector:
             'pii_by_type': {},
             'pii_hits': 0,
             'pii_miss': 0,
+            'pii_requests': 0,
             'cred_hits': 0,
             'cred_miss': 0,
             'cred_lru_evictions': 0,
@@ -1257,6 +1315,7 @@ class MetricsCollector:
             self._merge_json_counter(out['latency_buckets'], d.latency_buckets)
             out['pii_hits'] += d.pii_hits
             out['pii_miss'] += d.pii_miss
+            out['pii_requests'] += d.pii_requests
             out['cred_hits'] += d.cred_hits
             out['cred_miss'] += d.cred_miss
             out['cred_lru_evictions'] += d.cred_lru_evictions

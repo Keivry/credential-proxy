@@ -272,7 +272,11 @@ class TestCollectorCore:
     def test_incr_event_tokens_deep_copy(self, collector):
         """tokens 内层 dict 也须防御性拷贝：外部突变不污染 recent_events/聚合。"""
         tokens = {'gpt-4o': {'prompt': 10, 'completion': 5}}
-        run(collector.incr_event(request_id='req-t', upstream='8878', status=200, tokens=tokens))
+        run(
+            collector.incr_event(
+                request_id='req-t', upstream='8878', status=200, tokens=tokens
+            )
+        )
         tokens['gpt-4o']['prompt'] = 999
         tokens['gpt-4o']['new'] = 1
         ev = collector.events(limit=5)[-1]
