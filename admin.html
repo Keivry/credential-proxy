@@ -202,7 +202,7 @@
   function api(path, opts) {
     opts = opts || {};
     opts.headers = opts.headers || {};
-    if (state.token) opts.headers['X-Admin-Token'] = state.token;
+    if (state.token && state.token !== '__cookie__') opts.headers['X-Admin-Token'] = state.token;
     opts.credentials = 'include';
     return fetch(path, opts).then(function (r) {
       if (r.status === 401) { throw new Error('unauthorized'); }
