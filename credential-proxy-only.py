@@ -45,6 +45,15 @@ class CredentialProxyOnly(TokenMixin, PiiMixin, CredentialMixin, LlmMixin):
         self._shared_session = None
         self._runners: list = []
 
+        # ── 可观测性（llm-observability-dashboard）──
+        from _admin import validate_observability_token
+        from _metrics import get_collector
+        from proxy import DATA_DIR
+
+        validate_observability_token()
+        self._metrics_collector = get_collector(DATA_DIR)
+        self._metrics_collector.start()
+
         # ── Credential API 状态 ──
         self.master_password = os.environ.get('CREDENTIAL_MASTER_PASSWORD')
         if not self.master_password:
@@ -97,6 +106,13 @@ class CredentialProxyOnly(TokenMixin, PiiMixin, CredentialMixin, LlmMixin):
                 self.pii_response_side,
                 self.pii_hold_max,
             )
+        # 可观测性：注入 collector 到组件
+        det = getattr(self, '_pii_detector', None)
+        if det is not None and hasattr(det, 'set_collector'):
+            det.set_collector(self._metrics_collector)
+        scope = getattr(self, '_global_pii_scope', None)
+        if scope is not None and hasattr(scope, 'set_collector'):
+            scope.set_collector(self._metrics_collector)
 
         # ── 审计配置（Batch 8.1/8.2）──
         # 轻量入口无 MatrixMixin → approve 模式不支持，降级 block 并明确告警
@@ -148,6 +164,10 @@ class CredentialProxyOnly(TokenMixin, PiiMixin, CredentialMixin, LlmMixin):
             tasks.append(self.start_credential_api(self._cred_port))
         if self.proxies:
             tasks.append(self.start_llm_proxies())
+        # 可观测性：事件循环就绪后启动定时 flush
+        mc = getattr(self, '_metrics_collector', None)
+        if mc is not None:
+            mc.start()
         if not tasks:
             logger.error('未设置任何服务（需要 LLM_<PORT> 或 CREDENTIAL_API_PORT）')
             sys.exit(1)
@@ -160,14 +180,29 @@ class CredentialProxyOnly(TokenMixin, PiiMixin, CredentialMixin, LlmMixin):
                 await runner.cleanup()
             if self._shared_session:
                 await self._shared_session.close()
+            # 可观测性：优雅关闭 collector
+            mc = getattr(self, '_metrics_collector', None)
+            if mc is not None:
+                try:
+                    await mc.close()
+                except Exception:
+                    logger.exception('metrics collector 关闭失败')
 
 
 def main():
+    import signal as _signal
+
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s %(name)s %(levelname)s %(message)s',
     )
     proxy = CredentialProxyOnly()
+
+    def _sig_handler(sig, frame):
+        raise KeyboardInterrupt
+
+    _signal.signal(_signal.SIGTERM, _sig_handler)
+    _signal.signal(_signal.SIGINT, _sig_handler)
     try:
         asyncio.run(proxy.run())
     except KeyboardInterrupt:

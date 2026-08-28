@@ -181,6 +181,74 @@ def _has_partial_pii_candidate(text: str) -> bool:
 _DEBUG_DIR = os.environ.get('CREDENTIAL_PROXY_DEBUG_DIR', '')
 
 
+def is_chat_tail(tail: str) -> bool:
+    """判定对话类 LLM 接口尾（chat/completions | v1/messages | v1/responses）。
+
+    对 `tail.rstrip('/')` 后 endswith 判定，避免 `/v1/responses/` 漏判。
+    单一共享函数（19 处内联收敛），供埋点与协议分派共用。
+    """
+    return tail.rstrip('/').endswith(
+        ('chat/completions', 'v1/messages', 'v1/responses')
+    )
+
+
+def _capture_usage_ctx(payload: str, metrics_ctx: dict, protocol: str) -> None:
+    """从 SSE data payload 捕获 usage → 归一 tokens（按 model 分桶）。
+
+    - OpenAI Chat 末块 usage / Responses response.completed.response.usage /
+      Anthropic message_start+message_delta 聚合
+    - 仅当 payload 可解析且含 usage 字段；无则保持现状不估算
+    """
+    if not payload or not payload.strip() or payload.strip() == '[DONE]':
+        return
+    try:
+        obj = _jloads(payload.strip())
+    except Exception:
+        return
+    if not isinstance(obj, dict):
+        return
+    usage = None
+    if 'usage' in obj and isinstance(obj.get('usage'), dict):
+        usage = obj['usage']
+    else:
+        # Responses: response.completed.response.usage
+        resp_inner = obj.get('response')
+        if isinstance(resp_inner, dict):
+            inner2 = resp_inner.get('response')
+            if isinstance(inner2, dict) and isinstance(inner2.get('usage'), dict):
+                usage = inner2['usage']
+        # Anthropic message_delta.usage
+        delta_inner = obj.get('delta')
+        if isinstance(delta_inner, dict) and isinstance(delta_inner.get('usage'), dict):
+            usage = delta_inner['usage']
+        # Anthropic message_start.message.usage
+        msg_inner = obj.get('message')
+        if isinstance(msg_inner, dict) and isinstance(msg_inner.get('usage'), dict):
+            usage = msg_inner['usage']
+    if not isinstance(usage, dict):
+        return
+    from _metrics import normalize_usage
+
+    norm = normalize_usage(usage, protocol)
+    model = metrics_ctx.get('model', 'unknown_model')
+    tokens = metrics_ctx.setdefault('tokens', {})
+    cur = tokens.setdefault(model, {})
+    for k in (
+        'prompt',
+        'completion',
+        'total',
+        'input',
+        'output',
+        'cached_read',
+        'cached_write',
+    ):
+        v = norm.get(k)
+        if isinstance(v, int):
+            cur[k] = cur.get(k, 0) + v
+    if norm.get('unknown'):
+        cur['unknown'] = cur.get('unknown', 0) + 1
+
+
 def parse_llm_proxy_env() -> dict[int, str]:
     """从 LLM_<PORT>=<URL> 环境变量读取上游配置。"""
     proxies: dict[int, str] = {}
@@ -1065,6 +1133,13 @@ class LlmMixin(AuditMixin):
         """
         summary = redact_summary(args_json)
         timeout = getattr(self, 'audit_timeout', 90)
+        _mc = getattr(self, '_metrics_collector', None)
+
+        def _count_approval(result: str) -> None:
+            """audit_approval_result 分布（内存计数，重启归零）。"""
+            if _mc is not None:
+                _mc.incr_sync_audit_approval(result)
+
         if not hasattr(self, '_ask'):
             logger.error('审批模式需要 MatrixMixin（_ask 不可用）')
             return 'failed'
@@ -1128,6 +1203,7 @@ class LlmMixin(AuditMixin):
             _created = _audit_created_ids_var.get()
             if isinstance(_created, list) and req_id in _created:
                 _created.remove(req_id)
+            _count_approval('failed')
             return 'failed'
         logger.info(
             '审计审批已发送: %s req_id=%s msg_id=%s timeout=%ds 摘要=%.80s',
@@ -1144,6 +1220,7 @@ class LlmMixin(AuditMixin):
             _created = _audit_created_ids_var.get()
             if isinstance(_created, list) and req_id in _created:
                 _created.remove(req_id)
+            _count_approval('failed')
             return 'failed'
         self._audit_approval_msgs[msg_id] = req_id
         logger.info('审计审批等待中: %s req_id=%s msg_id=%s', name, req_id, msg_id)
@@ -1158,6 +1235,7 @@ class LlmMixin(AuditMixin):
             _created = _audit_created_ids_var.get()
             if isinstance(_created, list) and req_id in _created:
                 _created.remove(req_id)
+            _count_approval('expired')
             return 'expired'
         except Exception:
             # 8.3：等待期间异常（event 被异常置位等）同样清理
@@ -1167,6 +1245,7 @@ class LlmMixin(AuditMixin):
             _created = _audit_created_ids_var.get()
             if isinstance(_created, list) and req_id in _created:
                 _created.remove(req_id)
+            _count_approval('failed')
             return 'failed'
         # reaction 已到达
         ap = self._audit_approval_pending.pop(req_id, None)
@@ -1176,8 +1255,10 @@ class LlmMixin(AuditMixin):
             _created.remove(req_id)
         if ap and ap.get('approved') is True:
             logger.info('审计审批结果: %s req_id=%s → approved', name, req_id)
+            _count_approval('approved')
             return 'approved'
         logger.warning('审计审批结果: %s req_id=%s → rejected', name, req_id)
+        _count_approval('rejected')
         return 'rejected'
 
     def _build_block_event(self) -> str:
@@ -2159,21 +2240,48 @@ class LlmMixin(AuditMixin):
             _cv_last_responses_tok = _last_responses_tool_name_var.set(None)
             _cv_audit_created_ids_tok = _audit_created_ids_var.set([])
             tail = request.match_info['tail']
-            is_dialog_tail = tail.rstrip('/').endswith(
-                ('chat/completions', 'v1/messages', 'v1/responses')
-            )
+            is_dialog_tail = is_chat_tail(tail)
             target_url = f'{upstream.rstrip("/")}/{tail}'
             if request.query_string:
                 target_url += '?' + request.query_string
             body = await request.read()
             body_text = body.decode('utf-8', errors='replace') if body else ''
+            # 可观测性埋点上下文（llm-observability-dashboard 1.3）
+            _metrics_ctx: dict = {
+                't0': _time.time(),
+                'port': str(port),
+                'upstream': str(port),  # 主键仅 port
+                'status': None,
+                'latency_ms': None,
+                'bytes_in': len(body) if body else 0,
+                'bytes_out': 0,
+                'empty_guarded': False,
+                'invalid_json_guarded': False,
+                'client_gone': False,
+                'exception': False,
+                'sse_events': 0,
+                'truncated': 0,
+                'json_aware_success': 0,
+                'json_leaf_fallback': 0,
+                'json_full_fallback': 0,
+                'placeholder_injected': False,
+                'pii_hits': 0,
+                'pii_miss': 0,
+                'cred_hits': 0,
+                'cred_miss': 0,
+                'tokens': {},
+                'audit_by_verdict': {},
+                'audit_by_rule': {},
+                'pii_by_type': {},
+                'request_id': req_id,
+                'tail': tail,
+                'verdict': '',
+                'raw_summary': '',
+                'model': 'unknown_model',
+            }
 
             # 仅对 LLM 对话 endpoint 保存调试原始请求 JSON（非对话如 /v1/models 不保存）
-            _debug_save_eligible = bool(_DEBUG_DIR) and (
-                tail.rstrip('/').endswith('chat/completions')
-                or tail.rstrip('/').endswith('v1/messages')
-                or tail.rstrip('/').endswith('v1/responses')
-            )
+            _debug_save_eligible = bool(_DEBUG_DIR) and (is_chat_tail(tail))
             _debug_saved = False  # 标记是否已在 SSE 响应中保存过
             # === DEBUG: 原版请求 + meta 立即落盘（早于脱敏，便于对比） ===
             if _debug_save_eligible:
@@ -2287,6 +2395,33 @@ class LlmMixin(AuditMixin):
                 active_t2p = {}
                 pii_scope = None
 
+            # ── 可观测性：model 提取 + stream_options.include_usage 注入 ──
+            # （仅 OpenAI Chat/Responses 且 is_stream==true；Anthropic 严禁注入）
+            _req_model = 'unknown_model'
+            try:
+                _req_obj = _jloads(out_body.decode('utf-8', errors='replace'))
+                if isinstance(_req_obj, dict):
+                    _m = _req_obj.get('model')
+                    if isinstance(_m, str) and _m:
+                        _req_model = _m
+                    _is_stream = bool(_req_obj.get('stream', False))
+                    _tail_n = tail.rstrip('/')
+                    if (
+                        _is_stream
+                        and (
+                            _tail_n.endswith('chat/completions')
+                            or _tail_n.endswith('v1/responses')
+                        )
+                        and isinstance(_req_obj, dict)
+                    ):
+                        _so = _req_obj.setdefault('stream_options', {})
+                        if isinstance(_so, dict):
+                            _so.setdefault('include_usage', True)
+                        out_body = _jdumps(_req_obj).encode('utf-8')
+            except Exception:
+                pass
+            _metrics_ctx['model'] = _req_model
+
             # ── 占位符说明提示词注入（pii-placeholder-prompt）──
             # 触发条件（D1/D3/D4，三者同时满足才注入）：
             #   (a) is_dialog_tail 且 pii_enabled（脱敏路径）
@@ -2309,10 +2444,16 @@ class LlmMixin(AuditMixin):
                         _pp_protocol = 'responses'
                     else:
                         _pp_protocol = 'openai'
+                    _pp_before = out_body
                     out_body = self.inject_placeholder_prompt(
                         out_body.decode('utf-8', errors='replace'),
                         protocol=_pp_protocol,
                     ).encode('utf-8')
+                    if out_body != _pp_before:
+                        # placeholder_prompt_injected_total（注入发生与否）
+                        _metrics = getattr(self, '_metrics_collector', None)
+                        if _metrics is not None:
+                            _metrics.incr_sync_placeholder_injected()
                 except Exception:
                     logger.exception('注入占位符说明提示词失败，透传原 body')
 
@@ -2370,11 +2511,7 @@ class LlmMixin(AuditMixin):
                     # Log non-2xx upstream responses, only for chat completion endpoints
                     # 覆盖三种 LLM 对话协议：chat/completions、v1/messages、v1/responses
                     # 0.9.2 漏了 v1/responses，导致 Responses API 的上游错误被沉默
-                    if upstream_resp.status >= 400 and (
-                        tail.rstrip('/').endswith('chat/completions')
-                        or tail.rstrip('/').endswith('v1/messages')
-                        or tail.rstrip('/').endswith('v1/responses')
-                    ):
+                    if upstream_resp.status >= 400 and (is_chat_tail(tail)):
                         logger.warning(
                             'LLM 上游返回 %d: %s %s',
                             upstream_resp.status,
@@ -2395,9 +2532,7 @@ class LlmMixin(AuditMixin):
                         # _request_audit_approval）；流结束后清理
                         self._audit_keepalive_resp = resp
                         self._audit_keepalive_task = None
-                        if tail.rstrip('/').endswith(
-                            ('chat/completions', 'v1/messages', 'v1/responses')
-                        ):
+                        if is_chat_tail(tail):
                             logger.info(
                                 'LLM 流式开始: %s %s tail=%s ct=%s status=%d',
                                 request.method,
@@ -2696,6 +2831,18 @@ class LlmMixin(AuditMixin):
                                                     continue
 
                                                 sse_event_count += 1
+                                                # 可观测性：捕获 usage（slow 链）
+                                                _capture_usage_ctx(
+                                                    payload,
+                                                    _metrics_ctx,
+                                                    'anthropic'
+                                                    if is_anthropic_stream
+                                                    else (
+                                                        'responses'
+                                                        if is_responses_stream
+                                                        else 'openai'
+                                                    ),
+                                                )
                                                 if _debug_save_eligible:
                                                     try:
                                                         await _debug_append_line(
@@ -4441,9 +4588,15 @@ class LlmMixin(AuditMixin):
                                 logger.debug(
                                     'SSE write_eof 失败，客户端已断连',
                                 )
-                            if tail.rstrip('/').endswith(
-                                ('chat/completions', 'v1/messages', 'v1/responses')
-                            ):
+                            # 埋点上下文更新（slow 链）
+                            _metrics_ctx['status'] = upstream_resp.status
+                            _metrics_ctx['latency_ms'] = (
+                                _time.time() - _metrics_ctx['t0']
+                            ) * 1000
+                            _metrics_ctx['bytes_out'] = bytes_written
+                            _metrics_ctx['sse_events'] = sse_event_count
+                            _metrics_ctx['truncated'] = 1 if _truncated else 0
+                            if is_chat_tail(tail):
                                 logger.info(
                                     'LLM 流式结束(slow): %s %s status=%d sse_events=%d bytes_written=%d tail=%s',
                                     request.method,
@@ -4807,6 +4960,22 @@ class LlmMixin(AuditMixin):
                                                 if not _fast_payload.strip():
                                                     continue
                                                 fast_sse_event_count += 1
+                                                # 可观测性：捕获 usage（fast 链）
+                                                _capture_usage_ctx(
+                                                    _fast_payload,
+                                                    _metrics_ctx,
+                                                    'anthropic'
+                                                    if tail.rstrip('/').endswith(
+                                                        'v1/messages'
+                                                    )
+                                                    else (
+                                                        'responses'
+                                                        if tail.rstrip('/').endswith(
+                                                            'v1/responses'
+                                                        )
+                                                        else 'openai'
+                                                    ),
+                                                )
                                                 if _fast_payload.strip() == '[DONE]':
                                                     fast_seen_terminal = True
                                                     fast_seen_global_terminal = True
@@ -4886,6 +5055,22 @@ class LlmMixin(AuditMixin):
                                             await _tracked_write(b'data: [DONE]\n\n')
                                         elif _pl.strip():
                                             fast_sse_event_count += 1
+                                            # 可观测性：捕获 usage（fast CR 链）
+                                            _capture_usage_ctx(
+                                                _pl,
+                                                _metrics_ctx,
+                                                'anthropic'
+                                                if tail.rstrip('/').endswith(
+                                                    'v1/messages'
+                                                )
+                                                else (
+                                                    'responses'
+                                                    if tail.rstrip('/').endswith(
+                                                        'v1/responses'
+                                                    )
+                                                    else 'openai'
+                                                ),
+                                            )
                                             await _fast_emit_data(_pl)
                                     else:
                                         # 10.14.1 (API-SPEC FIX): 非 data 行
@@ -5056,9 +5241,15 @@ class LlmMixin(AuditMixin):
                                 logger.debug(
                                     'SSE write_eof 失败，客户端已断连',
                                 )
-                            if tail.rstrip('/').endswith(
-                                ('chat/completions', 'v1/messages', 'v1/responses')
-                            ):
+                            # 埋点上下文更新（fast 链）
+                            _metrics_ctx['status'] = upstream_resp.status
+                            _metrics_ctx['latency_ms'] = (
+                                _time.time() - _metrics_ctx['t0']
+                            ) * 1000
+                            _metrics_ctx['bytes_out'] = fast_bytes_written
+                            _metrics_ctx['sse_events'] = fast_sse_event_count
+                            _metrics_ctx['truncated'] = 1 if _fast_truncated else 0
+                            if is_chat_tail(tail):
                                 logger.info(
                                     'LLM 流式结束(fast): %s %s status=%d sse_events=%d bytes_written=%d tail=%s',
                                     request.method,
@@ -5128,11 +5319,7 @@ class LlmMixin(AuditMixin):
                         if (
                             not resp_body
                             and upstream_resp.status == 200
-                            and (
-                                tail.rstrip('/').endswith('chat/completions')
-                                or tail.rstrip('/').endswith('v1/messages')
-                                or tail.rstrip('/').endswith('v1/responses')
-                            )
+                            and (is_chat_tail(tail))
                         ):
                             logger.error(
                                 'LLM 上游返回空响应体(%d bytes): %s %s '
@@ -5175,13 +5362,31 @@ class LlmMixin(AuditMixin):
                         _is_invalid_json = False
                         if not _is_empty:
                             try:
-                                json.loads(resp_text)
+                                _resp_parsed = json.loads(resp_text)
+                                # 可观测性：非流式 usage 提取（按 model 分桶）
+                                if isinstance(_resp_parsed, dict) and isinstance(
+                                    _resp_parsed.get('usage'), dict
+                                ):
+                                    _resp_usage = _resp_parsed['usage']
+                                    _resp_model = _req_model
+                                    if isinstance(_resp_parsed.get('model'), str):
+                                        _resp_model = _resp_parsed['model']
+                                    _metrics_ctx['model'] = _resp_model
+                                    _capture_usage_ctx(
+                                        json.dumps({'usage': _resp_usage}),
+                                        _metrics_ctx,
+                                        'anthropic'
+                                        if tail.rstrip('/').endswith('v1/messages')
+                                        else (
+                                            'responses'
+                                            if tail.rstrip('/').endswith('v1/responses')
+                                            else 'openai'
+                                        ),
+                                    )
                             except json.JSONDecodeError:
                                 _is_invalid_json = True
                         # DEBUG: 0.9.8 后仍出现 JSONDecodeError 的诊断日志（临时）
-                        if tail.rstrip('/').endswith(
-                            ('chat/completions', 'v1/messages', 'v1/responses')
-                        ):
+                        if is_chat_tail(tail):
                             logger.info(
                                 'LLM 非流式响应诊断: %s %s status=%d empty=%s invalid=%s len=%d tail=%s ct=%s',
                                 request.method,
@@ -5196,9 +5401,7 @@ class LlmMixin(AuditMixin):
                         if (
                             (_is_empty or _is_invalid_json)
                             and upstream_resp.status == 200
-                            and tail.rstrip('/').endswith(
-                                ('chat/completions', 'v1/messages', 'v1/responses')
-                            )
+                            and is_chat_tail(tail)
                         ):
                             logger.error(
                                 'LLM 上游空体/非JSON转 502: %s %s status=%d empty=%s invalid_json=%s len=%d '
@@ -5209,6 +5412,18 @@ class LlmMixin(AuditMixin):
                                 _is_empty,
                                 _is_invalid_json,
                                 len(resp_text),
+                            )
+                            # 埋点上下文更新（空体/非JSON 502）
+                            _metrics_ctx['status'] = 502
+                            _metrics_ctx['latency_ms'] = (
+                                _time.time() - _metrics_ctx['t0']
+                            ) * 1000
+                            _metrics_ctx['bytes_out'] = 0
+                            _metrics_ctx['empty_guarded'] = bool(
+                                _is_empty and upstream_resp.status == 200
+                            )
+                            _metrics_ctx['invalid_json_guarded'] = bool(
+                                _is_invalid_json and upstream_resp.status == 200
                             )
                             return web.Response(
                                 body=json.dumps(
@@ -5346,9 +5561,7 @@ class LlmMixin(AuditMixin):
                                         out_text = resp_text
                             except Exception:
                                 pass
-                        if tail.rstrip('/').endswith(
-                            ('chat/completions', 'v1/messages', 'v1/responses')
-                        ):
+                        if is_chat_tail(tail):
                             logger.info(
                                 'LLM 剥离后诊断: %s %s status=%d empty_after_strip=%s out_len=%d tail=%s',
                                 request.method,
@@ -5372,9 +5585,7 @@ class LlmMixin(AuditMixin):
                         if (
                             not out_text.strip()
                             and upstream_resp.status == 200
-                            and tail.rstrip('/').endswith(
-                                ('chat/completions', 'v1/messages', 'v1/responses')
-                            )
+                            and is_chat_tail(tail)
                         ):
                             logger.error(
                                 '非流式剥离后空体转 502: %s %s status=%d out_len=%d',
@@ -5383,6 +5594,13 @@ class LlmMixin(AuditMixin):
                                 upstream_resp.status,
                                 len(out_text),
                             )
+                            # 埋点上下文更新（剥离后空体 502）
+                            _metrics_ctx['status'] = 502
+                            _metrics_ctx['latency_ms'] = (
+                                _time.time() - _metrics_ctx['t0']
+                            ) * 1000
+                            _metrics_ctx['bytes_out'] = 0
+                            _metrics_ctx['empty_guarded'] = True
                             return web.Response(
                                 body=json.dumps(
                                     {'error': {'message': 'empty after strip'}},
@@ -5391,6 +5609,18 @@ class LlmMixin(AuditMixin):
                                 status=502,
                                 headers={'Content-Type': 'application/json'},
                             )
+                        # 埋点上下文更新（非流式）
+                        _metrics_ctx['status'] = upstream_resp.status
+                        _metrics_ctx['latency_ms'] = (
+                            _time.time() - _metrics_ctx['t0']
+                        ) * 1000
+                        _metrics_ctx['bytes_out'] = len(out_text.encode('utf-8'))
+                        _metrics_ctx['empty_guarded'] = bool(
+                            _is_empty and upstream_resp.status == 200
+                        )
+                        _metrics_ctx['invalid_json_guarded'] = bool(
+                            _is_invalid_json and upstream_resp.status == 200
+                        )
                         return web.Response(
                             body=out_text.encode('utf-8'),
                             status=upstream_resp.status,
@@ -5418,6 +5648,63 @@ class LlmMixin(AuditMixin):
                 )
                 raise
             finally:
+                # 可观测性埋点（请求完成统一入口，slow/fast/非流式/异常均达此）
+                try:
+                    _mc = getattr(self, '_metrics_collector', None)
+                    if _mc is not None:
+                        _status = _metrics_ctx.get('status')
+                        _lat = _metrics_ctx.get('latency_ms')
+                        if _status is None:
+                            # 异常/未达响应分支：按异常计
+                            _metrics_ctx['exception'] = True
+                            _status = 500
+                            _lat = (_time.time() - _metrics_ctx['t0']) * 1000
+                        _upstream = _metrics_ctx.get('upstream', str(port))
+                        # 非对话尾归 other（不丢 requests_total）
+                        if not is_dialog_tail:
+                            _upstream = 'other'
+                        _mc.incr_event(
+                            upstream=_upstream,
+                            status=_status,
+                            latency_ms=_lat,
+                            bytes_in=_metrics_ctx.get('bytes_in', 0),
+                            bytes_out=_metrics_ctx.get('bytes_out', 0),
+                            empty_guarded=_metrics_ctx.get('empty_guarded', False),
+                            invalid_json_guarded=_metrics_ctx.get(
+                                'invalid_json_guarded', False
+                            ),
+                            client_gone=_metrics_ctx.get('client_gone', False),
+                            exception=_metrics_ctx.get('exception', False),
+                            sse_events=_metrics_ctx.get('sse_events', 0),
+                            truncated=_metrics_ctx.get('truncated', 0),
+                            json_aware_success=_metrics_ctx.get(
+                                'json_aware_success', 0
+                            ),
+                            json_leaf_fallback=_metrics_ctx.get(
+                                'json_leaf_fallback', 0
+                            ),
+                            json_full_fallback=_metrics_ctx.get(
+                                'json_full_fallback', 0
+                            ),
+                            placeholder_prompt_injected=_metrics_ctx.get(
+                                'placeholder_injected', False
+                            ),
+                            pii_hits=_metrics_ctx.get('pii_hits', 0),
+                            pii_miss=_metrics_ctx.get('pii_miss', 0),
+                            cred_hits=_metrics_ctx.get('cred_hits', 0),
+                            cred_miss=_metrics_ctx.get('cred_miss', 0),
+                            tokens=_metrics_ctx.get('tokens') or None,
+                            audit_by_verdict=_metrics_ctx.get('audit_by_verdict')
+                            or None,
+                            audit_by_rule=_metrics_ctx.get('audit_by_rule') or None,
+                            pii_by_type=_metrics_ctx.get('pii_by_type') or None,
+                            request_id=req_id,
+                            tail=tail,
+                            verdict=_metrics_ctx.get('verdict', ''),
+                            raw_summary=_metrics_ctx.get('raw_summary', ''),
+                        )
+                except Exception:
+                    logger.debug('metrics 埋点失败', exc_info=True)
                 # 请求级 PII 映射清理（无论成功/异常/客户端断连）
                 if getattr(self, 'pii_enabled', False):
                     self._pii_cleanup()
@@ -5466,6 +5753,15 @@ class LlmMixin(AuditMixin):
                     _audit_created_ids_var.reset(_cv_audit_created_ids_tok)
 
         app = web.Application()
+        # 可观测性：先注册 /_admin/* 长路由（防通配 * 吞路由）
+        _mc = getattr(self, '_metrics_collector', None)
+        if _mc is not None:
+            try:
+                from _admin import init_observability
+
+                init_observability(app, _mc)
+            except Exception:
+                logger.exception('初始化 /_admin 路由失败')
         app.router.add_route('*', '/{tail:.*}', handler)
         # 注意：不在此处注册 session.close() — _shared_session 由 shutdown() 统一关闭
         runner = web.AppRunner(app, access_log=None)

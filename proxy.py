@@ -92,6 +92,21 @@ class CredentialProxy(
         # ── mlockall: 进程启动时锁定内存，防 master_password swap ──
         self._lock_memory()
 
+        # ── 可观测性（llm-observability-dashboard）──
+        from _admin import validate_observability_token
+        from _metrics import get_collector
+
+        validate_observability_token()
+        self._metrics_collector = get_collector(DATA_DIR)
+        self._metrics_collector.start()
+        self._metrics_collector.set_pii_enabled_sync(
+            os.environ.get('PII_REDACTION_ENABLED', '0') in ('1', 'true', 'True', 'yes')
+        )
+        self._metrics_collector.set_placeholder_prompt_enabled_sync(
+            os.environ.get('PII_PLACEHOLDER_PROMPT', '1')
+            not in ('0', 'false', 'False', 'no')
+        )
+
         # ── Matrix ──
         self.homeserver = homeserver
         self.room_id = room_id
@@ -225,6 +240,8 @@ class CredentialProxy(
             'placeholder_prompt_enabled', True
         )
         self.pii_placeholder_prompt_text = pii_cfg.get('placeholder_prompt_text', '')
+        # 可观测性：注入 collector 到 PII/Token 组件
+        self._inject_metrics_collector()
 
         audit_cfg = parse_audit_env_config(require_whitelist=True)
         self._audit_startup_errors = audit_cfg['errors']
@@ -243,9 +260,29 @@ class CredentialProxy(
                 self.audit_hold_max_bytes,
             )
 
+    # ── 可观测性注入 ──
+
+    def _inject_metrics_collector(self) -> None:
+        """把 collector 注入到各 Mixin 组件（PiiDetector/GlobalPiiTokens/TokenMixin）。"""
+        mc = self._metrics_collector
+        # PiiDetector
+        det = getattr(self, '_pii_detector', None)
+        if det is not None and hasattr(det, 'set_collector'):
+            det.set_collector(mc)
+        # GlobalPiiTokens（请求级映射）
+        scope = getattr(self, '_global_pii_scope', None)
+        if scope is not None and hasattr(scope, 'set_collector'):
+            scope.set_collector(mc)
+        # TokenMixin（cred_hit/miss/lru）
+        self._metrics_collector_ref = mc
+
     # ── 主循环 ──
 
     async def run(self):
+        # 可观测性：事件循环就绪后启动定时 flush
+        mc = getattr(self, '_metrics_collector', None)
+        if mc is not None:
+            mc.start()
         # 审批孤儿清扫需运行循环（显式生命周期，见 _audit.py v0.9.2 修复）
         if (
             getattr(self, 'audit_enabled_flag', False)
@@ -325,6 +362,13 @@ def main():
         for runner in proxy._runners:
             await runner.cleanup()
         proxy._runners.clear()
+        # 可观测性：优雅关闭 collector（最终 flush + wal_checkpoint）
+        mc = getattr(proxy, '_metrics_collector', None)
+        if mc is not None:
+            try:
+                await mc.close()
+            except Exception:
+                logger.exception('metrics collector 关闭失败')
         # 关闭共享 ClientSession
         if proxy._shared_session:
             await proxy._shared_session.close()

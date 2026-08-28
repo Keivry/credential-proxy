@@ -145,6 +145,15 @@ class CredentialMixin:
 
     async def start_credential_api(self, port: int = _CREDENTIAL_API_PORT):
         app = web.Application()
+        # 可观测性：挂载 /_admin/*（统一 init_observability 接口）
+        _mc = getattr(self, '_metrics_collector', None)
+        if _mc is not None:
+            try:
+                from _admin import init_observability
+
+                init_observability(app, _mc)
+            except Exception:
+                logger.exception('初始化 /_admin 路由失败（8877）')
         app.router.add_post('/credential', self.handle_credential)
         app.router.add_get('/health', self.handle_health)
         app.router.add_get('/registrations', self.handle_registrations)

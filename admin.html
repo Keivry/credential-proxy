@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Credential Proxy · Observability</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #171a23;
+    --panel2: #1d2130;
+    --border: #2a2f42;
+    --text: #dbe1f0;
+    --dim: #8a93ab;
+    --accent: #4cc2ff;
+    --ok: #34d399;
+    --warn: #fbbf24;
+    --err: #f87171;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 14px/1.55 -apple-system, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+    padding: 20px;
+  }
+  .wrap { max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 700; margin-bottom: 4px; }
+  .sub { color: var(--dim); font-size: 12px; margin-bottom: 18px; }
+  .banner {
+    display: none; padding: 10px 14px; border-radius: 8px; margin-bottom: 14px;
+    background: rgba(251, 191, 36, .12); border: 1px solid rgba(251, 191, 36, .4); color: var(--warn);
+  }
+  .banner.show { display: block; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .kpi {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .kpi .label { color: var(--dim); font-size: 12px; margin-bottom: 6px; }
+  .kpi .value { font-size: 24px; font-weight: 700; font-family: var(--mono); }
+  .kpi .hint { color: var(--dim); font-size: 11px; margin-top: 4px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 18px; }
+  @media (max-width: 800px) { .grid2 { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 18px;
+  }
+  .panel h2 { font-size: 14px; margin-bottom: 10px; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .toolbar button, .toolbar select, .toolbar input {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 10px; font-size: 12px; cursor: pointer;
+  }
+  .toolbar button.active { background: var(--accent); color: #08121f; border-color: var(--accent); font-weight: 600; }
+  .toolbar input[type=password] { min-width: 220px; cursor: text; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--dim); font-weight: 600; font-size: 11px; }
+  td.num, th.num { text-align: right; font-family: var(--mono); }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover { background: var(--panel2); }
+  .modal {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,.6);
+    z-index: 100; align-items: center; justify-content: center;
+  }
+  .modal.show { display: flex; }
+  .modal-box {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    max-width: 640px; width: 92%; max-height: 80vh; overflow: auto; padding: 18px;
+  }
+  .modal-box pre { white-space: pre-wrap; word-break: break-all; font-family: var(--mono); font-size: 12px; }
+  .login {
+    position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+    background: var(--bg); z-index: 200;
+  }
+  .login.show { display: flex; }
+  .login-box { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 28px; width: 340px; }
+  .login-box h2 { font-size: 16px; margin-bottom: 14px; }
+  .login-box input {
+    width: 100%; padding: 10px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--panel2); color: var(--text); margin-bottom: 10px; font-size: 14px;
+  }
+  .login-box button {
+    width: 100%; padding: 10px; border-radius: 6px; border: none; cursor: pointer;
+    background: var(--accent); color: #08121f; font-weight: 700; font-size: 14px;
+  }
+  .login-err { color: var(--err); font-size: 12px; min-height: 18px; margin-bottom: 6px; }
+  .live-ind { display: inline-flex; align-items: center; gap: 6px; color: var(--ok); font-size: 12px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); display: inline-block; }
+  .dot.off { background: var(--dim); }
+  svg text { fill: var(--dim); font-size: 10px; }
+  .tokens4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin-bottom: 10px; }
+  .tok { background: var(--panel2); border-radius: 8px; padding: 8px 10px; }
+  .tok .l { color: var(--dim); font-size: 11px; }
+  .tok .v { font-family: var(--mono); font-size: 15px; font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="login" id="login">
+  <div class="login-box">
+    <h2>管理员登录</h2>
+    <div class="login-err" id="login-err"></div>
+    <input type="password" id="pass" autocomplete="current-password" placeholder="OBSERVABILITY_ADMIN_TOKEN">
+    <button id="login-btn">进入大盘</button>
+  </div>
+</div>
+
+<div class="wrap" id="app" style="display:none">
+  <h1>Credential Proxy · Observability</h1>
+  <div class="sub">脱敏 / 上游 / Token / 审计 可观测性大盘 · <span id="live-txt" class="live-ind"><span class="dot" id="live-dot"></span> Live</span></div>
+  <div class="banner" id="banner"></div>
+
+  <div class="kpis" id="kpis"></div>
+
+  <div class="panel">
+    <h2>时序趋势</h2>
+    <div class="toolbar" id="range-bar">
+      <button data-range="1h" class="active">1h</button>
+      <button data-range="24h">24h</button>
+      <button data-range="7d">7d</button>
+      <button data-range="30d">30d</button>
+      <select id="model-filter"><option value="">全部模型</option></select>
+    </div>
+    <div id="trend-chart"></div>
+    <div id="trend-svg"></div>
+  </div>
+
+  <div class="tokens4" id="tokens4"></div>
+
+  <div class="grid2">
+    <div class="panel">
+      <h2>PII 分布（按 kind）</h2>
+      <div id="pii-chart"></div>
+      <div id="pii-svg"></div>
+    </div>
+    <div class="panel">
+      <h2>上游分布（按 port）</h2>
+      <div id="upstream-chart"></div>
+      <div id="upstream-svg"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>最近事件 <span style="color:var(--dim);font-weight:400">（点击行查看脱敏摘要）</span></h2>
+    <div class="toolbar">
+      <select id="ev-verdict"><option value="">全部 verdict</option><option value="allow">allow</option><option value="deny">deny</option></select>
+      <select id="ev-upstream"><option value="">全部上游</option></select>
+      <button id="ev-refresh">刷新</button>
+      <button id="ev-live" class="active">Live</button>
+    </div>
+    <div style="overflow:auto">
+      <table id="ev-table">
+        <thead><tr>
+          <th>ts</th><th>request_id</th><th>upstream</th><th>status</th>
+          <th class="num">pii</th><th class="num">cred</th><th class="num">tokens</th>
+          <th>verdict</th><th class="num">latency(ms)</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="modal">
+  <div class="modal-box">
+    <h2 style="margin-bottom:10px">事件详情</h2>
+    <pre id="modal-body"></pre>
+    <div style="margin-top:12px;text-align:right"><button id="modal-close">关闭</button></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var state = { range: '1h', token: '', live: true, ev:[] };
+
+  function esc(s) {
+    var d = document.createElement('div');
+    d.textContent = s == null ? '' : String(s);
+    return d.innerHTML;
+  }
+
+  function fmtTs(ts) {
+    if (!ts) return '';
+    var d = new Date(ts * 1000);
+    return d.toLocaleTimeString('zh-CN', { hour12: false });
+  }
+
+  function fmtNum(n) {
+    if (n == null) return '—';
+    return Number(n).toLocaleString('en-US');
+  }
+
+  function setBanner(msg, kind) {
+    var b = document.getElementById('banner');
+    if (!msg) { b.className = 'banner'; return; }
+    b.className = 'banner show';
+    b.textContent = msg;
+  }
+
+  function api(path, opts) {
+    opts = opts || {};
+    opts.headers = opts.headers || {};
+    if (state.token) opts.headers['X-Admin-Token'] = state.token;
+    opts.credentials = 'include';
+    return fetch(path, opts).then(function (r) {
+      if (r.status === 401) { throw new Error('unauthorized'); }
+      if (!r.ok) { throw new Error('HTTP ' + r.status); }
+      return r.json();
+    });
+  }
+
+  // ── 登录流程 ──
+  function initAuth() {
+    fetch('/_admin/health', { credentials: 'include' }).then(function (r) {
+      if (r.status === 200) {
+        state.token = '__cookie__';
+        showApp();
+        return null;
+      }
+      showLogin();
+    }).catch(showLogin);
+  }
+
+  function showLogin() {
+    document.getElementById('login').className = 'login show';
+    document.getElementById('pass').focus();
+  }
+
+  function showApp() {
+    document.getElementById('login').className = 'login';
+    document.getElementById('app').style.display = 'block';
+    loadAll();
+    startLive();
+  }
+
+  function doLogin() {
+    var t = document.getElementById('pass').value;
+    if (!t) return;
+    fetch('/_admin/health', {
+      credentials: 'include',
+      headers: { 'X-Admin-Token': t }
+    }).then(function (r) {
+      if (r.status === 200) {
+        state.token = t;
+        // 服务端已 Set-Cookie；清除 URL 残留 ?access_token
+        history.replaceState({}, '', '/_admin/');
+        showApp();
+      } else {
+        var el = document.getElementById('login-err');
+        el.textContent = '401 未授权，请检查 Token';
+        document.getElementById('login-box');
+        var box = document.querySelector('.login-box');
+        box.style.animation = 'none';
+        void box.offsetWidth;
+        box.style.animation = 'shake .3s';
+      }
+    }).catch(function () {
+      document.getElementById('login-err').textContent = '请求失败，请重试';
+    });
+  }
+
+  // ── KPI ──
+  function renderKpis(metrics) {
+    var el = document.getElementById('kpis');
+    var req = metrics.requests || 0;
+    var piiHits = (metrics.pii_hits || 0) + (metrics.pii_miss || 0);
+    var redactedRatio = req > 0 ? (piiHits / req * 100) : 0;
+    var deny = (metrics.audit_by_verdict && metrics.audit_by_verdict.deny) || 0;
+    var p95 = metrics.latency ? metrics.latency.p95 : null;
+    var precise = metrics.latency ? metrics.latency.is_precise : false;
+    var p95Txt = p95 == null ? '—' : (Math.round(p95) + ' ms');
+    var p95Hint = state.range === '1h'
+      ? (precise ? '1h 精确' : '1h≈（低流量或高 TPS 属预期）')
+      : (state.range + '≈ 桶中位');
+    el.innerHTML =
+      '<div class="kpi"><div class="label">今日请求</div><div class="value">' + fmtNum(req) + '</div></div>' +
+      '<div class="kpi"><div class="label">脱敏占比</div><div class="value">' + redactedRatio.toFixed(1) + '%</div><div class="hint">PII 命中 ' + fmtNum(piiHits) + '</div></div>' +
+      '<div class="kpi"><div class="label">PII 命中</div><div class="value">' + fmtNum(piiHits) + '</div><div class="hint">hit ' + fmtNum(metrics.pii_hits || 0) + ' / miss ' + fmtNum(metrics.pii_miss || 0) + '</div></div>' +
+      '<div class="kpi"><div class="label">阻断数</div><div class="value">' + fmtNum(deny) + '</div><div class="hint">deny verdict</div></div>' +
+      '<div class="kpi"><div class="label">p95 延迟</div><div class="value">' + p95Txt + '</div><div class="hint">' + p95Hint + '</div></div>';
+  }
+
+  // ── Token 四卡 ──
+  function renderTokens4(metrics) {
+    var el = document.getElementById('tokens4');
+    var toks = metrics.tokens || {};
+    var prompt = 0, completion = 0, cachedRead = 0, cachedWrite = 0;
+    Object.keys(toks).forEach(function (m) {
+      var t = toks[m];
+      prompt += t.prompt || 0;
+      completion += t.completion || (t.output || 0);
+      cachedRead += t.cached_read || 0;
+      cachedWrite += t.cached_write || 0;
+    });
+    // usage 缺失告警：unknown 占比 >20%
+    var totalReq = metrics.requests || 0;
+    var unknown = 0;
+    Object.keys(toks).forEach(function (m) { unknown += toks[m].unknown || 0; });
+    if (totalReq > 0 && unknown / totalReq > 0.2) {
+      setBanner('⚠️ 缓存命中/成本核算失真：' + Math.round(unknown / totalReq * 100) + '% 请求无 usage');
+    } else {
+      setBanner('');
+    }
+    el.innerHTML =
+      '<div class="tok"><div class="l">输入 tokens</div><div class="v">' + fmtNum(prompt) + '</div></div>' +
+      '<div class="tok"><div class="l">输出 tokens</div><div class="v">' + fmtNum(completion) + '</div></div>' +
+      '<div class="tok"><div class="l">缓存命中 cached_read</div><div class="v">' + fmtNum(cachedRead) + '</div></div>' +
+      '<div class="tok"><div class="l">缓存写入 cached_write</div><div class="v">' + fmtNum(cachedWrite) + '</div></div>';
+  }
+
+  // ── 图表（Chart.js 可用则用，否则 SVG 降级）──
+  var chartInstances = {};
+
+  function renderCharts(metrics) {
+    var piiData = metrics.pii_by_type || {};
+    var upData = {};
+    // 上游分布：从 events 侧或 metrics 没有直接分 port —— 用 requests_by_status 近似不好，
+    // 从 recent_events 拉 events 计算
+    var hasChart = typeof Chart !== 'undefined';
+    renderBar('pii', piiData, 'PII kind');
+    // 上游分布稍后由 events 数据填充
+    if (hasChart) {
+      Object.keys(chartInstances).forEach(function (k) {
+        if (chartInstances[k]) chartInstances[k].destroy();
+      });
+      chartInstances = {};
+    }
+  }
+
+  function renderBar(id, data, label) {
+    var keys = Object.keys(data || {});
+    if (!keys.length) {
+      document.getElementById(id + '-chart').innerHTML = '';
+      document.getElementById(id + '-svg').innerHTML = '<span style="color:var(--dim)">暂无数据</span>';
+      return;
+    }
+    var hasChart = typeof Chart !== 'undefined';
+    var svgEl = document.getElementById(id + '-svg');
+    if (hasChart) {
+      svgEl.innerHTML = '';
+      try {
+        var ctx = document.getElementById(id + '-chart');
+        ctx.innerHTML = '<canvas id="' + id + '-canvas"></canvas>';
+        var canvas = document.getElementById(id + '-canvas');
+        if (chartInstances[id]) chartInstances[id].destroy();
+        chartInstances[id] = new Chart(canvas, {
+          type: 'bar',
+          data: {
+            labels: keys,
+            datasets: [{ label: label, data: keys.map(function (k) { return data[k]; }), backgroundColor: '#4cc2ff55', borderColor: '#4cc2ff', borderWidth: 1 }]
+          },
+          options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
+        });
+        return;
+      } catch (e) {
+        // Chart 初始化失败 → 降级 SVG
+      }
+    }
+    // SVG 降级
+    var max = Math.max.apply(null, keys.map(function (k) { return data[k]; }));
+    var w = 480, h = 160, bw = 40;
+    var bars = keys.map(function (k, i) {
+      var bh = (data[k] / max) * (h - 30);
+      return '<rect x="' + (i * (bw + 8) + 8) + '" y="' + (h - bh - 20) + '" width="' + bw + '" height="' + bh + '" fill="#4cc2ff66" stroke="#4cc2ff"/>' +
+             '<text x="' + (i * (bw + 8) + 8 + bw / 2) + '" y="' + (h - bh - 26) + '" text-anchor="middle">' + data[k] + '</text>' +
+             '<text x="' + (i * (bw + 8) + 8 + bw / 2) + '" y="' + (h - 6) + '" text-anchor="middle">' + esc(String(k).slice(0, 10)) + '</text>';
+    }).join('');
+    document.getElementById(id + '-chart').innerHTML = '';
+    svgEl.innerHTML = '<svg width="' + Math.max(w, keys.length * (bw + 8)) + '" height="' + h + '">' + bars + '</svg>';
+  }
+
+  function renderTrend(metrics) {
+    // 趋势：用 requests_by_status 的 200 序列近似（1h 粒度无历史点，展示当前）
+    var hasChart = typeof Chart !== 'undefined';
+    var svgEl = document.getElementById('trend-svg');
+    var chartEl = document.getElementById('trend-chart');
+    var labels = ['当前窗口'];
+    var vals = [metrics.requests || 0];
+    if (hasChart) {
+      svgEl.innerHTML = '';
+      chartEl.innerHTML = '<canvas id="trend-canvas"></canvas>';
+      try {
+        var canvas = document.getElementById('trend-canvas');
+        if (chartInstances['trend']) chartInstances['trend'].destroy();
+        chartInstances['trend'] = new Chart(canvas, {
+          type: 'line',
+          data: {
+            labels: labels,
+            datasets: [{ label: 'requests', data: vals, borderColor: '#4cc2ff', backgroundColor: '#4cc2ff22', fill: true }]
+          },
+          options: { plugins: { legend: { display: false } } }
+        });
+        return;
+      } catch (e) { /* fallthrough */ }
+    }
+    chartEl.innerHTML = '';
+    svgEl.innerHTML = '<span style="color:var(--dim)">' + state.range + ' 窗口请求数: ' + fmtNum(metrics.requests || 0) + '</span>';
+  }
+
+  function renderUpstream(metrics, events) {
+    var byUp = {};
+    (events ||[]).forEach(function (e) {
+      var u = e.upstream || 'other';
+      byUp[u] = (byUp[u] || 0) + 1;
+    });
+    // 无事件时用 metrics 近似
+    if (!Object.keys(byUp).length) {
+      var rbs = metrics.requests_by_status || {};
+      byUp['other'] = Object.keys(rbs).reduce(function (a, k) { return a + (rbs[k] || 0); }, 0);
+    }
+    renderBar('upstream', byUp, 'upstream port');
+  }
+
+  // ── 事件表 ──
+  function renderEvents(events) {
+    state.ev = events || [];
+    var tbody = document.querySelector('#ev-table tbody');
+    tbody.innerHTML = (state.ev ||[]).map(function (e) {
+      var tokens = e.tokens || {};
+      var tokTotal = 0;
+      Object.keys(tokens).forEach(function (m) {
+        var t = tokens[m];
+        tokTotal += (t.prompt || 0) + (t.completion || t.output || 0);
+      });
+      return '<tr class="clickable" data-i="' + (state.ev.indexOf(e)) + '">' +
+        '<td>' + esc(fmtTs(e.ts)) + '</td>' +
+        '<td>' + esc(e.request_id || '') + '</td>' +
+        '<td>' + esc(e.upstream || '') + '</td>' +
+        '<td>' + esc(e.status || '') + '</td>' +
+        '<td class="num">' + fmtNum(e.pii_hits) + '</td>' +
+        '<td class="num">' + fmtNum(e.cred_hits) + '</td>' +
+        '<td class="num">' + fmtNum(tokTotal) + '</td>' +
+        '<td>' + esc(e.verdict || '') + '</td>' +
+        '<td class="num">' + (e.latency_ms != null ? Math.round(e.latency_ms) : '—') + '</td>' +
+        '</tr>';
+    }).join('') || '<tr><td colspan="9" style="color:var(--dim)">暂无事件</td></tr>';
+    tbody.querySelectorAll('tr.clickable').forEach(function (tr) {
+      tr.addEventListener('click', function () {
+        var e = state.ev[Number(tr.getAttribute('data-i'))];
+        if (e) showModal(e);
+      });
+    });
+  }
+
+  function showModal(e) {
+    document.getElementById('modal').className = 'modal show';
+    document.getElementById('modal-body').textContent = JSON.stringify(e, null, 2);
+  }
+
+  // ── 数据加载 ──
+  function loadAll() {
+    api('/_admin/metrics?range=' + state.range).then(function (m) {
+      renderKpis(m);
+      renderTokens4(m);
+      renderCharts(m);
+      renderTrend(m);
+      return api('/_admin/events?limit=100').then(function (d) {
+        var evs = d.events || [];
+        renderEvents(evs);
+        renderUpstream(m, evs);
+        fillUpstreamFilter(evs);
+      });
+    }).catch(function (err) {
+      if (err.message === 'unauthorized') {
+        state.token = '';
+        showLogin();
+      }
+    });
+  }
+
+  function fillUpstreamFilter(evs) {
+    var sel = document.getElementById('ev-upstream');
+    var cur = sel.value;
+    var ups = {};
+    evs.forEach(function (e) { ups[e.upstream || 'other'] = 1; });
+    var html = '<option value="">全部上游</option>';
+    Object.keys(ups).sort().forEach(function (u) { html += '<option value="' + esc(u) + '">' + esc(u) + '</option>'; });
+    sel.innerHTML = html;
+    sel.value = cur;
+  }
+
+  // ── Live SSE ──
+  function startLive() {
+    var es;
+    function connect() {
+      if (!state.live) return;
+      var url = '/_admin/events/stream';
+      if (state.token && state.token !== '__cookie__') url += '?access_token=' + encodeURIComponent(state.token);
+      es = new EventSource(url);
+      es.onopen = function () {
+        document.getElementById('live-dot').className = 'dot';
+      };
+      es.onerror = function () {
+        document.getElementById('live-dot').className = 'dot off';
+        es.close();
+        setTimeout(connect, 3000);
+      };
+      es.addEventListener('event', function (ev) {
+        try {
+          var e = JSON.parse(ev.data);
+          prependEvent(e);
+        } catch (err) { /* ignore */ }
+      });
+      es.addEventListener('done', function () {
+        es.close();
+        setTimeout(connect, 1000);
+      });
+    }
+    connect();
+  }
+
+  function prependEvent(e) {
+    var evs = state.ev || [];
+    evs.unshift(e);
+    evs = evs.slice(0, 100);
+    state.ev = evs;
+    var tbody = document.querySelector('#ev-table tbody');
+    var first = tbody.querySelector('tr:first-child');
+    var row = document.createElement('tr');
+    var tokens = e.tokens || {};
+    var tokTotal = 0;
+    Object.keys(tokens).forEach(function (m) {
+      var t = tokens[m];
+      tokTotal += (t.prompt || 0) + (t.completion || t.output || 0);
+    });
+    row.className = 'clickable';
+    row.setAttribute('data-i', '0');
+    row.innerHTML =
+      '<td>' + esc(fmtTs(e.ts)) + '</td>' +
+      '<td>' + esc(e.request_id || '') + '</td>' +
+      '<td>' + esc(e.upstream || '') + '</td>' +
+      '<td>' + esc(e.status || '') + '</td>' +
+      '<td class="num">' + fmtNum(e.pii_hits) + '</td>' +
+      '<td class="num">' + fmtNum(e.cred_hits) + '</td>' +
+      '<td class="num">' + fmtNum(tokTotal) + '</td>' +
+      '<td>' + esc(e.verdict || '') + '</td>' +
+      '<td class="num">' + (e.latency_ms != null ? Math.round(e.latency_ms) : '—') + '</td>';
+    row.addEventListener('click', function () { showModal(e); });
+    if (first) tbody.insertBefore(row, first);
+    else tbody.appendChild(row);
+  }
+
+  // ── 事件绑定 ──
+  document.addEventListener('DOMContentLoaded', function () {
+    initAuth();
+    document.getElementById('login-btn').addEventListener('click', doLogin);
+    document.getElementById('pass').addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') doLogin();
+    });
+    document.getElementById('modal-close').addEventListener('click', function () {
+      document.getElementById('modal').className = 'modal';
+    });
+    document.querySelectorAll('#range-bar button').forEach(function (b) {
+      b.addEventListener('click', function () {
+        document.querySelectorAll('#range-bar button').forEach(function (x) { x.className = ''; });
+        b.className = 'active';
+        state.range = b.getAttribute('data-range');
+        loadAll();
+      });
+    });
+    document.getElementById('ev-refresh').addEventListener('click', loadAll);
+    document.getElementById('ev-live').addEventListener('click', function () {
+      state.live = !state.live;
+      this.className = state.live ? 'active' : '';
+      if (state.live) startLive();
+    });
+    document.getElementById('ev-verdict').addEventListener('change', function () {
+      var v = this.value;
+      api('/_admin/events?limit=100' + (v ? '&verdict=' + v : '')).then(function (d) {
+        renderEvents(d.events || []);
+      });
+    });
+    document.getElementById('model-filter').addEventListener('change', function () {
+      var m = this.value;
+      var url = '/_admin/metrics?range=' + state.range + (m ? '&model=' + encodeURIComponent(m) : '');
+      api(url).then(renderKpis);
+    });
+  });
+})();
+</script>
+</body>
+</html>

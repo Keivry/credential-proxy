@@ -31,13 +31,14 @@
 async def _auth_middleware(request):
     q = request.query.get('access_token')
     if q and request.path != '/_admin/events/stream':
-        return _unauthorized()          # ① 非 SSE 带 query 恒拒，先于一切
+        return _unauthorized()  # ① 非 SSE 带 query 恒拒，先于一切
     tok = request.headers.get('X-Admin-Token') or _cookie_token(request) or q
     if not tok:
-        return _unauthorized()          # ② 无凭证
+        return _unauthorized()  # ② 无凭证
     if not hmac.compare_digest(
         hashlib.sha256(tok).hexdigest(),
-        hashlib.sha256(_OBSERVABILITY_ADMIN_TOKEN).hexdigest()):  # ③ 定长摘要
+        hashlib.sha256(_OBSERVABILITY_ADMIN_TOKEN).hexdigest(),
+    ):  # ③ 定长摘要
         return _unauthorized()
     ...  # ④ 限流 / 处理
 ```

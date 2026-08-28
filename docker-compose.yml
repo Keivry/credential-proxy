@@ -1,7 +1,7 @@
 services:
   credential-proxy:
     build: .
-    image: ghcr.io/keivry/credential-proxy:0.9.2
+    image: ghcr.io/keivry/credential-proxy:0.9.25
     container_name: credential-proxy
     restart: unless-stopped
     cap_add:
@@ -15,6 +15,12 @@ services:
       - HOMESERVER=https://matrix.example.com
       - ROOM_ID=!yourroomid:matrix.example.com
       - MATRIX_ACCESS_TOKEN=${MATRIX_ACCESS_TOKEN:?MATRIX_ACCESS_TOKEN is required}
+
+      # ── Observability 大盘（/_admin，必填）──
+      # OBSERVABILITY_ADMIN_TOKEN: /_admin 大盘鉴权 Token，≥32 字符，须与其它 Token 独立。
+      #   未设置 → 拒绝启动（SystemExit）；OBSERVABILITY_DISABLE=1 可显式禁用 /_admin。
+      - OBSERVABILITY_ADMIN_TOKEN=${OBSERVABILITY_ADMIN_TOKEN:?OBSERVABILITY_ADMIN_TOKEN is required}
+      # - OBSERVABILITY_DISABLE=1   # 过渡逃生开关（禁用 /_admin，不推荐生产）
 
       # ── 三因子认证（v0.8.0+，强烈建议开启）──
       # 开启后仅 get 二进制可通过认证直接通信，curl/Python 直调被 403 拒绝。
@@ -49,10 +55,12 @@ services:
       # - DATA_DIR=/data
       # - CREDENTIAL_PROXY_DEBUG_DIR=/data/debug  # LLM 对话请求/响应日志
     ports:
-      - "8877:8877"        # 凭据 API
-      - "8878:8878"        # LLM 代理 — OpenCode
-      - "8879:8879"        # LLM 代理 — DeepSeek
+      - "127.0.0.1:8877:8877"   # 凭据 API（默认仅回环，外部访问需反代/TLS）
+      - "127.0.0.1:8878:8878"   # LLM 代理 — OpenCode（同上）
+      - "127.0.0.1:8879:8879"   # LLM 代理 — DeepSeek（同上）
     volumes:
+      # 数据目录父卷在前（metrics.sqlite 等），tpm/db 子卷在后（不遮蔽）
+      - ${DATA_DIR:-./data}:/data
       # TPM 密封文件（seal.pub + seal.priv；primary key 每次解封现场派生，无需 primary.ctx）
       - ${TPM_HOST_PATH:-./data/tpm}:/data/tpm:ro
       # KeePass 数据库（.kdbx + .key）

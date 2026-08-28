@@ -870,6 +870,11 @@ class AuditMixin:
             'summary': summary,
             'note': note,
         }
+        # 可观测性：audit_by_verdict / audit_by_rule（verdict 值域 allow/deny，
+        # rule 存 reason 非 pattern）
+        _mc = getattr(self, '_metrics_collector', None)
+        if _mc is not None:
+            _mc.incr_sync_audit(verdict=verdict, rule=rule_hit)
         # 内存环形计数（进程存活期内可查询——告警通道不可用时事件不无痕）
         ring = getattr(self, '_audit_log_ring', [])
         ring.append(record)
@@ -885,6 +890,9 @@ class AuditMixin:
             self._audit_log_fail_count = 0
             return
         # 写失败：两层 fail-closed
+        # 可观测性：audit_log_write_fail
+        if _mc is not None:
+            _mc.incr_sync_audit_log_write_fail()
         self._audit_log_fail_count = getattr(self, '_audit_log_fail_count', 0) + 1
         if verdict == 'deny':
             # 危险调用写失败：仍阻断（调用方已 deny），告警 + 环形计数

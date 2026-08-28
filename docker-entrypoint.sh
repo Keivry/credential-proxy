@@ -5,6 +5,9 @@ set -euo pipefail
 : "${HOMESERVER:?HOMESERVER is required}"
 : "${ROOM_ID:?ROOM_ID is required}"
 : "${MATRIX_ACCESS_TOKEN:?MATRIX_ACCESS_TOKEN is required}"
+if [ "${OBSERVABILITY_DISABLE:-}" != "1" ]; then
+    : "${OBSERVABILITY_ADMIN_TOKEN:?OBSERVABILITY_ADMIN_TOKEN is required (or set OBSERVABILITY_DISABLE=1 to disable /_admin)}"
+fi
 
 # ── 默认值 (可通过 env 覆盖) ──
 export DATA_DIR="${DATA_DIR:-/data}"
@@ -15,9 +18,10 @@ export CREDENTIAL_PORT="${CREDENTIAL_PORT:-8877}"
 # ── 确保数据目录存在 ──
 mkdir -p "$TPM_DIR" "$DB_DIR"
 
-# ── 确保 /data 目录归 credential-proxy 用户所有 ──
-# 容器以 root 启动创建目录，gosu 降权后非 root 用户需写 token_registry.json
+# ── 确保 /data 目录归 credential-proxy 用户所有且 700 ──
+# 容器以 root 启动创建目录，gosu 降权后非 root 用户需写 token_registry.json / metrics.sqlite
 chown credential-proxy:credential-proxy "$DATA_DIR"
+chmod 700 "$DATA_DIR"
 
 # ── 修复 TPM 设备权限（容器内设专用组，不依赖宿主 GID）──
 # chown + chmod 660 = root + credential-proxy 组可读写

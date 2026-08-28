@@ -242,6 +242,12 @@ class GlobalPiiTokens:
         self._audit_cb = audit_cb
         self._malformed_counts: dict[str, int] = {}
         self._lock = asyncio.Lock()
+        # 可观测性采集器引用（llm-observability-dashboard）
+        self._collector = None
+
+    def set_collector(self, collector) -> None:
+        """注入 MetricsCollector（计数钩子）。"""
+        self._collector = collector
 
     def _next_available_index(self, used: set[int] | None = None) -> int:
         """空洞跳过：收集 pii_t2p+resp_t2p 已用 seq set，取最小空缺。"""
@@ -288,6 +294,9 @@ class GlobalPiiTokens:
                 # 同步 move 对侧
                 if tok in table_t2p:
                     table_t2p.move_to_end(tok)
+                # pii_cache_hit 计数（仅请求侧合法值；响应侧 resp_p2t 不参与）
+                if not response_side and self._collector is not None:
+                    self._collector.incr_sync_pii_cache(hit=1, miss=0)
                 return tok
             # gap-aware: 收集 pii_t2p+resp_t2p 已用 seq set + batch_tracker 再 while递增
             used: set[int] = set()
@@ -305,9 +314,17 @@ class GlobalPiiTokens:
             table_p2t[value] = token
             table_t2p[token] = value
             # LRU 淘汰：仅对当前表（pii/resp 各限 1000，总量≤2000）
+            evicted = 0
             while len(table_p2t) > PII_MAX_ENTRIES:
                 _oldest_val, oldest_tok = table_p2t.popitem(last=False)
                 table_t2p.pop(oldest_tok, None)
+                evicted += 1
+            if evicted and self._collector is not None:
+                # 批量淘汰 pii_lru_evictions += n（两表各自触发均累加）
+                self._collector.incr_sync_lru(cred=0, pii=evicted)
+            # pii_cache_miss 计数（仅请求侧合法值；响应侧不参与）
+            if not response_side and self._collector is not None:
+                self._collector.incr_sync_pii_cache(hit=0, miss=1)
             return token
 
     def restore(self, text: str) -> str:
@@ -483,6 +500,8 @@ class TokenMixin:
         async with self._lock:
             if value in self.pwd_to_token:
                 self.pwd_to_token.move_to_end(value)
+                # cred_hit 计数（按请求 out!=in 计 1）
+                self._metrics_cred_hit()
                 return self.pwd_to_token[value]
             if TOKEN_STR_RE.fullmatch(value) or value.startswith(TOKEN_PREFIX):
                 logger.warning(
@@ -495,9 +514,29 @@ class TokenMixin:
                 oldest = next(iter(self.pwd_to_token))
                 old_token = self.pwd_to_token.pop(oldest)
                 self.token_to_pwd.pop(old_token, None)
+                # cred_lru_evictions +1
+                self._metrics_cred_lru(1)
             self.pwd_to_token[value] = token
             self.token_to_pwd[token] = value
+            # cred_miss 计数（新建）
+            self._metrics_cred_miss()
             return token
+
+    def _metrics_cred_hit(self) -> None:
+        """cred_hit 计数钩子（同步，无事件循环也安全）。"""
+        collector = getattr(self, '_metrics_collector', None)
+        if collector is not None:
+            collector.incr_sync_cred(hit=1, miss=0)
+
+    def _metrics_cred_miss(self) -> None:
+        collector = getattr(self, '_metrics_collector', None)
+        if collector is not None:
+            collector.incr_sync_cred(hit=0, miss=1)
+
+    def _metrics_cred_lru(self, n: int = 1) -> None:
+        collector = getattr(self, '_metrics_collector', None)
+        if collector is not None:
+            collector.incr_sync_lru(cred=n, pii=0)
 
     async def _maybe_register(self, value: str, use_token: bool = True) -> str:
         """注册密码值（use_token=True）或透传原始值（use_token=False）。

@@ -168,6 +168,45 @@ get revoke --name "check-mail"
 - **脚本内 `subprocess.run` 调用** 放行：`caller_hash` = 脚本文件 SHA256，不等于 `get_binary_hash`
 - **服务端同时校验**：`GET_BINARY_HASH` 服务端常量，防止兼容模式下客户端伪造
 
+## Observability 大盘（/_admin，v0.9.25+）
+
+实时指标大盘（请求量/延迟分桶/p95/PII 与凭据命中率/Token 用量/审计分布），单文件 `admin.html` 免构建。
+
+### 鉴权与绑定
+
+- **`OBSERVABILITY_ADMIN_TOKEN` 必填**（未设/空值 `SystemExit` 拒绝启动；长度 <32 仅告警；与 `CREDENTIAL_ADMIN_TOKEN`/`MATRIX_ACCESS_TOKEN`/`admin_token` 文件值独立，重复即拒）。
+- 凭证优先级：`X-Admin-Token` 头 > `__Host-admin_token` Cookie > `?access_token`（**仅 SSE** 回退）。非 SSE 带 `?access_token` **恒 401**（防历史 URL 复用）；`hmac.compare_digest`（等长 sha256 摘要）时序安全比较。
+- Cookie：`HttpOnly` + `Secure`（仅 https；`ENV=dev` 且 `ALLOW_LOOPBACK_NO_TOKEN=1` 时 http 回退不带 `Secure`）；前端 `history.replaceState` 清除 URL 中的 `?access_token`；`admin.html` 密码输入框 `type=password autocomplete=current-password`。
+- **端口绑定**：docker-compose 默认 `127.0.0.1:887x:887x`（仅回环）；`0.0.0.0` 直出 `/_admin` 无 TLS 风险极大，外部访问必须经 TLS 反代。
+- **限流**：管理接口 `10/min/IP` 超限 `429 + Retry-After`；SSE `max 5 并发/IP` + `60s :ping` 心跳 + `5min` 服务端强制重连。
+- `OBSERVABILITY_DISABLE=1`：过渡逃生开关，`/_admin/*` 全 404（二期收紧）。
+
+### 指标与存储
+
+- `DATA_DIR/metrics.sqlite`（WAL + `busy_timeout=5000` + `synchronous=NORMAL` + `user_version=1`），文件含 `-wal`/`-shm` 均 `0600`（`os.umask(0o077)` + `wal_checkpoint(TRUNCATE)` 后重 chmod）。
+- `daily_agg` 15 基础列 + 5 扩展列（`placeholder_prompt_injected`/`truncated_total`/`json_aware_success`/`json_leaf_fallback`/`json_full_fallback`），30 天滚动；`hourly_agg` 9 列轻量子集，7 天滚动。
+- 每 5min **覆盖式 UPSERT**（`ON CONFLICT DO UPDATE SET col=excluded.col`）不翻倍；`QueueFull` 丢最老快照计 `dropped_snapshots`（覆盖式不丢数，跨窗口有补偿）；优雅关闭 `wal_checkpoint(TRUNCATE)`。
+- 延迟 12 桶 `LATENCY_BUCKETS=[10,25,50,100,200,400,800,1500,3000,5000,10000,Inf]` ms；p95 由桶逆分位取中位近似（最差约 30.4% @[800,1500) 中位），`is_precise = (now-oldest_ts)>=3600 and len>=100`，低流量/高 TPS 时 `1h` 永为 `≈` 属设计预期。
+- `ENOSPC` 磁盘满 → 降级内存-only，`health.sqlite_ok=false` + `sqlite_error` 非空，进程不崩，恢复后续写不回补。
+- 摘要脱敏单一路径 `redact→truncate`：`__PII_*__`/`__VG_CRED_*__`/`sk-`/`xox*`/email → `[REDACTED:*]`，截断边界半字符保护（UTF-8）。
+- **PII 占位符口径**：`PII_PLACEHOLDER_PROMPT=1` 注入说明不计 `pii_detected_total`/`bytes_in`，`health.placeholder_prompt_enabled` 反映开关。
+- v0.9.25 基线：slow/fast 双路径埋点、`sse_events` 按块计、`truncated_total`、JSON-aware 三态、verdict 值域 `allow/deny`。
+
+### 使用
+
+```bash
+# 打开大盘（浏览器访问；http 下仅 dev 回环免 token 模式可用）
+open http://127.0.0.1:8878/_admin/
+
+# API（JSON）
+curl -H "X-Admin-Token: $OBSERVABILITY_ADMIN_TOKEN" http://127.0.0.1:8878/_admin/health
+curl -H "X-Admin-Token: $OBSERVABILITY_ADMIN_TOKEN" "http://127.0.0.1:8878/_admin/metrics?range=24h"
+curl -H "X-Admin-Token: $OBSERVABILITY_ADMIN_TOKEN" "http://127.0.0.1:8878/_admin/events?verdict=deny"
+
+# SSE 实时流（query token 仅此处回退）
+curl -N "http://127.0.0.1:8878/_admin/events/stream?access_token=$OBSERVABILITY_ADMIN_TOKEN"
+```
+
 ## 配置
 
 ### 环境变量
@@ -180,6 +219,8 @@ get revoke --name "check-mail"
 | `GET_BINARY_HASH` | `get` 二进制的 SHA256 | 空（跳过三因子认证） |
 | `GET_BINARY_SECRET` | 部署共享密钥 | 空（跳过三因子认证） |
 | `CREDENTIAL_PORT` | HTTP API 端口 | `8877` |
+| `OBSERVABILITY_ADMIN_TOKEN` | `/_admin` 大盘鉴权 Token。**必填**：未设置/空值 → `SystemExit` 拒绝启动；长度 <32 仅 `logger.warning`（建议 ≥32）；须与 `CREDENTIAL_ADMIN_TOKEN`/`MATRIX_ACCESS_TOKEN`/`DATA_DIR/admin_token` 文件值**独立**（重复 → `SystemExit`） | —（必填） |
+| `OBSERVABILITY_DISABLE` | `/_admin` 过渡逃生开关：`1` 时 `/_admin/*` 全 404 且跳过 Token 校验（二期收紧，生产不推荐） | 空（启用） |
 | `DATA_DIR` | 数据目录 | `/data` |
 | `TPM_DIR` | TPM 密封文件目录 | `$DATA_DIR/tpm` |
 | `DB_DIR` | KeePass 数据库目录 | `$DATA_DIR/db` |

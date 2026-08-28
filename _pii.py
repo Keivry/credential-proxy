@@ -568,6 +568,12 @@ class PiiDetector:
         self.dict_entries: list[tuple[str, str]] = []  # (name, type)
         self.dict_ver = 0
         self.dict_re = None  # 编译缓存（版本比对决定重编译）
+        # 可观测性采集器引用（llm-observability-dashboard）
+        self._collector = None
+
+    def set_collector(self, collector) -> None:
+        """注入 MetricsCollector（pii_detected_total 计数钩子）。"""
+        self._collector = collector
 
     # ── 自定义正则加载 ──
 
@@ -881,6 +887,7 @@ class PiiDetector:
         if not _COARSE_FILTER_RE.search(text):
             if self.dict_re:
                 hits.extend(self._scan_dict(text, credential_p2t))
+            self._count_detected(hits)
             return hits
 
         def _overlaps_protected(start: int, end: int) -> bool:
@@ -919,7 +926,21 @@ class PiiDetector:
         # 字典（独立扫描，凭据重叠值同样跳过）
         if self.dict_re:
             hits.extend(self._scan_dict(text, credential_p2t))
+        self._count_detected(hits)
         return hits
+
+    def _count_detected(self, hits: list[tuple[str, str]]) -> None:
+        """pii_detected_total{kind} 计数（sanitize_kind 消毒后）。"""
+        if not hits or self._collector is None:
+            return
+        from _metrics import sanitize_kind
+
+        by_kind: dict[str, int] = {}
+        for kind, _value in hits:
+            sk = sanitize_kind(kind, self.custom_names)
+            by_kind[sk] = by_kind.get(sk, 0) + 1
+        if by_kind:
+            self._collector.incr_sync_pii_detected(by_kind)
 
     async def detect_and_redact(
         self,
