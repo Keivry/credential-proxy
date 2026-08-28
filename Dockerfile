@@ -23,6 +23,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # 源码
 COPY *.py /app/
+# 可观测性大盘静态页（/_admin 静态壳，缺失时返回 admin dashboard unavailable）
+COPY admin.html /app/
 
 # 入口
 COPY --chmod=+x docker-entrypoint.sh /
