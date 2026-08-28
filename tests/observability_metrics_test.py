@@ -194,6 +194,54 @@ class TestCollectorCore:
         assert data['requests_by_status'].get('200') == 1
         assert collector.ring_stats()['ring_len'] == 1
 
+    def test_pii_requests_same_source(self, collector):
+        """脱敏占比 = pii_requests/requests 必须同数据源（recent_events），且 ≤100%。"""
+        run(
+            collector.incr_event(
+                upstream='8878',
+                status=200,
+                pii_found=True,
+                pii_by_type={'ipv6': 2},
+                pii_hits=1,
+                pii_miss=0,
+                request_id='p1',
+                tail='chat/completions',
+            )
+        )
+        run(
+            collector.incr_event(
+                upstream='8878',
+                status=200,
+                pii_found=True,
+                pii_by_type={'email': 1},
+                pii_hits=0,
+                pii_miss=1,
+                request_id='p2',
+                tail='chat/completions',
+            )
+        )
+        run(
+            collector.incr_event(
+                upstream='8878',
+                status=200,
+                request_id='p3',
+                tail='chat/completions',
+            )
+        )
+        data = collector.query_range('1h')
+        assert data['requests'] == 3
+        assert data['pii_requests'] == 2
+        assert data['pii_hits'] == 1
+        assert data['pii_miss'] == 1
+        ratio = data['pii_requests'] / data['requests']
+        assert ratio <= 1.0
+        assert abs(ratio - 2 / 3) < 1e-9
+        # 24h 窗口从 DB 读取同一语义（先 flush 落库）
+        collector._flush_sync()
+        data24 = collector.query_range('24h')
+        assert data24['pii_requests'] == 2
+        assert data24['pii_hits'] == 1
+
     def test_sanitize_kind_db_no_raw_label(self, collector):
         run(
             collector.incr_event(

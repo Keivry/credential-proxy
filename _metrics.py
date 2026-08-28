@@ -714,6 +714,7 @@ class MetricsCollector:
         placeholder_prompt_injected: bool = False,
         pii_hits: int = 0,
         pii_miss: int = 0,
+        pii_found: bool = False,
         cred_hits: int = 0,
         cred_miss: int = 0,
         tokens: dict[str, Any] | None = None,
@@ -794,7 +795,7 @@ class MetricsCollector:
             d.pii_miss += pii_miss
             h.pii_hits += pii_hits
             h.pii_miss += pii_miss
-            if pii_hits > 0:
+            if pii_found:
                 d.pii_requests += 1
                 h.pii_requests += 1
             d.cred_hits += cred_hits
@@ -818,6 +819,7 @@ class MetricsCollector:
                         'latency_ms': latency_ms_v,
                         'pii_hits': pii_hits,
                         'pii_miss': pii_miss,
+                        'pii_found': pii_found,
                         'cred_hits': cred_hits,
                         'cred_miss': cred_miss,
                         'tokens': tokens_d,
@@ -1068,6 +1070,10 @@ class MetricsCollector:
             s = e['status']
             by_status[s] = by_status.get(s, 0) + 1
             # recent_events 不含 pii_by_type 明细（含类型分布需从 daily 拉近 1h）
+            if e.get('pii_found'):
+                pii_requests += 1
+            pii_hits += e.get('pii_hits', 0)
+            pii_miss += e.get('pii_miss', 0)
         # 1h 的 pii_by_type / tokens 从 daily 当日累计近似（按 1h 窗口取当日）
         day_key = _day_key(now)
         audit_by_verdict: dict[str, int] = {}
@@ -1078,9 +1084,8 @@ class MetricsCollector:
             for k, v in agg.pii_by_type.items():
                 pii_by_type[k] = pii_by_type.get(k, 0) + v
             self._merge_tokens(tokens, agg.tokens)
-            pii_hits += agg.pii_hits
-            pii_miss += agg.pii_miss
-            pii_requests += agg.pii_requests
+            # pii_hits/pii_miss/pii_requests 均从 recent_events 精确统计（同 requests 数据源）；
+            # _daily 只作为 pii_by_type/tokens 的全天近似
             cred_hits += agg.cred_hits
             cred_miss += agg.cred_miss
             for k, v in agg.audit_by_verdict.items():

@@ -2281,6 +2281,7 @@ class LlmMixin(AuditMixin):
                 'audit_by_verdict': {},
                 'audit_by_rule': {},
                 'pii_by_type': {},
+                'pii_found': False,
                 'request_id': req_id,
                 'tail': tail,
                 'verdict': '',
@@ -2354,6 +2355,8 @@ class LlmMixin(AuditMixin):
                 pii_scope = self._pii_scope_or_none()
                 has_cred = snapshot_t2p and b'__VG_CRED_' in out_body
                 has_pii = bool(pii_scope) and b'__PII_' in out_body
+                if has_pii:
+                    _metrics_ctx['pii_found'] = True
                 # ── 请求脱敏后置校验：仅 has_cred/has_pii 时触发，失败先叶子重建仍失败才全量回退 ──
                 if has_cred or has_pii:
                     try:
@@ -5715,6 +5718,7 @@ class LlmMixin(AuditMixin):
                             ),
                             pii_hits=_metrics_ctx.get('pii_hits', 0),
                             pii_miss=_metrics_ctx.get('pii_miss', 0),
+                            pii_found=_metrics_ctx.get('pii_found', False),
                             cred_hits=_metrics_ctx.get('cred_hits', 0),
                             cred_miss=_metrics_ctx.get('cred_miss', 0),
                             tokens=_metrics_ctx.get('tokens') or None,

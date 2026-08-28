@@ -279,8 +279,8 @@
       : (state.range + '≈ 桶中位');
     el.innerHTML =
       '<div class="kpi"><div class="label">今日请求</div><div class="value">' + fmtNum(req) + '</div></div>' +
-      '<div class="kpi"><div class="label">脱敏占比</div><div class="value">' + redactedRatio.toFixed(1) + '%</div><div class="hint">含 PII 请求 ' + fmtNum(piiReqs) + '</div></div>' +
-      '<div class="kpi"><div class="label">PII 命中</div><div class="value">' + fmtNum(piiHits) + '</div><div class="hint">hit ' + fmtNum(metrics.pii_hits || 0) + ' / miss ' + fmtNum(metrics.pii_miss || 0) + '</div></div>' +
+      '<div class="kpi"><div class="label">脱敏占比</div><div class="value">' + redactedRatio.toFixed(1) + '%</div><div class="hint">含 PII 请求 ' + fmtNum(piiReqs) + ' / 总 ' + fmtNum(req) + '</div></div>' +
+      '<div class="kpi"><div class="label">PII Token 缓存</div><div class="value">' + fmtNum(piiHits) + '</div><div class="hint">hit(复用) ' + fmtNum(metrics.pii_hits || 0) + ' / miss(新值) ' + fmtNum(metrics.pii_miss || 0) + '</div></div>' +
       '<div class="kpi"><div class="label">阻断数</div><div class="value">' + fmtNum(deny) + '</div><div class="hint">deny verdict</div></div>' +
       '<div class="kpi"><div class="label">p95 延迟</div><div class="value">' + p95Txt + '</div><div class="hint">' + p95Hint + '</div></div>';
   }
