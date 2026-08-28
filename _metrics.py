@@ -683,7 +683,9 @@ class MetricsCollector:
             delta_pii[sk] = delta_pii.get(sk, 0) + v
         delta_verdict: dict[str, int] = dict(audit_by_verdict or {})
         delta_rule: dict[str, int] = dict(audit_by_rule or {})
-        tokens_d = tokens or {}
+        # 防御性拷贝：metrics_ctx['tokens'] 是请求局部 dict，后续 _capture_usage_ctx
+        # 流式增量修改会污染 recent_events/聚合已引用的同一对象
+        tokens_d = dict(tokens) if tokens else {}
         latency_ms_v = latency_ms if latency_ms is not None else None
         # 锁外做脱敏（5 个正则替换，避免占用全局锁）
         summary_redacted = redact_summary(raw_summary, 120) if raw_summary else ''
