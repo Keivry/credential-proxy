@@ -201,10 +201,11 @@ def _read_admin_html() -> str:
 class TestRateLimiterCleanup:
     def test_expired_key_reused_with_count(self):
         rl = _RateLimiter(limit=10, window_s=60)
-        ip = "192.0.2.55"
+        ip = '192.0.2.55'
         rl.allow(ip)
         # 模拟时间流逝（直接篡改内部时间戳为过期）
         import time as _t
+
         rl._hits[ip] = [_t.time() - 120]
         ok, _ = rl.allow(ip)
         assert ok is True
@@ -214,7 +215,7 @@ class TestRateLimiterCleanup:
 
     def test_active_key_kept(self):
         rl = _RateLimiter(limit=10, window_s=60)
-        ip = "192.0.2.56"
+        ip = '192.0.2.56'
         rl.allow(ip)
         ok, _ = rl.allow(ip)
         assert ok is True
@@ -240,7 +241,7 @@ class TestEventsSummaryRedacted:
                 upstream='8878',
                 status=200,
                 request_id='r-redact-1',
-                raw_summary='call tool with key-sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 and phone 13800138000',
+                raw_summary='call tool with key-sk-ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 and phone __PII_2_4a59a9be__',
             )
 
         _a.run(_run())
@@ -248,4 +249,34 @@ class TestEventsSummaryRedacted:
         assert evs, '应有事件'
         s = evs[0].get('summary', '')
         assert 'ABCDEFGHIJKLMNOPQRSTUVWXYZ123456' not in s
-        assert '13800138000' not in s
+        assert '__PII_2_4a59a9be__' not in s
+
+
+class TestMetricsQueryRangeKwOnly:
+    """query_range 必须兼容 keyword-only model_filter（回归保护）。
+
+    真实 bug：run_in_executor 位置传 model_filter 触发
+    'takes 2 positional arguments but 3 were given'（_metrics.query_range 签名
+    是 keyword-only），导致大盘聚合指标全 0。
+    """
+
+    def test_query_range_accepts_model_filter_kwonly(self, collector):
+        import asyncio as _a
+
+        async def _run():
+            await collector.incr_event(
+                upstream='8878',
+                status=200,
+                request_id='r-kwonly-1',
+            )
+            # keyword-only 传参：修复前抛 TypeError，修复后正常返回
+            data = collector.query_range('1h', model_filter='gpt-test')
+            assert data.get('range') == '1h'
+            assert 'error' not in data, f'不应异常: {data}'
+
+        _a.run(_run())
+
+    def test_query_range_positional_model_filter_raises(self, collector):
+        """位置传 model_filter 必须报 TypeError——确保调用方不会误用。"""
+        with pytest.raises(TypeError):
+            collector.query_range('1h', 'gpt-test')

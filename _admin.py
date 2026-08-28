@@ -384,7 +384,8 @@ async def _handle_metrics(request: web.Request, collector) -> web.Response:
     loop = asyncio.get_running_loop()
     try:
         data = await loop.run_in_executor(
-            None, collector.query_range, range_, model_filter
+            None,
+            lambda: collector.query_range(range_, model_filter=model_filter),
         )
     except Exception as e:  # pragma: no cover — 防御
         logger.warning('metrics 查询异常: %s', e)
