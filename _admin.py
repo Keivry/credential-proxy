@@ -39,8 +39,9 @@ _NO_STORE_HEADERS = {
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
 }
 
-# 管理接口限流：10/min/IP
-_RATE_LIMIT_MIN = 10
+# 管理接口限流：60/min/IP（防坏 token 爆破；Dashboard 刷新+轮询正常交互不受限）
+# 10/min 会被「刷新页面 → health+metrics+events 多个请求」几次耗尽 → 429 误伤
+_RATE_LIMIT_MIN = 60
 _RATE_WINDOW_S = 60
 # SSE 限流：5 concurrent/IP + 60s ping + 5min 强制断开
 _SSE_MAX_CONCURRENT = 5
@@ -266,6 +267,8 @@ def init_observability(app: web.Application, collector) -> None:
 
         # 管理接口 10/min/IP 限流（IP 维度，鉴权前计数——防坏 token 爆破）
         # 空/None remote 归一为 'unknown' 单列桶，防全局坍缩
+        # /_admin/health 豁免限流：前端每次刷新 initAuth 必打，且 token 等长
+        # sha256 比较极廉价；限流 10/min 会被几次刷新耗尽 → 429 被前端误判为未登录
         remote = request.remote or 'unknown'
         # 回环免 token（仅 ENV==dev && ALLOW_LOOPBACK_NO_TOKEN==1 && GET）
         # spec：Docker/反代下回环不可靠，仅 dev 调试时精确回环放行 + warning
@@ -276,7 +279,11 @@ def init_observability(app: web.Application, collector) -> None:
             and method == 'GET'
             and _is_loopback(remote)
         )
-        if path != '/_admin/events/stream' and not is_loopback_grace:
+        if (
+            path != '/_admin/events/stream'
+            and path != '/_admin/health'
+            and not is_loopback_grace
+        ):
             ok, retry = rate.allow(remote)
             if not ok:
                 return _too_many(retry_after=retry)

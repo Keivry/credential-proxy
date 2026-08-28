@@ -219,6 +219,13 @@
         showApp();
         return null;
       }
+      if (r.status === 429) {
+        // 限流：Cookie 可能仍有效，但刷新太频繁。提示稍候而非弹登录框
+        var el = document.getElementById('login-err');
+        if (el) el.textContent = '请求过于频繁，请稍候再试…';
+        showLogin();
+        return null;
+      }
       showLogin();
     }).catch(showLogin);
   }

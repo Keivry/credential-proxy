@@ -245,10 +245,10 @@ class TestCollectorCore:
     def test_event_detail_hit_miss_from_ctx(self, collector):
         """事件详情的 pii_hits/pii_miss/cred_hits/cred_miss 来自 per-request ContextVar。"""
         from _metrics import (
+            _req_pii_ctx,
             accumulate_cred,
             accumulate_pii_cache,
             reset_req_pii_ctx,
-            _req_pii_ctx,
         )
 
         _req_pii_ctx()
