@@ -242,6 +242,40 @@ class TestCollectorCore:
         assert data24['pii_requests'] == 2
         assert data24['pii_hits'] == 1
 
+    def test_event_detail_hit_miss_from_ctx(self, collector):
+        """事件详情的 pii_hits/pii_miss/cred_hits/cred_miss 来自 per-request ContextVar。"""
+        from _metrics import (
+            accumulate_cred,
+            accumulate_pii_cache,
+            reset_req_pii_ctx,
+            _req_pii_ctx,
+        )
+
+        _req_pii_ctx()
+        accumulate_pii_cache(hit=1, miss=0)
+        accumulate_pii_cache(hit=0, miss=2)
+        accumulate_cred(hit=1, miss=0)
+        try:
+            run(
+                collector.incr_event(
+                    upstream='8879',
+                    status=200,
+                    pii_found=True,
+                    request_id='evt-ctx-1',
+                    tail='chat/completions',
+                )
+            )
+        finally:
+            reset_req_pii_ctx()
+        ev = collector.recent_events[-1]
+        assert ev['pii_hits'] == 1
+        assert ev['pii_miss'] == 2
+        assert ev['cred_hits'] == 1
+        assert ev['cred_miss'] == 0
+        q = collector.query_range('1h')
+        assert q['pii_hits'] == 1
+        assert q['pii_miss'] == 2
+
     def test_sanitize_kind_db_no_raw_label(self, collector):
         run(
             collector.incr_event(

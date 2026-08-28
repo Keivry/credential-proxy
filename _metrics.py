@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import contextvars
 import json
 import logging
 import os
@@ -809,6 +810,18 @@ class MetricsCollector:
                 self._merge_tokens(h.tokens, tokens_d)
             # recent_events
             if request_id:
+                # 从 ContextVar 读 per-request 真实计数（sync 钩子累计）：
+                # pii_hits/pii_miss 若调用方显式传参则优先，否则取 ctx 累计
+                _ctx_pii = _req_pii_var.get()
+                if _ctx_pii:
+                    if pii_hits == 0:
+                        pii_hits = _ctx_pii.get('pii_hits', 0)
+                    if pii_miss == 0:
+                        pii_miss = _ctx_pii.get('pii_miss', 0)
+                    if cred_hits == 0:
+                        cred_hits = _ctx_pii.get('cred_hits', 0)
+                    if cred_miss == 0:
+                        cred_miss = _ctx_pii.get('cred_miss', 0)
                 self.recent_events.append(
                     {
                         'ts': now,
@@ -1120,7 +1133,15 @@ class MetricsCollector:
 
         用独立只读连接（mode=ro），不与 writer 线程共享 self._conn，
         避免 SQLite 跨线程并发 execute 竞态（WAL 多读单写）。
+        查询前先同步 flush：把内存最新累计落盘，避免 24h/7d/30d 窗口
+        读到的 DB 落后于 1h（内存 recent_events）——启动初期 5min flush
+        未到时 24h 不应为空。
         """
+        # 查询前同步落盘最新内存（UPSERT 幂等，无重复计数）
+        try:
+            self._flush_sync()
+        except Exception:
+            pass  # flush 失败仍继续查（可能读到旧数据）
         if self._conn is None:
             return self._query_memory_fallback(hours, model_filter)
         cutoff_hour = _hour_key(_utc_now() - hours * 3600)
@@ -1494,9 +1515,13 @@ class MetricsCollector:
         def _do() -> None:
             now = _utc_now()
             day = _day_key(now)
+            hour = _hour_key(now)
             d = self._daily.setdefault((day, 'other'), _DailyAgg())
+            h = self._hourly.setdefault((hour, 'other'), _HourlyAgg())
             d.pii_hits += hit
             d.pii_miss += miss
+            h.pii_hits += hit
+            h.pii_miss += miss
 
         self._sync_fail_open(_do)
 
@@ -1506,9 +1531,12 @@ class MetricsCollector:
         def _do() -> None:
             now = _utc_now()
             day = _day_key(now)
+            hour = _hour_key(now)
             d = self._daily.setdefault((day, 'other'), _DailyAgg())
+            h = self._hourly.setdefault((hour, 'other'), _HourlyAgg())
             for kind, n in by_kind.items():
                 d.pii_by_type[kind] = d.pii_by_type.get(kind, 0) + n
+                h.pii_by_type[kind] = h.pii_by_type.get(kind, 0) + n
 
         self._sync_fail_open(_do)
 
@@ -1570,6 +1598,54 @@ class MetricsCollector:
 
 _collector_singleton: MetricsCollector | None = None
 _collector_lock = threading.Lock()
+
+
+# ── per-request PII/cred 计数（ContextVar，事件详情 hit/miss 数据源）──
+# _pii.py/_token.py 的同步钩子在请求上下文内调用，通过本 ContextVar 累计
+# 当前请求的 pii_cache hit/miss 与 cred hit/miss；incr_event 时读取并写入
+# recent_events，使事件详情的 hit/miss 不再是恒 0。
+_req_pii_var = contextvars.ContextVar(
+    '_req_pii_var', default=None
+)  # dict: {'pii_hits':0,'pii_miss':0,'cred_hits':0,'cred_miss':0}
+
+
+def _req_pii_ctx() -> dict[str, int]:
+    """获取当前请求的 per-request 计数（无则创建并 set）。"""
+    d = _req_pii_var.get()
+    if d is None:
+        d = {'pii_hits': 0, 'pii_miss': 0, 'cred_hits': 0, 'cred_miss': 0}
+        _req_pii_var.set(d)
+    return d
+
+
+def accumulate_pii_cache(hit: int = 0, miss: int = 0) -> None:
+    """当前请求的 pii_cache hit/miss 累计（_token.py register 钩子调用）。"""
+    try:
+        d = _req_pii_var.get()
+        if d is not None:
+            d['pii_hits'] += hit
+            d['pii_miss'] += miss
+    except Exception:
+        pass  # fail-open：埋点绝不阻断业务
+
+
+def accumulate_cred(hit: int = 0, miss: int = 0) -> None:
+    """当前请求的 cred hit/miss 累计（_token.py _register_secret 钩子调用）。"""
+    try:
+        d = _req_pii_var.get()
+        if d is not None:
+            d['cred_hits'] += hit
+            d['cred_miss'] += miss
+    except Exception:
+        pass
+
+
+def reset_req_pii_ctx() -> None:
+    """请求结束时清理 per-request 计数（handler finally 调用）。"""
+    try:
+        _req_pii_var.set(None)  # type: ignore[arg-type]
+    except Exception:
+        pass
 
 
 def get_collector(data_dir: str | None = None) -> MetricsCollector:

@@ -297,6 +297,13 @@ class GlobalPiiTokens:
                 # pii_cache_hit 计数（仅请求侧合法值；响应侧 resp_p2t 不参与）
                 if not response_side and self._collector is not None:
                     self._collector.incr_sync_pii_cache(hit=1, miss=0)
+                # per-request 累计（事件详情数据源）
+                try:
+                    from _metrics import accumulate_pii_cache
+
+                    accumulate_pii_cache(hit=1, miss=0)
+                except Exception:
+                    pass
                 return tok
             # gap-aware: 收集 pii_t2p+resp_t2p 已用 seq set + batch_tracker 再 while递增
             used: set[int] = set()
@@ -325,6 +332,13 @@ class GlobalPiiTokens:
             # pii_cache_miss 计数（仅请求侧合法值；响应侧不参与）
             if not response_side and self._collector is not None:
                 self._collector.incr_sync_pii_cache(hit=0, miss=1)
+            # per-request 累计（事件详情数据源）
+            try:
+                from _metrics import accumulate_pii_cache
+
+                accumulate_pii_cache(hit=0, miss=1)
+            except Exception:
+                pass
             return token
 
     def restore(self, text: str) -> str:
@@ -527,11 +541,25 @@ class TokenMixin:
         collector = getattr(self, '_metrics_collector', None)
         if collector is not None:
             collector.incr_sync_cred(hit=1, miss=0)
+        # per-request 累计（事件详情数据源）
+        try:
+            from _metrics import accumulate_cred
+
+            accumulate_cred(hit=1, miss=0)
+        except Exception:
+            pass
 
     def _metrics_cred_miss(self) -> None:
         collector = getattr(self, '_metrics_collector', None)
         if collector is not None:
             collector.incr_sync_cred(hit=0, miss=1)
+        # per-request 累计（事件详情数据源）
+        try:
+            from _metrics import accumulate_cred
+
+            accumulate_cred(hit=0, miss=1)
+        except Exception:
+            pass
 
     def _metrics_cred_lru(self, n: int = 1) -> None:
         collector = getattr(self, '_metrics_collector', None)
