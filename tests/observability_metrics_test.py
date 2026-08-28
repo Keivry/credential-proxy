@@ -240,20 +240,15 @@ class TestCollectorCore:
         conn.close()
 
     def test_queue_full_dropped(self, collector):
-        # 填满队列（maxsize=5）：每次 flush 入队 2 个快照（daily+hourly），3 次=6 个超限
-        for i in range(8):
-            run(
-                collector.incr_event(
-                    upstream='8878',
-                    status=200,
-                    request_id=f'r{i}',
-                )
-            )
-        for _ in range(3):
-            run(collector.flush())
+        # 填满队列（maxsize=128）：直接塞 130 个快照触发 dropped（丢最老再入队）
+        snap = [{'date': '2026-08-28', 'upstream': '8878', 'requests': 1}]
+        for _ in range(130):
+            collector._enqueue(snap)
         assert collector._dropped_snapshots > 0
         assert collector._first_dropped_ts is not None
         assert collector._last_dropped_ts is not None
+        # 队列内仍保留最新（丢最老）且不超过 maxsize
+        assert collector._queue.qsize() <= 128
 
     def test_wal_and_version(self, collector):
         run(collector.flush())

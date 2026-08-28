@@ -199,24 +199,26 @@ def _read_admin_html() -> str:
 
 
 class TestRateLimiterCleanup:
-    def test_expired_key_removed(self):
+    def test_expired_key_reused_with_count(self):
         rl = _RateLimiter(limit=10, window_s=60)
-        rl.allow('1.2.3.4')
+        ip = "192.0.2.55"
+        rl.allow(ip)
         # 模拟时间流逝（直接篡改内部时间戳为过期）
         import time as _t
-
-        rl._hits['1.2.3.4'] = [_t.time() - 120]
-        ok, _ = rl.allow('1.2.3.4')
+        rl._hits[ip] = [_t.time() - 120]
+        ok, _ = rl.allow(ip)
         assert ok is True
-        # 空窗口 key 应被清理（防空列表永久残留）
-        assert '1.2.3.4' not in rl._hits
+        # 空窗口首请求计入配额（防每分钟多放 1 个），key 保留且含当前时间戳
+        assert ip in rl._hits
+        assert len(rl._hits[ip]) == 1
 
     def test_active_key_kept(self):
         rl = _RateLimiter(limit=10, window_s=60)
-        rl.allow('1.2.3.4')
-        ok, _ = rl.allow('1.2.3.4')
+        ip = "192.0.2.56"
+        rl.allow(ip)
+        ok, _ = rl.allow(ip)
         assert ok is True
-        assert '1.2.3.4' in rl._hits
+        assert ip in rl._hits
 
 
 class TestSseRegistryIdempotent:

@@ -397,7 +397,7 @@
       } catch (e) { /* fallthrough */ }
     }
     chartEl.innerHTML = '';
-    svgEl.innerHTML = '<span style="color:var(--dim)">' + state.range + ' 窗口请求数: ' + fmtNum(metrics.requests || 0) + '</span>';
+    svgEl.innerHTML = '<span style="color:var(--dim)">' + esc(state.range) + ' 窗口请求数: ' + fmtNum(metrics.requests || 0) + '</span>';
   }
 
   function renderUpstream(metrics, events) {

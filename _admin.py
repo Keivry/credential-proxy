@@ -19,7 +19,9 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import time as _time
+from collections import deque
 
 from aiohttp import web
 
@@ -161,8 +163,10 @@ class _RateLimiter:
         had = key in self._hits
         lst = [t for t in self._hits.get(key, []) if now - t < self.window_s]
         if had and not lst:
-            # 已有 key 但窗口内无记录 → 清空防残留（全新 key 走正常写入）
+            # 已有 key 但窗口内无记录 → 清空防残留 + 首请求计数（防每分钟多放 1 个）
             self._hits.pop(key, None)
+            lst = [now]
+            self._hits[key] = lst
             return True, 0
         if len(lst) >= self.limit:
             retry = int(self.window_s - (now - lst[0])) + 1
@@ -304,19 +308,22 @@ def init_observability(app: web.Application, collector) -> None:
         )
         set_cookie = ''
         if cookie_src and path != '/_admin/events/stream':
+            # tok 过字符集消毒：仅保留可打印 ASCII（防 ; \r \n 头注入）
+            cookie_val = re.sub(r'[^\x21-\x7E]', '', tok)
             # __Host- 前缀要求 Secure + Path=/（且仅 HTTPS 可用）；回退 admin_token 兼容 http
             scheme = request.scheme
             if scheme == 'https':
                 set_cookie = (
                     '__Host-admin_token='
-                    + tok
+                    + cookie_val
                     + '; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=3600'
                 )
             else:
+                # http 下 SameSite=Strict 防 CSRF（顶级 GET 不再携带）
                 set_cookie = (
                     'admin_token='
-                    + tok
-                    + '; HttpOnly; SameSite=Lax; Path=/; Max-Age=3600'
+                    + cookie_val
+                    + '; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600'
                 )
 
         # ⑦ 管理接口 10/min/IP 限流（已在鉴权前计数；此处仅 SSE 并发限流）
@@ -422,29 +429,40 @@ async def _handle_sse(request: web.Request, collector) -> web.StreamResponse:
         },
     )
     await resp.prepare(request)
-    last_ts = _time.time()
+    last_push_ts = _time.time()
+    last_ping_ts = _time.time()
     start = _time.time()
+    # 已推送事件去重游标：同秒多请求（同 ts）也能全部推送，防 `> last_ts` 丢同 ts 事件
+    sent_ids: deque[str] = deque(maxlen=2000)
     try:
         while True:
-            # 推送新事件（自上次推送以来）
-            evs = collector.events(limit=20)
-            new_evs = [e for e in evs if e.get('ts', 0) > last_ts]
+            # 推送新事件（自上次推送以来，按 request_id 去重）
+            evs = collector.events(limit=50)
+            new_evs = [
+                e
+                for e in evs
+                if e.get('ts', 0) >= last_push_ts
+                and e.get('request_id', '') not in sent_ids
+            ]
             for e in reversed(new_evs):
+                _rid = e.get('request_id', '')
+                if _rid:
+                    sent_ids.append(_rid)
                 await resp.write(
                     f'event: event\ndata: {json.dumps(e, ensure_ascii=False)}\n\n'.encode()
                 )
             if new_evs:
-                last_ts = max(e.get('ts', 0) for e in new_evs)
+                last_push_ts = max(e.get('ts', 0) for e in new_evs)
             # 5min 强制断开
             if _time.time() - start >= _SSE_MAX_S:
                 await resp.write(b'event: done\ndata: {}\n\n')
                 await resp.write_eof()
-                break
+                return resp
             await asyncio.sleep(2)
-            # 60s ping
-            if _time.time() - last_ts >= _SSE_PING_S:
+            # 60s ping（独立游标，不重置 last_push_ts 防漏推）
+            if _time.time() - last_ping_ts >= _SSE_PING_S:
                 await resp.write(b': ping\n\n')
-                last_ts = _time.time()
+                last_ping_ts = _time.time()
     except (asyncio.CancelledError, ConnectionResetError):
         pass
     except Exception:

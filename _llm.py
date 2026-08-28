@@ -201,6 +201,9 @@ def _capture_usage_ctx(payload: str, metrics_ctx: dict, protocol: str) -> None:
     """
     if not payload or not payload.strip() or payload.strip() == '[DONE]':
         return
+    # 快路径排除：99% chunk 无 usage/cached_tokens，避免全量 JSON 解析
+    if '"usage"' not in payload and '"cached_tokens"' not in payload:
+        return
     try:
         obj = _jloads(payload.strip())
     except Exception:
@@ -2400,30 +2403,38 @@ class LlmMixin(AuditMixin):
 
             # ── 可观测性：model 提取 + stream_options.include_usage 注入 ──
             # （仅 OpenAI Chat/Responses 且 is_stream==true；Anthropic 严禁注入）
+            # 非流式/Anthropic 不做全量 loads/dumps，仅轻量正则提取 model
             _req_model = 'unknown_model'
             try:
-                _req_obj = _jloads(out_body.decode('utf-8', errors='replace'))
-                if isinstance(_req_obj, dict):
-                    _m = _req_obj.get('model')
-                    if isinstance(_m, str) and _m:
-                        # model label 消毒：截断过长 + 去控制字符（防脏标签入 tokens dict/大盘）
-                        _req_model = (
-                            _m[:128].replace('\x00', '').strip() or 'unknown_model'
-                        )
-                    _is_stream = bool(_req_obj.get('stream', False))
-                    _tail_n = tail.rstrip('/')
-                    if (
-                        _is_stream
-                        and (
-                            _tail_n.endswith('chat/completions')
-                            or _tail_n.endswith('v1/responses')
-                        )
-                        and isinstance(_req_obj, dict)
-                    ):
-                        _so = _req_obj.setdefault('stream_options', {})
-                        if isinstance(_so, dict):
-                            _so.setdefault('include_usage', True)
-                        out_body = _jdumps(_req_obj).encode('utf-8')
+                _body_str = out_body.decode('utf-8', errors='replace')
+                # 轻量流式探测：`"stream":true` 出现在 body 中（仅 true 触发注入）
+                _is_stream = _re.search(rb'"stream"\s*:\s*true', out_body) is not None
+                _tail_n = tail.rstrip('/')
+                _is_chat = (
+                    _tail_n.endswith('chat/completions')
+                    or _tail_n.endswith('v1/messages')
+                    or _tail_n.endswith('v1/responses')
+                )
+                _is_injectable = _is_stream and (
+                    _tail_n.endswith('chat/completions')
+                    or _tail_n.endswith('v1/responses')
+                )
+                # 仅对话类请求解析（model 用于 tokens 分桶）；其他（embeddings 等）不解析
+                if _is_chat:
+                    _req_obj = _jloads(_body_str)
+                    if isinstance(_req_obj, dict):
+                        _m = _req_obj.get('model')
+                        if isinstance(_m, str) and _m:
+                            # model label 消毒：截断过长 + 去控制字符（防脏标签入 tokens dict/大盘）
+                            _req_model = (
+                                _re.sub(r'[\x00-\x1f\x7f]', '', _m)[:128].strip()
+                                or 'unknown_model'
+                            )
+                        if _is_injectable:
+                            _so = _req_obj.setdefault('stream_options', {})
+                            if isinstance(_so, dict):
+                                _so.setdefault('include_usage', True)
+                            out_body = _jdumps(_req_obj).encode('utf-8')
             except Exception:
                 pass
             _metrics_ctx['model'] = _req_model

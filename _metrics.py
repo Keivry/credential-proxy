@@ -59,7 +59,7 @@ BUILTIN_KINDS = {
 
 RING_MAXLEN = 10000
 FLUSH_INTERVAL_S = 300  # 5min
-QUEUE_MAXSIZE = 5
+QUEUE_MAXSIZE = 128
 DAILY_RETENTION_DAYS = 30
 HOURLY_RETENTION_HOURS = 24 * 7
 DB_FILE = 'metrics.sqlite'
@@ -197,7 +197,7 @@ def redact_summary(raw: str, limit: int = 120) -> str:
 
     - 替换内部 token 形态为 [REDACTED:token]
     - 替换 sk-/xox 密钥形态与 email 为 [REDACTED:key]/[REDACTED:email]
-    - 截断边界半字符保护：绝不切断多字节字符
+    - 截断边界半字符保护：绝不切断多字节字符（Python str 按码点切片天然安全）
     """
     if not raw:
         return ''
@@ -208,15 +208,13 @@ def redact_summary(raw: str, limit: int = 120) -> str:
     out = _PHONE_RE.sub('[REDACTED:phone]', out)
     if len(out) <= limit:
         return out
-    # 截断边界半字符保护：逐字符回退直到落在 UTF-8 边界
-    cut = out[:limit]
-    while cut and len(cut.encode('utf-8', errors='ignore')) > limit + 64:
-        cut = cut[:-1]
-    # 更精确：按字符截断，保证不出现半字符
-    try:
-        cut = out[:limit].encode('utf-8').decode('utf-8')
-    except UnicodeDecodeError:
-        cut = out[: limit - 1].encode('utf-8').decode('utf-8', errors='ignore')
+    # 截断边界半字符保护：Python 按码点切片天然不产生半字符，直接截断
+    # 但超长摘要可能包含代理对（emoji），用 errors='ignore' 保证合法 UTF-8
+    cut = (
+        out[: limit - 1]
+        .encode('utf-8', errors='ignore')
+        .decode('utf-8', errors='ignore')
+    )
     return cut + '…'
 
 
@@ -687,6 +685,8 @@ class MetricsCollector:
         delta_rule: dict[str, int] = dict(audit_by_rule or {})
         tokens_d = tokens or {}
         latency_ms_v = latency_ms if latency_ms is not None else None
+        # 锁外做脱敏（5 个正则替换，避免占用全局锁）
+        summary_redacted = redact_summary(raw_summary, 120) if raw_summary else ''
 
         async with self._lock:
             d = self._daily.setdefault((day, d_up), _DailyAgg())
@@ -755,7 +755,7 @@ class MetricsCollector:
                         'cred_miss': cred_miss,
                         'tokens': tokens_d,
                         'verdict': verdict,
-                        'summary': redact_summary(raw_summary, 120),
+                        'summary': summary_redacted,
                         'client_gone': client_gone,
                         'exception': exception,
                     }
@@ -1042,11 +1042,42 @@ class MetricsCollector:
         }
 
     def _query_db(self, hours: int, model_filter: str | None = None) -> dict[str, Any]:
-        """DB 桶 SUM 单条 SELECT 拉全量后内存归并（非 N+1）。"""
+        """DB 桶 SUM 单条 SELECT 拉全量后内存归并（非 N+1）。
+
+        用独立只读连接（mode=ro），不与 writer 线程共享 self._conn，
+        避免 SQLite 跨线程并发 execute 竞态（WAL 多读单写）。
+        """
         if self._conn is None:
             return self._query_memory_fallback(hours, model_filter)
         cutoff_hour = _hour_key(_utc_now() - hours * 3600)
         cutoff_date = _day_key(_utc_now() - hours * 3600)
+        try:
+            ro_conn = sqlite3.connect(
+                f'file:{self.db_path}?mode=ro', uri=True, timeout=5.0
+            )
+        except sqlite3.Error:
+            return self._query_memory_fallback(hours, model_filter)
+        try:
+            return self._query_db_with(
+                ro_conn, hours, model_filter, cutoff_hour, cutoff_date
+            )
+        except (sqlite3.Error, OSError):
+            return self._query_memory_fallback(hours, model_filter)
+        finally:
+            try:
+                ro_conn.close()
+            except sqlite3.Error:
+                pass
+
+    def _query_db_with(
+        self,
+        conn: sqlite3.Connection,
+        hours: int,
+        model_filter: str | None,
+        cutoff_hour: str,
+        cutoff_date: str,
+    ) -> dict[str, Any]:
+        """独立连接上执行 DB 查询（供只读连接使用）。"""
         out: dict[str, Any] = {
             'range': f'{hours}h',
             'requests': 0,
@@ -1072,7 +1103,7 @@ class MetricsCollector:
         try:
             # hourly: 24h/7d 窗口（30d 走 daily，避免双计）
             if hours < 24 * 30:
-                rows = self._conn.execute(
+                rows = conn.execute(
                     'SELECT hour, upstream, requests, requests_by_status, tokens, '
                     'latency_buckets, pii_by_type, pii_lru_evictions, cred_lru_evictions '
                     'FROM hourly_agg WHERE hour >= ?',
@@ -1100,7 +1131,7 @@ class MetricsCollector:
                     out['cred_lru_evictions'] += cred_lru or 0
             # daily: 30d 窗口（含扩展列）
             if hours >= 24 * 30:
-                rows_d = self._conn.execute(
+                rows_d = conn.execute(
                     'SELECT date, upstream, pii_hits, pii_miss, cred_hits, cred_miss, '
                     'cred_lru_evictions, pii_lru_evictions, requests, requests_by_status, '
                     'tokens, audit_by_verdict, audit_by_rule, latency_buckets, '
@@ -1163,7 +1194,7 @@ class MetricsCollector:
                 }
         except (sqlite3.Error, OSError) as e:
             logger.warning('metrics 查询失败（降级内存）: %s', e)
-            return self._query_memory_fallback(hours, model_filter)
+            raise
         return out
 
     def _query_memory_fallback(
@@ -1271,16 +1302,23 @@ class MetricsCollector:
         upstream: str | None = None,
         verdict: str | None = None,
     ) -> list[dict[str, Any]]:
-        """recent_events 环形缓冲视图（数据源仅 recent_events）。"""
-        evs = list(self.recent_events)
-        if upstream:
-            evs = [e for e in evs if e['upstream'] == upstream]
-        if verdict:
-            evs = [e for e in evs if e.get('verdict') == verdict]
-        if kind:
-            evs = [e for e in evs if kind in e.get('summary', '')]
-        evs.sort(key=lambda e: e['ts'], reverse=True)
-        return evs[:limit]
+        """recent_events 环形缓冲视图（数据源仅 recent_events）。
+
+        recent_events 为 append 追加的环形缓冲（deque），尾部即最新事件，
+        逆序扫描早停即可取最新 limit 条，无需全量拷贝+排序（SSE 每 2s 调用）。
+        """
+        out: list[dict[str, Any]] = []
+        for e in reversed(self.recent_events):
+            if upstream and e['upstream'] != upstream:
+                continue
+            if verdict and e.get('verdict') != verdict:
+                continue
+            if kind and kind not in e.get('summary', ''):
+                continue
+            out.append(e)
+            if len(out) >= limit:
+                break
+        return out
 
     # ── close ──
 
@@ -1311,8 +1349,8 @@ class MetricsCollector:
             except sqlite3.Error:
                 pass
             self._conn = None
-        self._p95_executor.shutdown(wait=False, cancel_futures=True)
-        self._writer_executor.shutdown(wait=False, cancel_futures=True)
+        self._p95_executor.shutdown(wait=True)
+        self._writer_executor.shutdown(wait=True)
 
     def _drain_queue(self) -> None:
         while True:
