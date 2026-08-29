@@ -426,6 +426,9 @@ class MetricsCollector:
         self._last_dropped_ts: float | None = None
         self._last_flush_ts = _utc_now()
         self._conn: sqlite3.Connection | None = None
+        # SQLite 连接不是线程安全的：writer 线程池与主线程查询路径（_flush_sync）
+        # 共用 self._conn，必须用 threading.Lock 串行化所有 execute/commit
+        self._sqlite_lock = threading.Lock()
         self._connect_db()
         self._load_existing_today()
 
@@ -628,118 +631,119 @@ class MetricsCollector:
         if not self._sqlite_ok or self._conn is None:
             return
         try:
-            day = snapshot.get('date', '')
-            hour = snapshot.get('hour', '')
-            upstream = snapshot.get('upstream', 'other')
-            conn = self._conn
-            if day:
-                conn.execute(
-                    """
-                    INSERT INTO daily_agg (
-                        date, upstream, pii_by_type, pii_hits, pii_miss, pii_requests,
-                        cred_hits, cred_miss, cred_lru_evictions,
-                        pii_lru_evictions, requests, requests_by_status,
-                        tokens, audit_by_verdict, audit_by_rule,
-                        latency_buckets, placeholder_prompt_injected,
-                        truncated_total, json_aware_success,
-                        json_leaf_fallback, json_full_fallback
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(date, upstream) DO UPDATE SET
-                        pii_by_type=excluded.pii_by_type,
-                        pii_hits=excluded.pii_hits,
-                        pii_miss=excluded.pii_miss,
-                        pii_requests=excluded.pii_requests,
-                        cred_hits=excluded.cred_hits,
-                        cred_miss=excluded.cred_miss,
-                        cred_lru_evictions=excluded.cred_lru_evictions,
-                        pii_lru_evictions=excluded.pii_lru_evictions,
-                        requests=excluded.requests,
-                        requests_by_status=excluded.requests_by_status,
-                        tokens=excluded.tokens,
-                        audit_by_verdict=excluded.audit_by_verdict,
-                        audit_by_rule=excluded.audit_by_rule,
-                        latency_buckets=excluded.latency_buckets,
-                        placeholder_prompt_injected=excluded.placeholder_prompt_injected,
-                        truncated_total=excluded.truncated_total,
-                        json_aware_success=excluded.json_aware_success,
-                        json_leaf_fallback=excluded.json_leaf_fallback,
-                        json_full_fallback=excluded.json_full_fallback
-                    """,
-                    (
-                        day,
-                        upstream,
-                        json.dumps(snapshot.get('pii_by_type', {}), ensure_ascii=False),
-                        snapshot.get('pii_hits', 0),
-                        snapshot.get('pii_miss', 0),
-                        snapshot.get('pii_requests', 0),
-                        snapshot.get('cred_hits', 0),
-                        snapshot.get('cred_miss', 0),
-                        snapshot.get('cred_lru_evictions', 0),
-                        snapshot.get('pii_lru_evictions', 0),
-                        snapshot.get('requests', 0),
-                        json.dumps(
-                            snapshot.get('requests_by_status', {}), ensure_ascii=False
+            with self._sqlite_lock:  # 串行化 self._conn：writer 线程 vs 主线程 _flush_sync
+                day = snapshot.get('date', '')
+                hour = snapshot.get('hour', '')
+                upstream = snapshot.get('upstream', 'other')
+                conn = self._conn
+                if day:
+                    conn.execute(
+                        """
+                        INSERT INTO daily_agg (
+                            date, upstream, pii_by_type, pii_hits, pii_miss, pii_requests,
+                            cred_hits, cred_miss, cred_lru_evictions,
+                            pii_lru_evictions, requests, requests_by_status,
+                            tokens, audit_by_verdict, audit_by_rule,
+                            latency_buckets, placeholder_prompt_injected,
+                            truncated_total, json_aware_success,
+                            json_leaf_fallback, json_full_fallback
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(date, upstream) DO UPDATE SET
+                            pii_by_type=excluded.pii_by_type,
+                            pii_hits=excluded.pii_hits,
+                            pii_miss=excluded.pii_miss,
+                            pii_requests=excluded.pii_requests,
+                            cred_hits=excluded.cred_hits,
+                            cred_miss=excluded.cred_miss,
+                            cred_lru_evictions=excluded.cred_lru_evictions,
+                            pii_lru_evictions=excluded.pii_lru_evictions,
+                            requests=excluded.requests,
+                            requests_by_status=excluded.requests_by_status,
+                            tokens=excluded.tokens,
+                            audit_by_verdict=excluded.audit_by_verdict,
+                            audit_by_rule=excluded.audit_by_rule,
+                            latency_buckets=excluded.latency_buckets,
+                            placeholder_prompt_injected=excluded.placeholder_prompt_injected,
+                            truncated_total=excluded.truncated_total,
+                            json_aware_success=excluded.json_aware_success,
+                            json_leaf_fallback=excluded.json_leaf_fallback,
+                            json_full_fallback=excluded.json_full_fallback
+                        """,
+                        (
+                            day,
+                            upstream,
+                            json.dumps(snapshot.get('pii_by_type', {}), ensure_ascii=False),
+                            snapshot.get('pii_hits', 0),
+                            snapshot.get('pii_miss', 0),
+                            snapshot.get('pii_requests', 0),
+                            snapshot.get('cred_hits', 0),
+                            snapshot.get('cred_miss', 0),
+                            snapshot.get('cred_lru_evictions', 0),
+                            snapshot.get('pii_lru_evictions', 0),
+                            snapshot.get('requests', 0),
+                            json.dumps(
+                                snapshot.get('requests_by_status', {}), ensure_ascii=False
+                            ),
+                            json.dumps(snapshot.get('tokens', {}), ensure_ascii=False),
+                            json.dumps(
+                                snapshot.get('audit_by_verdict', {}), ensure_ascii=False
+                            ),
+                            json.dumps(
+                                snapshot.get('audit_by_rule', {}), ensure_ascii=False
+                            ),
+                            json.dumps(
+                                snapshot.get('latency_buckets', {}), ensure_ascii=False
+                            ),
+                            snapshot.get('placeholder_prompt_injected', 0),
+                            snapshot.get('truncated_total', 0),
+                            snapshot.get('json_aware_success', 0),
+                            snapshot.get('json_leaf_fallback', 0),
+                            snapshot.get('json_full_fallback', 0),
                         ),
-                        json.dumps(snapshot.get('tokens', {}), ensure_ascii=False),
-                        json.dumps(
-                            snapshot.get('audit_by_verdict', {}), ensure_ascii=False
+                    )
+                if hour:
+                    conn.execute(
+                        """
+                        INSERT INTO hourly_agg (
+                            hour, upstream, requests, requests_by_status,
+                            tokens, latency_buckets, pii_by_type,
+                            pii_hits, pii_miss, pii_requests,
+                            pii_lru_evictions, cred_lru_evictions
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(hour, upstream) DO UPDATE SET
+                            requests=excluded.requests,
+                            requests_by_status=excluded.requests_by_status,
+                            tokens=excluded.tokens,
+                            latency_buckets=excluded.latency_buckets,
+                            pii_by_type=excluded.pii_by_type,
+                            pii_hits=excluded.pii_hits,
+                            pii_miss=excluded.pii_miss,
+                            pii_requests=excluded.pii_requests,
+                            pii_lru_evictions=excluded.pii_lru_evictions,
+                            cred_lru_evictions=excluded.cred_lru_evictions
+                        """,
+                        (
+                            hour,
+                            upstream,
+                            snapshot.get('requests', 0),
+                            json.dumps(
+                                snapshot.get('requests_by_status', {}), ensure_ascii=False
+                            ),
+                            json.dumps(snapshot.get('tokens', {}), ensure_ascii=False),
+                            json.dumps(
+                                snapshot.get('latency_buckets', {}), ensure_ascii=False
+                            ),
+                            json.dumps(snapshot.get('pii_by_type', {}), ensure_ascii=False),
+                            snapshot.get('pii_hits', 0),
+                            snapshot.get('pii_miss', 0),
+                            snapshot.get('pii_requests', 0),
+                            snapshot.get('pii_lru_evictions', 0),
+                            snapshot.get('cred_lru_evictions', 0),
                         ),
-                        json.dumps(
-                            snapshot.get('audit_by_rule', {}), ensure_ascii=False
-                        ),
-                        json.dumps(
-                            snapshot.get('latency_buckets', {}), ensure_ascii=False
-                        ),
-                        snapshot.get('placeholder_prompt_injected', 0),
-                        snapshot.get('truncated_total', 0),
-                        snapshot.get('json_aware_success', 0),
-                        snapshot.get('json_leaf_fallback', 0),
-                        snapshot.get('json_full_fallback', 0),
-                    ),
-                )
-            if hour:
-                conn.execute(
-                    """
-                    INSERT INTO hourly_agg (
-                        hour, upstream, requests, requests_by_status,
-                        tokens, latency_buckets, pii_by_type,
-                        pii_hits, pii_miss, pii_requests,
-                        pii_lru_evictions, cred_lru_evictions
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(hour, upstream) DO UPDATE SET
-                        requests=excluded.requests,
-                        requests_by_status=excluded.requests_by_status,
-                        tokens=excluded.tokens,
-                        latency_buckets=excluded.latency_buckets,
-                        pii_by_type=excluded.pii_by_type,
-                        pii_hits=excluded.pii_hits,
-                        pii_miss=excluded.pii_miss,
-                        pii_requests=excluded.pii_requests,
-                        pii_lru_evictions=excluded.pii_lru_evictions,
-                        cred_lru_evictions=excluded.cred_lru_evictions
-                    """,
-                    (
-                        hour,
-                        upstream,
-                        snapshot.get('requests', 0),
-                        json.dumps(
-                            snapshot.get('requests_by_status', {}), ensure_ascii=False
-                        ),
-                        json.dumps(snapshot.get('tokens', {}), ensure_ascii=False),
-                        json.dumps(
-                            snapshot.get('latency_buckets', {}), ensure_ascii=False
-                        ),
-                        json.dumps(snapshot.get('pii_by_type', {}), ensure_ascii=False),
-                        snapshot.get('pii_hits', 0),
-                        snapshot.get('pii_miss', 0),
-                        snapshot.get('pii_requests', 0),
-                        snapshot.get('pii_lru_evictions', 0),
-                        snapshot.get('cred_lru_evictions', 0),
-                    ),
-                )
-            self._trim_old(conn)
-            conn.commit()
-            _chmod_0600(self.db_path)
+                    )
+                self._trim_old(conn)
+                conn.commit()
+                _chmod_0600(self.db_path)
         except (OSError, sqlite3.Error) as e:
             self._handle_write_error(e)
 
@@ -2036,13 +2040,15 @@ class MetricsCollector:
         await loop.run_in_executor(None, _shutdown_writers)
         if self._conn is not None:
             try:
-                self._conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
-                self._conn.commit()
-                _chmod_0600(self.db_path)
+                with self._sqlite_lock:
+                    self._conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+                    self._conn.commit()
+                    _chmod_0600(self.db_path)
             except (sqlite3.Error, OSError):
                 logger.warning('wal_checkpoint 失败', exc_info=True)
             try:
-                self._conn.close()
+                with self._sqlite_lock:
+                    self._conn.close()
             except sqlite3.Error:
                 pass
             self._conn = None
