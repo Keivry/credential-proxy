@@ -5683,58 +5683,64 @@ class LlmMixin(AuditMixin):
                 try:
                     _mc = getattr(self, '_metrics_collector', None)
                     if _mc is not None:
-                        _status = _metrics_ctx.get('status')
-                        _lat = _metrics_ctx.get('latency_ms')
-                        if _status is None:
-                            # 异常/未达响应分支：按异常计
-                            _metrics_ctx['exception'] = True
-                            _status = 500
-                            _lat = (_time.time() - _metrics_ctx['t0']) * 1000
-                        _upstream = _metrics_ctx.get('upstream', str(port))
-                        # 非对话尾归 other（不丢 requests_total）
-                        if not is_dialog_tail:
-                            _upstream = 'other'
-                        await _mc.incr_event(
-                            upstream=_upstream,
-                            status=_status,
-                            latency_ms=_lat,
-                            bytes_in=_metrics_ctx.get('bytes_in', 0),
-                            bytes_out=_metrics_ctx.get('bytes_out', 0),
-                            empty_guarded=_metrics_ctx.get('empty_guarded', False),
-                            invalid_json_guarded=_metrics_ctx.get(
-                                'invalid_json_guarded', False
-                            ),
-                            client_gone=_metrics_ctx.get('client_gone', False),
-                            exception=_metrics_ctx.get('exception', False),
-                            sse_events=_metrics_ctx.get('sse_events', 0),
-                            truncated=_metrics_ctx.get('truncated', 0),
-                            json_aware_success=_metrics_ctx.get(
-                                'json_aware_success', 0
-                            ),
-                            json_leaf_fallback=_metrics_ctx.get(
-                                'json_leaf_fallback', 0
-                            ),
-                            json_full_fallback=_metrics_ctx.get(
-                                'json_full_fallback', 0
-                            ),
-                            placeholder_prompt_injected=_metrics_ctx.get(
-                                'placeholder_injected', False
-                            ),
-                            pii_hits=_metrics_ctx.get('pii_hits', 0),
-                            pii_miss=_metrics_ctx.get('pii_miss', 0),
-                            pii_found=_metrics_ctx.get('pii_found', False),
-                            cred_hits=_metrics_ctx.get('cred_hits', 0),
-                            cred_miss=_metrics_ctx.get('cred_miss', 0),
-                            tokens=_metrics_ctx.get('tokens') or None,
-                            audit_by_verdict=_metrics_ctx.get('audit_by_verdict')
-                            or None,
-                            audit_by_rule=_metrics_ctx.get('audit_by_rule') or None,
-                            pii_by_type=_metrics_ctx.get('pii_by_type') or None,
-                            request_id=req_id,
-                            tail=tail,
-                            verdict=_metrics_ctx.get('verdict', ''),
-                            raw_summary=_metrics_ctx.get('raw_summary', ''),
-                        )
+                        # 非对话请求彻底不进统计（design D4）：不调 incr_event、
+                        # 不进 recent_events、不进聚合（v0.9.34 及之前归 other 的口径废弃）
+                        # 注意：不能 return（finally 内 return 会跳过下方 PII/审计清理），
+                        # 用 flag 跳过埋点体
+                        if not is_chat_tail(tail):
+                            _metrics_ctx['_skip_metrics'] = True
+                        if not _metrics_ctx.get('_skip_metrics'):
+                            _status = _metrics_ctx.get('status')
+                            _lat = _metrics_ctx.get('latency_ms')
+                            if _status is None:
+                                # 异常/未达响应分支：按异常计
+                                _metrics_ctx['exception'] = True
+                                _status = 500
+                                _lat = (_time.time() - _metrics_ctx['t0']) * 1000
+                            _upstream = _metrics_ctx.get('upstream', str(port))
+                            await _mc.incr_event(
+                                upstream=_upstream,
+                                status=_status,
+                                latency_ms=_lat,
+                                bytes_in=_metrics_ctx.get('bytes_in', 0),
+                                bytes_out=_metrics_ctx.get('bytes_out', 0),
+                                empty_guarded=_metrics_ctx.get('empty_guarded', False),
+                                invalid_json_guarded=_metrics_ctx.get(
+                                    'invalid_json_guarded', False
+                                ),
+                                client_gone=_metrics_ctx.get('client_gone', False),
+                                exception=_metrics_ctx.get('exception', False),
+                                sse_events=_metrics_ctx.get('sse_events', 0),
+                                truncated=_metrics_ctx.get('truncated', 0),
+                                json_aware_success=_metrics_ctx.get(
+                                    'json_aware_success', 0
+                                ),
+                                json_leaf_fallback=_metrics_ctx.get(
+                                    'json_leaf_fallback', 0
+                                ),
+                                json_full_fallback=_metrics_ctx.get(
+                                    'json_full_fallback', 0
+                                ),
+                                placeholder_prompt_injected=_metrics_ctx.get(
+                                    'placeholder_injected', False
+                                ),
+                                pii_hits=_metrics_ctx.get('pii_hits', 0),
+                                pii_miss=_metrics_ctx.get('pii_miss', 0),
+                                pii_found=_metrics_ctx.get('pii_found', False),
+                                cred_hits=_metrics_ctx.get('cred_hits', 0),
+                                cred_miss=_metrics_ctx.get('cred_miss', 0),
+                                model=_metrics_ctx.get('model', 'unknown_model'),
+                                tokens=_metrics_ctx.get('tokens') or None,
+                                audit_by_verdict=_metrics_ctx.get('audit_by_verdict')
+                                or None,
+                                audit_by_rule=_metrics_ctx.get('audit_by_rule') or None,
+                                pii_by_type=_metrics_ctx.get('pii_by_type') or None,
+                                request_id=req_id,
+                                tail=tail,
+                                verdict=_metrics_ctx.get('verdict', ''),
+                                raw_summary=_metrics_ctx.get('raw_summary', ''),
+                            )
+                            _metrics_ctx['_skip_metrics'] = False
                 except Exception:
                     logger.debug('metrics 埋点失败', exc_info=True)
                 # 请求级 PII 映射清理（无论成功/异常/客户端断连）

@@ -60,16 +60,13 @@
   td.num, th.num { text-align: right; font-family: var(--mono); }
   tr.clickable { cursor: pointer; }
   tr.clickable:hover { background: var(--panel2); }
-  .modal {
-    display: none; position: fixed; inset: 0; background: rgba(0,0,0,.6);
-    z-index: 100; align-items: center; justify-content: center;
+  .tooltip {
+    position: fixed; z-index: 150; max-width: 420px; max-height: 60vh; overflow: auto;
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,.45);
+    pointer-events: auto;
   }
-  .modal.show { display: flex; }
-  .modal-box {
-    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-    max-width: 640px; width: 92%; max-height: 80vh; overflow: auto; padding: 18px;
-  }
-  .modal-box pre { white-space: pre-wrap; word-break: break-all; font-family: var(--mono); font-size: 12px; }
+  .tooltip pre { white-space: pre-wrap; word-break: break-all; font-family: var(--mono); font-size: 11px; margin: 0; }
   .login {
     position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
     background: var(--bg); z-index: 200;
@@ -142,9 +139,8 @@
   </div>
 
   <div class="panel">
-    <h2>最近事件 <span style="color:var(--dim);font-weight:400">（点击行查看脱敏摘要）</span></h2>
+    <h2>最近事件 <span style="color:var(--dim);font-weight:400">（悬停行查看脱敏摘要）</span></h2>
     <div class="toolbar">
-      <select id="ev-verdict"><option value="">全部 verdict</option><option value="allow">allow</option><option value="deny">deny</option></select>
       <select id="ev-upstream"><option value="">全部上游</option></select>
       <button id="ev-refresh">刷新</button>
       <button id="ev-live" class="active">Live</button>
@@ -152,9 +148,9 @@
     <div style="overflow:auto">
       <table id="ev-table">
         <thead><tr>
-          <th>ts</th><th>request_id</th><th>upstream</th><th>status</th>
+          <th>ts</th><th>request_id</th><th>upstream</th><th>model</th><th>status</th>
           <th class="num">pii</th><th class="num">cred</th><th class="num">tokens</th>
-          <th>verdict</th><th class="num">latency(ms)</th>
+          <th class="num">Cache%</th><th class="num">latency(ms)</th>
         </tr></thead>
         <tbody></tbody>
       </table>
@@ -162,18 +158,12 @@
   </div>
 </div>
 
-<div class="modal" id="modal">
-  <div class="modal-box">
-    <h2 style="margin-bottom:10px">事件详情</h2>
-    <pre id="modal-body"></pre>
-    <div style="margin-top:12px;text-align:right"><button id="modal-close">关闭</button></div>
-  </div>
-</div>
+<div class="tooltip" id="ev-tooltip" hidden></div>
 
 <script>
 (function () {
   'use strict';
-  var state = { range: '1h', token: '', live: true, ev:[] };
+  var state = { range: '1h', token: '', live: true, ev: [], model: '', upstream: '' };
 
   function esc(s) {
     var d = document.createElement('div');
@@ -189,7 +179,32 @@
 
   function fmtNum(n) {
     if (n == null) return '—';
-    return Number(n).toLocaleString('en-US');
+    n = Number(n);
+    if (n < 1000) return String(n);
+    var v, d;
+    if (n >= 1e9) { v = n / 1e9; d = 'B'; }
+    else if (n >= 1e6) { v = n / 1e6; d = 'M'; }
+    else { v = n / 1e3; d = 'K'; }
+    var s = v.toFixed(1).replace(/\.0$/, '');
+    return s + d;
+  }
+
+  // 输入 token 缓存命中率：cached_read/input，input 缺省回退 prompt；分母 0/缺失 → '-'
+  function fmtCache(e) {
+    var toks = e.tokens || {};
+    var cr = 0, input = null;
+    Object.keys(toks).forEach(function (m) {
+      var t = toks[m];
+      cr += t.cached_read || 0;
+      if (input == null) input = t.input != null ? t.input : (t.prompt != null ? t.prompt : null);
+    });
+    if (input == null || input === 0) return null; // null → 显示 '-'
+    return { pct: (cr / input * 100).toFixed(1) + '%', cr: cr, input: input };
+  }
+
+  function fmtPct(p) {
+    if (p == null) return '—';
+    return Number(p).toFixed(1) + '%';
   }
 
   function setBanner(msg, kind) {
@@ -285,10 +300,10 @@
       ? (precise ? '1h 精确' : '1h≈（低流量或高 TPS 属预期）')
       : (state.range + '≈ 桶中位');
     el.innerHTML =
-      '<div class="kpi"><div class="label">今日请求</div><div class="value">' + fmtNum(req) + '</div></div>' +
-      '<div class="kpi"><div class="label">脱敏占比</div><div class="value">' + redactedRatio.toFixed(1) + '%</div><div class="hint">含 PII 请求 ' + fmtNum(piiReqs) + ' / 总 ' + fmtNum(req) + '</div></div>' +
-      '<div class="kpi"><div class="label">PII Token 缓存</div><div class="value">' + fmtNum(piiHits) + '</div><div class="hint">hit(复用) ' + fmtNum(metrics.pii_hits || 0) + ' / miss(新值) ' + fmtNum(metrics.pii_miss || 0) + '</div></div>' +
-      '<div class="kpi"><div class="label">阻断数</div><div class="value">' + fmtNum(deny) + '</div><div class="hint">deny verdict</div></div>' +
+      '<div class="kpi"><div class="label">今日请求</div><div class="value" title="' + esc(String(req)) + '">' + fmtNum(req) + '</div></div>' +
+      '<div class="kpi"><div class="label">脱敏占比</div><div class="value" title="' + esc(piiReqs + ' / ' + req) + '">' + redactedRatio.toFixed(1) + '%</div><div class="hint">含 PII 请求 ' + fmtNum(piiReqs) + ' / 总 ' + fmtNum(req) + '</div></div>' +
+      '<div class="kpi"><div class="label">PII Token 缓存</div><div class="value" title="' + esc(String(piiHits)) + '">' + fmtNum(piiHits) + '</div><div class="hint">hit(复用) ' + fmtNum(metrics.pii_hits || 0) + ' / miss(新值) ' + fmtNum(metrics.pii_miss || 0) + '</div></div>' +
+      '<div class="kpi"><div class="label">阻断数</div><div class="value" title="' + esc(String(deny)) + '">' + fmtNum(deny) + '</div><div class="hint">deny verdict</div></div>' +
       '<div class="kpi"><div class="label">p95 延迟</div><div class="value">' + p95Txt + '</div><div class="hint">' + p95Hint + '</div></div>';
   }
 
@@ -314,10 +329,10 @@
       setBanner('');
     }
     el.innerHTML =
-      '<div class="tok"><div class="l">输入 tokens</div><div class="v">' + fmtNum(prompt) + '</div></div>' +
-      '<div class="tok"><div class="l">输出 tokens</div><div class="v">' + fmtNum(completion) + '</div></div>' +
-      '<div class="tok"><div class="l">缓存命中 cached_read</div><div class="v">' + fmtNum(cachedRead) + '</div></div>' +
-      '<div class="tok"><div class="l">缓存写入 cached_write</div><div class="v">' + fmtNum(cachedWrite) + '</div></div>';
+      '<div class="tok"><div class="l">输入 tokens</div><div class="v" title="' + esc(String(prompt)) + '">' + fmtNum(prompt) + '</div></div>' +
+      '<div class="tok"><div class="l">输出 tokens</div><div class="v" title="' + esc(String(completion)) + '">' + fmtNum(completion) + '</div></div>' +
+      '<div class="tok"><div class="l">缓存命中 cached_read</div><div class="v" title="' + esc(String(cachedRead)) + '">' + fmtNum(cachedRead) + '</div></div>' +
+      '<div class="tok"><div class="l">缓存写入 cached_write</div><div class="v" title="' + esc(String(cachedWrite)) + '">' + fmtNum(cachedWrite) + '</div></div>';
   }
 
   // ── 图表（Chart.js 可用则用，否则 SVG 降级）──
@@ -325,18 +340,9 @@
 
   function renderCharts(metrics) {
     var piiData = metrics.pii_by_type || {};
-    var upData = {};
-    // 上游分布：从 events 侧或 metrics 没有直接分 port —— 用 requests_by_status 近似不好，
-    // 从 recent_events 拉 events 计算
     var hasChart = typeof Chart !== 'undefined';
     renderBar('pii', piiData, 'PII kind');
-    // 上游分布稍后由 events 数据填充
-    if (hasChart) {
-      Object.keys(chartInstances).forEach(function (k) {
-        if (chartInstances[k]) chartInstances[k].destroy();
-      });
-      chartInstances = {};
-    }
+    // 上游分布稍后由 events 数据填充（renderUpstream 调用 renderBar('upstream', ...)）
   }
 
   function renderBar(id, data, label) {
@@ -354,59 +360,132 @@
         var ctx = document.getElementById(id + '-chart');
         ctx.innerHTML = '<canvas id="' + id + '-canvas"></canvas>';
         var canvas = document.getElementById(id + '-canvas');
-        if (chartInstances[id]) chartInstances[id].destroy();
-        chartInstances[id] = new Chart(canvas, {
-          type: 'bar',
-          data: {
-            labels: keys,
-            datasets: [{ label: label, data: keys.map(function (k) { return data[k]; }), backgroundColor: '#4cc2ff55', borderColor: '#4cc2ff', borderWidth: 1 }]
-          },
-          options: { plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } }
-        });
+        var datasets = [{ label: label, data: keys.map(function (k) { return data[k]; }), backgroundColor: '#4cc2ff55', borderColor: '#4cc2ff', borderWidth: 1 }];
+        if (!chartInstances[id]) {
+          chartInstances[id] = new Chart(canvas, {
+            type: 'bar',
+            data: { labels: keys, datasets: datasets },
+            options: {
+              plugins: {
+                legend: { display: false },
+                tooltip: {
+                  callbacks: {
+                    label: function (c) { return ' ' + c.label + ': ' + Number(c.raw).toLocaleString('en-US'); }
+                  }
+                }
+              },
+              scales: { y: { beginAtZero: true, ticks: { callback: function (v) { return fmtNum(v); } } } }
+            }
+          });
+        } else {
+          var ch = chartInstances[id];
+          ch.data.labels = keys;
+          ch.data.datasets = datasets;
+          ch.update();
+        }
         return;
       } catch (e) {
         // Chart 初始化失败 → 降级 SVG
       }
     }
-    // SVG 降级
+    // SVG 降级（bar 加 <title> 精确值 hover）
     var max = Math.max.apply(null, keys.map(function (k) { return data[k]; }));
     var w = 480, h = 160, bw = 40;
     var bars = keys.map(function (k, i) {
       var bh = (data[k] / max) * (h - 30);
-      return '<rect x="' + (i * (bw + 8) + 8) + '" y="' + (h - bh - 20) + '" width="' + bw + '" height="' + bh + '" fill="#4cc2ff66" stroke="#4cc2ff"/>' +
-             '<text x="' + (i * (bw + 8) + 8 + bw / 2) + '" y="' + (h - bh - 26) + '" text-anchor="middle">' + data[k] + '</text>' +
-             '<text x="' + (i * (bw + 8) + 8 + bw / 2) + '" y="' + (h - 6) + '" text-anchor="middle">' + esc(String(k).slice(0, 10)) + '</text>';
+      return '<g><rect x="' + (i * (bw + 8) + 8) + '" y="' + (h - bh - 20) + '" width="' + bw + '" height="' + bh + '" fill="#4cc2ff66" stroke="#4cc2ff"><title>' +
+        esc(k) + ': ' + Number(data[k]).toLocaleString('en-US') + '</title></rect>' +
+        '<text x="' + (i * (bw + 8) + 8 + bw / 2) + '" y="' + (h - bh - 26) + '" text-anchor="middle">' + fmtNum(data[k]) + '</text>' +
+        '<text x="' + (i * (bw + 8) + 8 + bw / 2) + '" y="' + (h - 6) + '" text-anchor="middle">' + esc(String(k).slice(0, 10)) + '</text></g>';
     }).join('');
     document.getElementById(id + '-chart').innerHTML = '';
     svgEl.innerHTML = '<svg width="' + Math.max(w, keys.length * (bw + 8)) + '" height="' + h + '">' + bars + '</svg>';
   }
 
-  function renderTrend(metrics) {
-    // 趋势：用 requests_by_status 的 200 序列近似（1h 粒度无历史点，展示当前）
+  function renderTrend(seriesData) {
+    // 多序列折线：seriesData = {buckets: [{ts, requests, tokens_prompt, tokens_completion, cached_read, p95, pii_requests}], is_precise}
+    var buckets = (seriesData && seriesData.buckets) || [];
     var hasChart = typeof Chart !== 'undefined';
     var svgEl = document.getElementById('trend-svg');
     var chartEl = document.getElementById('trend-chart');
-    var labels = ['当前窗口'];
-    var vals = [metrics.requests || 0];
+    var labels = buckets.map(function (b) {
+      var d = new Date(b.ts * 1000);
+      return state.range === '1h' ? d.toLocaleTimeString('zh-CN', { hour12: false, minute: '2-digit' })
+        : state.range === '24h' ? d.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit' })
+        : d.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
+    });
+    var mkSeries = function (key, label, color) {
+      return { label: label, data: buckets.map(function (b) { return b[key] || 0; }),
+        borderColor: color, backgroundColor: color + '22', fill: false, tension: 0.3, spanGaps: false };
+    };
     if (hasChart) {
       svgEl.innerHTML = '';
       chartEl.innerHTML = '<canvas id="trend-canvas"></canvas>';
       try {
         var canvas = document.getElementById('trend-canvas');
-        if (chartInstances['trend']) chartInstances['trend'].destroy();
-        chartInstances['trend'] = new Chart(canvas, {
-          type: 'line',
-          data: {
-            labels: labels,
-            datasets: [{ label: 'requests', data: vals, borderColor: '#4cc2ff', backgroundColor: '#4cc2ff22', fill: true }]
-          },
-          options: { plugins: { legend: { display: false } } }
-        });
+        var datasets = [
+          mkSeries('requests', 'requests', '#4cc2ff'),
+          mkSeries('tokens_prompt', 'tokens_prompt', '#34d399'),
+          mkSeries('tokens_completion', 'tokens_completion', '#fbbf24'),
+          mkSeries('p95', 'p95(ms)', '#f87171'),
+          mkSeries('pii_requests', 'pii_requests', '#c084fc')
+        ];
+        if (!chartInstances['trend']) {
+          chartInstances['trend'] = new Chart(canvas, {
+            type: 'line',
+            data: { labels: labels, datasets: datasets },
+            options: {
+              interaction: { mode: 'index', intersect: false },
+              plugins: {
+                legend: { labels: { color: '#8a93ab', font: { size: 10 } } },
+                tooltip: {
+                  callbacks: {
+                    label: function (ctx) {
+                      var v = ctx.raw;
+                      return ' ' + ctx.dataset.label + ': ' + (typeof v === 'number' ? Number(v).toLocaleString('en-US') : v);
+                    }
+                  }
+                }
+              },
+              scales: {
+                y: { ticks: { callback: function (val) { return fmtNum(val); }, color: '#8a93ab' }, grid: { color: '#2a2f42' } },
+                x: { ticks: { color: '#8a93ab', maxTicksLimit: 10 } }
+              }
+            }
+          });
+        } else {
+          var ch = chartInstances['trend'];
+          ch.data.labels = labels;
+          ch.data.datasets = datasets;
+          ch.update();
+        }
+        var precEl = document.getElementById('trend-precise');
+        if (precEl) precEl.textContent = seriesData && seriesData.is_precise ? '' : '≈';
         return;
       } catch (e) { /* fallthrough */ }
     }
     chartEl.innerHTML = '';
-    svgEl.innerHTML = '<span style="color:var(--dim)">' + esc(state.range) + ' 窗口请求数: ' + fmtNum(metrics.requests || 0) + '</span>';
+    // SVG 折线降级
+    if (buckets.length) {
+      var W = 600, H = 160, pad = 8;
+      var maxV = Math.max.apply(null, buckets.map(function (b) { return b.requests || 0; })) || 1;
+      var step = W / (buckets.length - 1 || 1);
+      var pts = buckets.map(function (b, i) {
+        var x = pad + i * step, y = H - pad - ((b.requests || 0) / maxV) * (H - 2 * pad);
+        return x.toFixed(1) + ',' + y.toFixed(1);
+      }).join(' ');
+      var circles = buckets.map(function (b, i) {
+        var x = pad + i * step, y = H - pad - ((b.requests || 0) / maxV) * (H - 2 * pad);
+        return '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="2" fill="#4cc2ff"><title>' +
+          esc(labels[i]) + ' requests=' + (b.requests || 0).toLocaleString('en-US') + ' tokens_prompt=' +
+          (b.tokens_prompt || 0).toLocaleString('en-US') + ' p95=' + (b.p95 != null ? Math.round(b.p95) : '—') +
+          '</title></circle>';
+      }).join('');
+      svgEl.innerHTML = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">' +
+        '<polyline points="' + pts + '" fill="none" stroke="#4cc2ff" stroke-width="1.5"/>' + circles + '</svg>';
+    } else {
+      svgEl.innerHTML = '<span style="color:var(--dim)">' + esc(state.range) + ' 窗口无数据</span>';
+    }
   }
 
   function renderUpstream(metrics, events) {
@@ -427,36 +506,95 @@
   function renderEvents(events) {
     state.ev = events || [];
     var tbody = document.querySelector('#ev-table tbody');
-    tbody.innerHTML = (state.ev ||[]).map(function (e) {
+    tbody.innerHTML = (state.ev ||[]).map(function (e, idx) {
       var tokens = e.tokens || {};
       var tokTotal = 0;
       Object.keys(tokens).forEach(function (m) {
         var t = tokens[m];
         tokTotal += (t.prompt || 0) + (t.completion || t.output || 0);
       });
-      return '<tr class="clickable" data-i="' + (state.ev.indexOf(e)) + '">' +
+      var cache = fmtCache(e);
+      var cacheTd = cache
+        ? '<td class="num" title="' + esc(cache.cr + ' / ' + cache.input) + '">' + esc(cache.pct) + '</td>'
+        : '<td class="num" title="无 usage">—</td>';
+      var latTd = e.latency_ms != null ? Math.round(e.latency_ms) : '—';
+      return '<tr class="clickable" data-i="' + idx + '">' +
         '<td>' + esc(fmtTs(e.ts)) + '</td>' +
         '<td>' + esc(e.request_id || '') + '</td>' +
         '<td>' + esc(e.upstream || '') + '</td>' +
+        '<td>' + esc(e.model || '') + '</td>' +
         '<td>' + esc(e.status || '') + '</td>' +
-        '<td class="num">' + fmtNum(e.pii_hits) + '</td>' +
-        '<td class="num">' + fmtNum(e.cred_hits) + '</td>' +
-        '<td class="num">' + fmtNum(tokTotal) + '</td>' +
-        '<td>' + esc(e.verdict || '') + '</td>' +
-        '<td class="num">' + (e.latency_ms != null ? Math.round(e.latency_ms) : '—') + '</td>' +
+        '<td class="num" title="' + esc(String(e.pii_hits)) + '">' + fmtNum(e.pii_hits) + '</td>' +
+        '<td class="num" title="' + esc(String(e.cred_hits)) + '">' + fmtNum(e.cred_hits) + '</td>' +
+        '<td class="num" title="' + esc(String(tokTotal)) + '">' + fmtNum(tokTotal) + '</td>' +
+        cacheTd +
+        '<td class="num">' + latTd + '</td>' +
         '</tr>';
-    }).join('') || '<tr><td colspan="9" style="color:var(--dim)">暂无事件</td></tr>';
-    tbody.querySelectorAll('tr.clickable').forEach(function (tr) {
+    }).join('') || '<tr><td colspan="10" style="color:var(--dim)">暂无事件</td></tr>';
+    // 行 hover → tooltip 浮窗（mouseenter 显示、mouseleave 关闭、Esc/点击外部关闭）
+    bindRowHover(tbody);
+  }
+
+  // 事件行 hover tooltip：行旁固定浮窗，200ms 延迟显示；移入浮窗不关闭；Esc/点击外部/滚动关闭
+  var hoverTimer = null, hoverRow = null;
+  function bindRowHover(tbody) {
+    var rows = tbody.querySelectorAll('tr.clickable');
+    Array.prototype.forEach.call(rows, function (tr) {
+      tr.addEventListener('mouseenter', function () {
+        var idx = Number(tr.getAttribute('data-i'));
+        var e = state.ev[idx];
+        if (!e) return;
+        clearTimeout(hoverTimer);
+        hoverRow = tr;
+        hoverTimer = setTimeout(function () { showEvTooltip(e, tr); }, 200);
+      });
+      tr.addEventListener('mouseleave', function () {
+        clearTimeout(hoverTimer);
+        setTimeout(function () {
+          var tip = document.getElementById('ev-tooltip');
+          if (tip && !tip.matches(':hover')) hideEvTooltip();
+        }, 150);
+      });
       tr.addEventListener('click', function () {
-        var e = state.ev[Number(tr.getAttribute('data-i'))];
-        if (e) showModal(e);
+        var idx = Number(tr.getAttribute('data-i'));
+        var e = state.ev[idx];
+        if (e) showEvTooltip(e, tr); // 点击固定
       });
     });
   }
 
-  function showModal(e) {
-    document.getElementById('modal').className = 'modal show';
-    document.getElementById('modal-body').textContent = JSON.stringify(e, null, 2);
+  function showEvTooltip(e, tr) {
+    var tip = document.getElementById('ev-tooltip');
+    // 脱敏摘要 + 关键字段（原样保留 __PII_*__/__VG_CRED_*__ 占位符，不还原）
+    var toks = e.tokens || {};
+    var tokLines = Object.keys(toks).map(function (m) {
+      var t = toks[m];
+      return m + ': prompt=' + (t.prompt || 0) + ' completion=' + (t.completion || t.output || 0) +
+        ' cached_read=' + (t.cached_read || 0);
+    }).join('\n') || '(无 usage)';
+    var summary = e.summary || e.raw_summary || '';
+    tip.textContent = '';
+    var pre = document.createElement('pre');
+    pre.textContent =
+      'request_id: ' + (e.request_id || '') + '\n' +
+      'ts: ' + fmtTs(e.ts) + ' | upstream: ' + (e.upstream || '') + ' | model: ' + (e.model || '') + '\n' +
+      'status: ' + (e.status || '') + ' | latency: ' + (e.latency_ms != null ? Math.round(e.latency_ms) + 'ms' : '—') + '\n' +
+      'pii_hits: ' + (e.pii_hits || 0) + ' | cred_hits: ' + (e.cred_hits || 0) + '\n' +
+      'tokens:\n' + tokLines + '\n' +
+      'summary: ' + summary;
+    tip.appendChild(pre);
+    tip.hidden = false;
+    // 定位跟随行（fixed，防溢出视口）
+    var rect = tr.getBoundingClientRect();
+    var left = rect.right + 8;
+    if (left + 420 > window.innerWidth) left = rect.left - 428;
+    tip.style.left = Math.max(4, left) + 'px';
+    tip.style.top = Math.max(4, rect.top) + 'px';
+  }
+
+  function hideEvTooltip() {
+    var tip = document.getElementById('ev-tooltip');
+    if (tip) tip.hidden = true;
   }
 
   // ── 数据加载 ──
@@ -464,18 +602,25 @@
   var loadSeq = 0;
   function loadAll() {
     var seq = ++loadSeq;
-    api('/_admin/metrics?range=' + state.range).then(function (m) {
+    var q = '?range=' + state.range;
+    if (state.model) q += '&model=' + encodeURIComponent(state.model);
+    if (state.upstream) q += '&upstream=' + encodeURIComponent(state.upstream);
+    api('/_admin/metrics' + q).then(function (m) {
       if (seq !== loadSeq) return;
       renderKpis(m);
       renderTokens4(m);
       renderCharts(m);
-      renderTrend(m);
-      return api('/_admin/events?limit=100').then(function (d) {
+      return api('/_admin/series' + q).then(function (s) {
         if (seq !== loadSeq) return;
-        var evs = d.events || [];
-        renderEvents(evs);
-        renderUpstream(m, evs);
-        fillUpstreamFilter(evs);
+        renderTrend(s);
+        return api('/_admin/events?limit=100' + (state.model ? '&model=' + encodeURIComponent(state.model) : '') + (state.upstream ? '&upstream=' + encodeURIComponent(state.upstream) : '')).then(function (d) {
+          if (seq !== loadSeq) return;
+          var evs = d.events || [];
+          renderEvents(evs);
+          renderUpstream(m, evs);
+          fillUpstreamFilter(evs);
+          fillModelFilter(m, evs);
+        });
       });
     }).catch(function (err) {
       if (err.message === 'unauthorized') {
@@ -483,6 +628,24 @@
         showLogin();
       }
     });
+  }
+
+  function fillModelFilter(metrics, evs) {
+    var sel = document.getElementById('model-filter');
+    var cur = sel.value;
+    var models = {};
+    // tokens 键（成本归因维度）
+    Object.keys((metrics && metrics.tokens) ||{}).forEach(function (m) { models[m] = 1; });
+    // 事件行 model（补充无 usage 请求）
+    (evs ||[]).forEach(function (e) { if (e.model) models[e.model] = 1; });
+    var html = '<option value="">全部模型</option>';
+    Object.keys(models).sort().forEach(function (m) {
+      var label = m === 'unknown_model' ? '未知模型 (unknown)' : m;
+      html += '<option value="' + esc(m) + '">' + esc(label) + '</option>';
+    });
+    sel.innerHTML = html;
+    sel.value = cur;
+    sel.disabled = !Object.keys(models).length;
   }
 
   function fillUpstreamFilter(evs) {
@@ -497,19 +660,33 @@
   }
 
   // ── Live SSE ──
+  var sseEs = null, fallbackTimer = null;
   function startLive() {
     var es;
     function connect() {
       if (!state.live) return;
-      var url = '/_admin/events/stream';
-      if (state.token && state.token !== '__cookie__') url += '?access_token=' + encodeURIComponent(state.token);
+      var url = '/_admin/events/stream?range=' + state.range;
+      if (state.model) url += '&model=' + encodeURIComponent(state.model);
+      if (state.upstream) url += '&upstream=' + encodeURIComponent(state.upstream);
+      if (state.token && state.token !== '__cookie__') url += '&access_token=' + encodeURIComponent(state.token);
       es = new EventSource(url);
+      sseEs = es;
       es.onopen = function () {
         document.getElementById('live-dot').className = 'dot';
+        if (fallbackTimer) { clearInterval(fallbackTimer); fallbackTimer = null; }
       };
       es.onerror = function () {
         document.getElementById('live-dot').className = 'dot off';
         es.close();
+        // 断开回退：15s 轮询刷新 KPI（SSE 恢复时清除）
+        if (!fallbackTimer) {
+          fallbackTimer = setInterval(function () {
+            var q = '?range=' + state.range;
+            if (state.model) q += '&model=' + encodeURIComponent(state.model);
+            if (state.upstream) q += '&upstream=' + encodeURIComponent(state.upstream);
+            api('/_admin/metrics' + q).then(renderKpis).catch(function () {});
+          }, 15000);
+        }
         setTimeout(connect, 3000);
       };
       es.addEventListener('event', function (ev) {
@@ -518,12 +695,35 @@
           prependEvent(e);
         } catch (err) { /* ignore */ }
       });
+      es.addEventListener('metrics', function (ev) {
+        try {
+          var snap = JSON.parse(ev.data);
+          // range 绑定校验：SSE 快照回显 range，与当前 state 不一致则丢弃（防旧窗口覆盖）
+          if (snap.range !== state.range) return;
+          if ((snap.model || null) !== (state.model || null)) return;
+          if ((snap.upstream || null) !== (state.upstream || null)) return;
+          var m = snap.metrics || {};
+          if (m && m.error) return;
+          renderKpis(m);
+          renderTokens4(m);
+          renderCharts(m);
+          if (snap.series && !snap.series.error) renderTrend(snap.series);
+        } catch (err) { /* ignore */ }
+      });
       es.addEventListener('done', function () {
         es.close();
         setTimeout(connect, 1000);
       });
     }
     connect();
+  }
+
+  // 切 range/model/upstream 时重建 SSE（绑定新维度，防旧快照覆盖）
+  function restartLive() {
+    if (!state.live) return;
+    if (sseEs) { sseEs.close(); sseEs = null; }
+    if (fallbackTimer) { clearInterval(fallbackTimer); fallbackTimer = null; }
+    startLive();
   }
 
   function prependEvent(e) {
@@ -540,19 +740,37 @@
       var t = tokens[m];
       tokTotal += (t.prompt || 0) + (t.completion || t.output || 0);
     });
+    var cache = fmtCache(e);
+    var cacheTd = cache
+      ? '<td class="num" title="' + esc(cache.cr + ' / ' + cache.input) + '">' + esc(cache.pct) + '</td>'
+      : '<td class="num" title="无 usage">—</td>';
     row.className = 'clickable';
     row.setAttribute('data-i', '0');
     row.innerHTML =
       '<td>' + esc(fmtTs(e.ts)) + '</td>' +
       '<td>' + esc(e.request_id || '') + '</td>' +
       '<td>' + esc(e.upstream || '') + '</td>' +
+      '<td>' + esc(e.model || '') + '</td>' +
       '<td>' + esc(e.status || '') + '</td>' +
-      '<td class="num">' + fmtNum(e.pii_hits) + '</td>' +
-      '<td class="num">' + fmtNum(e.cred_hits) + '</td>' +
-      '<td class="num">' + fmtNum(tokTotal) + '</td>' +
-      '<td>' + esc(e.verdict || '') + '</td>' +
+      '<td class="num" title="' + esc(String(e.pii_hits)) + '">' + fmtNum(e.pii_hits) + '</td>' +
+      '<td class="num" title="' + esc(String(e.cred_hits)) + '">' + fmtNum(e.cred_hits) + '</td>' +
+      '<td class="num" title="' + esc(String(tokTotal)) + '">' + fmtNum(tokTotal) + '</td>' +
+      cacheTd +
       '<td class="num">' + (e.latency_ms != null ? Math.round(e.latency_ms) : '—') + '</td>';
-    row.addEventListener('click', function () { showModal(e); });
+    // hover tooltip（复用 renderEvents 的 bindRowHover——但单行插入后手动绑定）
+    row.addEventListener('mouseenter', function () {
+      clearTimeout(hoverTimer);
+      hoverRow = row;
+      hoverTimer = setTimeout(function () { showEvTooltip(e, row); }, 200);
+    });
+    row.addEventListener('mouseleave', function () {
+      clearTimeout(hoverTimer);
+      setTimeout(function () {
+        var tip = document.getElementById('ev-tooltip');
+        if (tip && !tip.matches(':hover')) hideEvTooltip();
+      }, 150);
+    });
+    row.addEventListener('click', function () { showEvTooltip(e, row); });
     if (first) tbody.insertBefore(row, first);
     else tbody.appendChild(row);
   }
@@ -564,15 +782,13 @@
     document.getElementById('pass').addEventListener('keydown', function (ev) {
       if (ev.key === 'Enter') doLogin();
     });
-    document.getElementById('modal-close').addEventListener('click', function () {
-      document.getElementById('modal').className = 'modal';
-    });
     document.querySelectorAll('#range-bar button').forEach(function (b) {
       b.addEventListener('click', function () {
         document.querySelectorAll('#range-bar button').forEach(function (x) { x.className = ''; });
         b.className = 'active';
         state.range = b.getAttribute('data-range');
         loadAll();
+        restartLive();
       });
     });
     document.getElementById('ev-refresh').addEventListener('click', loadAll);
@@ -581,17 +797,27 @@
       this.className = state.live ? 'active' : '';
       if (state.live) startLive();
     });
-    document.getElementById('ev-verdict').addEventListener('change', function () {
-      var v = this.value;
-      api('/_admin/events?limit=100' + (v ? '&verdict=' + v : '')).then(function (d) {
-        renderEvents(d.events || []);
-      });
+    document.getElementById('ev-upstream').addEventListener('change', function () {
+      state.upstream = this.value;
+      loadAll();
+      restartLive();
     });
     document.getElementById('model-filter').addEventListener('change', function () {
-      var m = this.value;
-      var url = '/_admin/metrics?range=' + state.range + (m ? '&model=' + encodeURIComponent(m) : '');
-      api(url).then(renderKpis);
+      state.model = this.value;
+      loadAll();
+      restartLive();
     });
+    // Esc 关闭 tooltip；点击外部关闭；滚动关闭
+    document.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape') hideEvTooltip();
+    });
+    document.addEventListener('click', function (ev) {
+      var tip = document.getElementById('ev-tooltip');
+      if (tip && !tip.hidden && !ev.target.closest('#ev-tooltip') && !ev.target.closest('tr.clickable')) {
+        hideEvTooltip();
+      }
+    });
+    window.addEventListener('scroll', function () { hideEvTooltip(); }, true);
   });
 })();
 </script>

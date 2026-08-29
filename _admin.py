@@ -354,6 +354,8 @@ def init_observability(app: web.Application, collector) -> None:
         else:
             if path == '/_admin/metrics':
                 resp = await _handle_metrics(request, collector)
+            elif path == '/_admin/series':
+                resp = await _handle_series(request, collector)
             elif path == '/_admin/events':
                 resp = _handle_events(request, collector)
             elif path == '/_admin/health':
@@ -388,11 +390,14 @@ async def _handle_metrics(request: web.Request, collector) -> web.Response:
     if range_ not in ('1h', '24h', '7d', '30d'):
         range_ = '1h'
     model_filter = request.query.get('model') or None
+    upstream_filter = request.query.get('upstream') or None
     loop = asyncio.get_running_loop()
     try:
         data = await loop.run_in_executor(
             None,
-            lambda: collector.query_range(range_, model_filter=model_filter),
+            lambda: collector.query_range(
+                range_, model_filter=model_filter, upstream_filter=upstream_filter
+            ),
         )
     except Exception as e:  # pragma: no cover — 防御
         logger.warning('metrics 查询异常: %s', e)
@@ -403,8 +408,31 @@ async def _handle_metrics(request: web.Request, collector) -> web.Response:
     return resp
 
 
+async def _handle_series(request: web.Request, collector) -> web.Response:
+    """GET /_admin/series?range=1h|24h|7d|30d&model=&upstream=。"""
+    range_ = request.query.get('range', '24h')
+    if range_ not in ('1h', '24h', '7d', '30d'):
+        range_ = '24h'
+    model_filter = request.query.get('model') or None
+    upstream_filter = request.query.get('upstream') or None
+    try:
+        data = await asyncio.to_thread(
+            collector.series,
+            range_,
+            model_filter=model_filter,
+            upstream_filter=upstream_filter,
+        )
+    except Exception as e:  # pragma: no cover — 防御
+        logger.warning('series 查询异常: %s', e)
+        data = {'error': 'series_unavailable', 'range': range_}
+    resp = web.json_response(data, dumps=json.dumps)
+    for k, v in _NO_STORE_HEADERS.items():
+        resp.headers[k] = v
+    return resp
+
+
 def _handle_events(request: web.Request, collector) -> web.Response:
-    """GET /_admin/events?limit&kind&upstream&verdict。"""
+    """GET /_admin/events?limit&kind&upstream&model。"""
     try:
         limit = int(request.query.get('limit', '50'))
     except ValueError:
@@ -412,12 +440,8 @@ def _handle_events(request: web.Request, collector) -> web.Response:
     limit = max(1, min(limit, 200))
     kind = request.query.get('kind') or None
     upstream = request.query.get('upstream') or None
-    verdict = request.query.get('verdict') or None
-    if verdict not in (None, 'allow', 'deny'):
-        verdict = None
-    events = collector.events(
-        limit=limit, kind=kind, upstream=upstream, verdict=verdict
-    )
+    model = request.query.get('model') or None
+    events = collector.events(limit=limit, kind=kind, upstream=upstream, model=model)
     resp = web.json_response({'events': events}, dumps=json.dumps)
     for k, v in _NO_STORE_HEADERS.items():
         resp.headers[k] = v
@@ -467,9 +491,48 @@ async def _handle_sse(request: web.Request, collector) -> web.StreamResponse:
         )
     last_push_ts = _time.time()
     last_ping_ts = _time.time()
+    last_metrics_ts = _time.time()
     start = _time.time()
+    # SSE 绑定查询维度（前端切 range/model/upstream 会重建 SSE，这里读取建连时参数）
+    _range = request.query.get('range', '1h')
+    if _range not in ('1h', '24h', '7d', '30d'):
+        _range = '1h'
+    _model = request.query.get('model') or None
+    _upstream = request.query.get('upstream') or None
     try:
         while True:
+            # 15s 全量 metrics 快照（单 writer 顺序写，不另起 task 防并发写 StreamResponse 交织）
+            if _time.time() - last_metrics_ts >= 15:
+                try:
+                    _mdata = await asyncio.to_thread(
+                        collector.query_range,
+                        _range,
+                        model_filter=_model,
+                        upstream_filter=_upstream,
+                    )
+                    _sdata = await asyncio.to_thread(
+                        collector.series,
+                        _range,
+                        model_filter=_model,
+                        upstream_filter=_upstream,
+                    )
+                    _hdata = await asyncio.to_thread(collector.health)
+                except Exception:
+                    _mdata = {'error': 'metrics_unavailable', 'range': _range}
+                    _sdata = {'error': 'series_unavailable', 'range': _range}
+                    _hdata = {'error': 'health_unavailable'}
+                _snap = {
+                    'range': _range,
+                    'model': _model,
+                    'upstream': _upstream,
+                    'metrics': _mdata,
+                    'series': _sdata,
+                    'health': _hdata,
+                }
+                await resp.write(
+                    f'event: metrics\ndata: {json.dumps(_snap, ensure_ascii=False)}\n\n'.encode()
+                )
+                last_metrics_ts = _time.time()
             # 推送新事件（自上次推送以来，按 request_id 去重）
             # 取数窗口 200：2s 轮询间隔内 QPS≤100 不丢（50 在 >25 rps 时截断丢事件）
             evs = collector.events(limit=200)

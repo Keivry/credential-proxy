@@ -718,6 +718,7 @@ class MetricsCollector:
         pii_found: bool = False,
         cred_hits: int = 0,
         cred_miss: int = 0,
+        model: str = 'unknown_model',
         tokens: dict[str, Any] | None = None,
         audit_by_verdict: dict[str, int] | None = None,
         audit_by_rule: dict[str, int] | None = None,
@@ -749,6 +750,9 @@ class MetricsCollector:
             else {}
         )
         latency_ms_v = latency_ms if latency_ms is not None else None
+        # model 白名单/截断（防属性注入/超长；非法则归 unknown_model）
+        if not _re.fullmatch(r'[A-Za-z0-9._/\-]{1,64}', model or ''):
+            model = 'unknown_model'
         # 锁外做脱敏（5 个正则替换，避免占用全局锁）
         summary_redacted = redact_summary(raw_summary, 120) if raw_summary else ''
 
@@ -827,6 +831,7 @@ class MetricsCollector:
                         'ts': now,
                         'request_id': request_id,
                         'upstream': d_up,
+                        'model': model,
                         'tail': tail,
                         'status': status_s,
                         'latency_ms': latency_ms_v,
@@ -970,24 +975,34 @@ class MetricsCollector:
 
     # ── p95 / ring ──
 
-    def ring_stats(self) -> dict[str, Any]:
-        """recent_events 现场统计（含 is_precise/ring_coverage_s）。"""
+    def ring_stats(
+        self,
+        *,
+        upstream_filter: str | None = None,
+        model_filter: str | None = None,
+    ) -> dict[str, Any]:
+        """recent_events 现场统计（含 is_precise/ring_coverage_s）。
+
+        可选按 upstream/model 过滤（1h 窗口查询带筛选时用）。
+        """
         now = _utc_now()
-        if not self.recent_events:
+        evs = [
+            e
+            for e in self.recent_events
+            if (upstream_filter is None or e.get('upstream') == upstream_filter)
+            and (model_filter is None or e.get('model') == model_filter)
+        ]
+        if not evs:
             return {
-                'ring_len': 0,
+                'ring_len': len(evs),
                 'ring_coverage_s': 0.0,
                 'is_precise': False,
                 'p95': None,
                 'p50': None,
             }
-        oldest_ts = self.recent_events[0]['ts']
+        oldest_ts = evs[0]['ts']
         coverage = now - oldest_ts
-        lat = [
-            e['latency_ms']
-            for e in self.recent_events
-            if e.get('latency_ms') is not None
-        ]
+        lat = [e['latency_ms'] for e in evs if e.get('latency_ms') is not None]
         precise = coverage >= 3600 and len(lat) >= 100
         p95 = p50 = None
         if lat:
@@ -996,7 +1011,7 @@ class MetricsCollector:
             p95 = lat_sorted[min(int(0.95 * n), n - 1)]
             p50 = lat_sorted[min(int(0.50 * n), n - 1)]
         return {
-            'ring_len': len(self.recent_events),
+            'ring_len': len(evs),
             'ring_coverage_s': round(coverage, 1),
             'is_precise': precise,
             'p95': p95,
@@ -1061,19 +1076,35 @@ class MetricsCollector:
     # ── 窗口查询 ──
 
     def query_range(
-        self, range_: str, *, model_filter: str | None = None
+        self,
+        range_: str,
+        *,
+        model_filter: str | None = None,
+        upstream_filter: str | None = None,
     ) -> dict[str, Any]:
         """?range=1h|24h|7d|30d 聚合（1h 内存 ring，其余 DB 桶 SUM）。"""
         if range_ == '1h':
-            return self._query_1h(model_filter)
+            return self._query_1h(model_filter, upstream_filter)
         hours = 24 if range_ == '24h' else (24 * 7 if range_ == '7d' else 24 * 30)
-        return self._query_db(hours, model_filter)
+        return self._query_db(hours, model_filter, upstream_filter)
 
-    def _query_1h(self, model_filter: str | None = None) -> dict[str, Any]:
+    def _query_1h(
+        self,
+        model_filter: str | None = None,
+        upstream_filter: str | None = None,
+    ) -> dict[str, Any]:
         now = _utc_now()
         cutoff = now - 3600
-        evs = [e for e in self.recent_events if e['ts'] >= cutoff]
-        ring = self.ring_stats()
+        evs = [
+            e
+            for e in self.recent_events
+            if e['ts'] >= cutoff
+            and (upstream_filter is None or e.get('upstream') == upstream_filter)
+            and (model_filter is None or e.get('model') == model_filter)
+        ]
+        ring = self.ring_stats(
+            upstream_filter=upstream_filter, model_filter=model_filter
+        )
         requests = len(evs)
         by_status: dict[str, int] = {}
         pii_by_type: dict[str, int] = {}
@@ -1094,9 +1125,17 @@ class MetricsCollector:
         for (_d, _up), agg in self._daily.items():
             if _d != day_key:
                 continue
+            if upstream_filter is not None and _up != upstream_filter:
+                continue
             for k, v in agg.pii_by_type.items():
                 pii_by_type[k] = pii_by_type.get(k, 0) + v
-            self._merge_tokens(tokens, agg.tokens)
+            if model_filter is not None:
+                self._merge_tokens(
+                    tokens,
+                    {k: v for k, v in agg.tokens.items() if k == model_filter},
+                )
+            else:
+                self._merge_tokens(tokens, agg.tokens)
             # pii_hits/pii_miss/pii_requests 均从 recent_events 精确统计（同 requests 数据源）；
             # _daily 只作为 pii_by_type/tokens 的全天近似
             cred_hits += agg.cred_hits
@@ -1128,7 +1167,12 @@ class MetricsCollector:
             },
         }
 
-    def _query_db(self, hours: int, model_filter: str | None = None) -> dict[str, Any]:
+    def _query_db(
+        self,
+        hours: int,
+        model_filter: str | None = None,
+        upstream_filter: str | None = None,
+    ) -> dict[str, Any]:
         """DB 桶 SUM 单条 SELECT 拉全量后内存归并（非 N+1）。
 
         用独立只读连接（mode=ro），不与 writer 线程共享 self._conn，
@@ -1143,7 +1187,7 @@ class MetricsCollector:
         except Exception:
             pass  # flush 失败仍继续查（可能读到旧数据）
         if self._conn is None:
-            return self._query_memory_fallback(hours, model_filter)
+            return self._query_memory_fallback(hours, model_filter, upstream_filter)
         cutoff_hour = _hour_key(_utc_now() - hours * 3600)
         cutoff_date = _day_key(_utc_now() - hours * 3600)
         try:
@@ -1154,13 +1198,18 @@ class MetricsCollector:
                 timeout=5.0,
             )
         except sqlite3.Error:
-            return self._query_memory_fallback(hours, model_filter)
+            return self._query_memory_fallback(hours, model_filter, upstream_filter)
         try:
             return self._query_db_with(
-                ro_conn, hours, model_filter, cutoff_hour, cutoff_date
+                ro_conn,
+                hours,
+                model_filter,
+                upstream_filter,
+                cutoff_hour,
+                cutoff_date,
             )
         except (sqlite3.Error, OSError):
-            return self._query_memory_fallback(hours, model_filter)
+            return self._query_memory_fallback(hours, model_filter, upstream_filter)
         finally:
             try:
                 ro_conn.close()
@@ -1172,6 +1221,7 @@ class MetricsCollector:
         conn: sqlite3.Connection,
         hours: int,
         model_filter: str | None,
+        upstream_filter: str | None,
         cutoff_hour: str,
         cutoff_date: str,
     ) -> dict[str, Any]:
@@ -1202,13 +1252,22 @@ class MetricsCollector:
         try:
             # hourly: 24h/7d 窗口（30d 走 daily，避免双计）
             if hours < 24 * 30:
-                rows = conn.execute(
-                    'SELECT hour, upstream, requests, requests_by_status, tokens, '
-                    'latency_buckets, pii_by_type, pii_hits, pii_miss, pii_requests, '
-                    'pii_lru_evictions, cred_lru_evictions '
-                    'FROM hourly_agg WHERE hour >= ?',
-                    (cutoff_hour,),
-                ).fetchall()
+                if upstream_filter is not None:
+                    rows = conn.execute(
+                        'SELECT hour, upstream, requests, requests_by_status, tokens, '
+                        'latency_buckets, pii_by_type, pii_hits, pii_miss, pii_requests, '
+                        'pii_lru_evictions, cred_lru_evictions '
+                        'FROM hourly_agg WHERE hour >= ? AND upstream = ?',
+                        (cutoff_hour, upstream_filter),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        'SELECT hour, upstream, requests, requests_by_status, tokens, '
+                        'latency_buckets, pii_by_type, pii_hits, pii_miss, pii_requests, '
+                        'pii_lru_evictions, cred_lru_evictions '
+                        'FROM hourly_agg WHERE hour >= ?',
+                        (cutoff_hour,),
+                    ).fetchall()
                 for (
                     _h,
                     _up,
@@ -1237,15 +1296,26 @@ class MetricsCollector:
                     out['cred_lru_evictions'] += cred_lru or 0
             # daily: 30d 窗口（含扩展列）
             if hours >= 24 * 30:
-                rows_d = conn.execute(
-                    'SELECT date, upstream, pii_hits, pii_miss, pii_requests, cred_hits, cred_miss, '
-                    'cred_lru_evictions, pii_lru_evictions, requests, requests_by_status, '
-                    'tokens, audit_by_verdict, audit_by_rule, latency_buckets, '
-                    'placeholder_prompt_injected, truncated_total, json_aware_success, '
-                    'json_leaf_fallback, json_full_fallback '
-                    'FROM daily_agg WHERE date >= ?',
-                    (cutoff_date,),
-                ).fetchall()
+                if upstream_filter is not None:
+                    rows_d = conn.execute(
+                        'SELECT date, upstream, pii_hits, pii_miss, pii_requests, cred_hits, cred_miss, '
+                        'cred_lru_evictions, pii_lru_evictions, requests, requests_by_status, '
+                        'tokens, audit_by_verdict, audit_by_rule, latency_buckets, '
+                        'placeholder_prompt_injected, truncated_total, json_aware_success, '
+                        'json_leaf_fallback, json_full_fallback '
+                        'FROM daily_agg WHERE date >= ? AND upstream = ?',
+                        (cutoff_date, upstream_filter),
+                    ).fetchall()
+                else:
+                    rows_d = conn.execute(
+                        'SELECT date, upstream, pii_hits, pii_miss, pii_requests, cred_hits, cred_miss, '
+                        'cred_lru_evictions, pii_lru_evictions, requests, requests_by_status, '
+                        'tokens, audit_by_verdict, audit_by_rule, latency_buckets, '
+                        'placeholder_prompt_injected, truncated_total, json_aware_success, '
+                        'json_leaf_fallback, json_full_fallback '
+                        'FROM daily_agg WHERE date >= ?',
+                        (cutoff_date,),
+                    ).fetchall()
                 for row in rows_d:
                     (
                         _d,
@@ -1306,7 +1376,10 @@ class MetricsCollector:
         return out
 
     def _query_memory_fallback(
-        self, hours: int, model_filter: str | None = None
+        self,
+        hours: int,
+        model_filter: str | None = None,
+        upstream_filter: str | None = None,
     ) -> dict[str, Any]:
         out: dict[str, Any] = {
             'range': f'{hours}h',
@@ -1331,7 +1404,9 @@ class MetricsCollector:
             'json_full_fallback': 0,
             'latency': {'p50': None, 'p95': None, 'is_precise': False},
         }
-        for d in self._daily.values():
+        for (_d, _up), d in self._daily.items():
+            if upstream_filter is not None and _up != upstream_filter:
+                continue
             out['requests'] += d.requests
             self._merge_json_counter(out['requests_by_status'], d.requests_by_status)
             self._merge_tokens(out['tokens'], d.tokens)
@@ -1410,7 +1485,7 @@ class MetricsCollector:
         limit: int = 50,
         kind: str | None = None,
         upstream: str | None = None,
-        verdict: str | None = None,
+        model: str | None = None,
     ) -> list[dict[str, Any]]:
         """recent_events 环形缓冲视图（数据源仅 recent_events）。
 
@@ -1421,7 +1496,7 @@ class MetricsCollector:
         for e in reversed(self.recent_events):
             if upstream and e['upstream'] != upstream:
                 continue
-            if verdict and e.get('verdict') != verdict:
+            if model and e.get('model') != model:
                 continue
             if kind and kind not in e.get('summary', ''):
                 continue
@@ -1429,6 +1504,269 @@ class MetricsCollector:
             if len(out) >= limit:
                 break
         return out
+
+    # ── series 时间桶序列 ──
+
+    def series(
+        self,
+        range_: str,
+        *,
+        model_filter: str | None = None,
+        upstream_filter: str | None = None,
+    ) -> dict[str, Any]:
+        """时间桶序列（趋势图数据源）。
+
+        - `1h`：recent_events 分钟桶（60 点，锁内快照防撕裂），is_precise 由 ring 覆盖决定
+        - `24h`/`7d`：hourly_agg 小时桶（24/168 点）
+        - `30d`：daily_agg 日桶（30 点）
+        - 空桶补零；支持 model/upstream 过滤（DB 路径按桶键过滤 + tokens 内 model 近似）
+        返回 `{buckets: [{ts, requests, tokens_prompt, tokens_completion, cached_read, p95, pii_requests}], is_precise}`。
+        """
+        now = _utc_now()
+        if range_ == '1h':
+            return self._series_1h(now, model_filter, upstream_filter)
+        if range_ == '30d':
+            return self._series_db(
+                hours=24 * 30,
+                bucket_s=24 * 3600,
+                key_fn=_day_key,
+                granularity='day',
+                model_filter=model_filter,
+                upstream_filter=upstream_filter,
+            )
+        hours = 24 if range_ == '24h' else 24 * 7
+        return self._series_db(
+            hours=hours,
+            bucket_s=3600,
+            key_fn=_hour_key,
+            granularity='hour',
+            model_filter=model_filter,
+            upstream_filter=upstream_filter,
+        )
+
+    def _series_1h(
+        self,
+        now: float,
+        model_filter: str | None,
+        upstream_filter: str | None,
+    ) -> dict[str, Any]:
+        """1h 分钟桶：recent_events 锁内快照后归并。"""
+        cutoff = now - 3600
+        # 快照（deque list() 在 CPython GIL 下原子；series 在 executor 线程，
+        # 不能用 asyncio.Lock，直接拷贝即可——append 与 list() 并发安全）
+        snap = list(self.recent_events)
+        buckets: list[dict[str, Any]] = []
+        # 60 个分钟桶：从「当前分钟对齐」往前推 59 分钟，覆盖最近 1h
+        now_min = int(now // 60) * 60
+        start_min = now_min - 59 * 60
+        for i in range(60):
+            ts = start_min + i * 60
+            buckets.append(
+                {
+                    'ts': ts,
+                    'requests': 0,
+                    'tokens_prompt': 0,
+                    'tokens_completion': 0,
+                    'cached_read': 0,
+                    'p95': None,
+                    'pii_requests': 0,
+                }
+            )
+        lat_by_min: dict[int, list[float]] = {}
+        for e in snap:
+            if e['ts'] < cutoff:
+                continue
+            if upstream_filter is not None and e.get('upstream') != upstream_filter:
+                continue
+            if model_filter is not None and e.get('model') != model_filter:
+                continue
+            idx = int((e['ts'] - start_min) // 60)
+            if not (0 <= idx < 60):
+                continue
+            b = buckets[idx]
+            b['requests'] += 1
+            if e.get('pii_found'):
+                b['pii_requests'] += 1
+            toks = e.get('tokens') or {}
+            for _m, u in toks.items():
+                if model_filter is not None and _m != model_filter:
+                    continue
+                b['tokens_prompt'] += u.get('prompt', 0) or 0
+                b['tokens_completion'] += u.get('completion', 0) or 0
+                b['cached_read'] += u.get('cached_read', 0) or 0
+            lat = e.get('latency_ms')
+            if lat is not None:
+                lat_by_min.setdefault(idx, []).append(lat)
+        for idx, lats in lat_by_min.items():
+            if lats:
+                buckets[idx]['p95'] = sorted(lats)[
+                    min(int(0.95 * len(lats)), len(lats) - 1)
+                ]
+        ring = self.ring_stats(
+            upstream_filter=upstream_filter, model_filter=model_filter
+        )
+        return {'buckets': buckets, 'is_precise': ring['is_precise']}
+
+    def _series_db(
+        self,
+        *,
+        hours: int,
+        bucket_s: int,
+        key_fn,
+        granularity: str,
+        model_filter: str | None,
+        upstream_filter: str | None,
+    ) -> dict[str, Any]:
+        """DB 桶序列：独立只读连接拉全量后按时间键归并（与 _query_db 同模式）。"""
+        try:
+            self._flush_sync()
+        except Exception:
+            pass
+        if self._conn is None:
+            return self._series_memory(
+                hours, bucket_s, key_fn, granularity, model_filter, upstream_filter
+            )
+        cutoff = _utc_now() - hours * 3600
+        cutoff_key = key_fn(cutoff)
+        try:
+            ro_conn = sqlite3.connect(
+                f'file:{urllib.parse.quote(self.db_path, safe="/")}?mode=ro',
+                uri=True,
+                timeout=5.0,
+            )
+        except sqlite3.Error:
+            return self._series_memory(
+                hours, bucket_s, key_fn, granularity, model_filter, upstream_filter
+            )
+        try:
+            # 拉窗口内全量桶（hourly 或 daily），内存归并
+            if granularity == 'hour':
+                if upstream_filter is not None:
+                    rows = ro_conn.execute(
+                        'SELECT hour, upstream, requests, tokens, latency_buckets, pii_requests '
+                        'FROM hourly_agg WHERE hour >= ? AND upstream = ?',
+                        (cutoff_key, upstream_filter),
+                    ).fetchall()
+                else:
+                    rows = ro_conn.execute(
+                        'SELECT hour, upstream, requests, tokens, latency_buckets, pii_requests '
+                        'FROM hourly_agg WHERE hour >= ?',
+                        (cutoff_key,),
+                    ).fetchall()
+            else:
+                if upstream_filter is not None:
+                    rows = ro_conn.execute(
+                        'SELECT date, upstream, requests, tokens, latency_buckets, pii_requests '
+                        'FROM daily_agg WHERE date >= ? AND upstream = ?',
+                        (cutoff_key, upstream_filter),
+                    ).fetchall()
+                else:
+                    rows = ro_conn.execute(
+                        'SELECT date, upstream, requests, tokens, latency_buckets, pii_requests '
+                        'FROM daily_agg WHERE date >= ?',
+                        (cutoff_key,),
+                    ).fetchall()
+            # 建桶（空桶补零）
+            now = _utc_now()
+            n_buckets = int(hours * 3600 // bucket_s)
+            bucket_ts = [
+                int((now - (n_buckets - i) * bucket_s) // bucket_s) * bucket_s
+                for i in range(n_buckets)
+            ]
+            buckets = [
+                {
+                    'ts': ts,
+                    'requests': 0,
+                    'tokens_prompt': 0,
+                    'tokens_completion': 0,
+                    'cached_read': 0,
+                    'p95': None,
+                    'pii_requests': 0,
+                }
+                for ts in bucket_ts
+            ]
+            key_to_idx = {key_fn(ts): i for i, ts in enumerate(bucket_ts)}
+            for row in rows:
+                k = row[0]
+                idx = key_to_idx.get(k)
+                if idx is None:
+                    continue
+                b = buckets[idx]
+                b['requests'] += row[2] or 0
+                toks = json.loads(row[3]) if row[3] else {}
+                for _m, u in toks.items():
+                    if model_filter is not None and _m != model_filter:
+                        continue
+                    b['tokens_prompt'] += u.get('prompt', 0) or 0
+                    b['tokens_completion'] += u.get('completion', 0) or 0
+                    b['cached_read'] += u.get('cached_read', 0) or 0
+                b['pii_requests'] += row[5] or 0
+                lb = json.loads(row[4]) if row[4] else {}
+                if lb:
+                    b['p95'] = self._percentile_from_buckets(lb, 0.95)
+            return {'buckets': buckets, 'is_precise': False}
+        except (sqlite3.Error, OSError):
+            return self._series_memory(
+                hours, bucket_s, key_fn, granularity, model_filter, upstream_filter
+            )
+        finally:
+            try:
+                ro_conn.close()
+            except sqlite3.Error:
+                pass
+
+    def _series_memory(
+        self,
+        hours: int,
+        bucket_s: int,
+        key_fn,
+        granularity: str,
+        model_filter: str | None,
+        upstream_filter: str | None,
+    ) -> dict[str, Any]:
+        """内存 fallback：从 _daily/_hourly 归并（无 DB 时）。"""
+        now = _utc_now()
+        cutoff = now - hours * 3600
+        n_buckets = int(hours * 3600 // bucket_s)
+        bucket_ts = [
+            int((now - (n_buckets - i) * bucket_s) // bucket_s) * bucket_s
+            for i in range(n_buckets)
+        ]
+        buckets = [
+            {
+                'ts': ts,
+                'requests': 0,
+                'tokens_prompt': 0,
+                'tokens_completion': 0,
+                'cached_read': 0,
+                'p95': None,
+                'pii_requests': 0,
+            }
+            for ts in bucket_ts
+        ]
+        key_to_idx = {key_fn(ts): i for i, ts in enumerate(bucket_ts)}
+        agg_map = self._daily if granularity == 'day' else self._hourly
+        cutoff_key = key_fn(cutoff)
+        for (_k, _up), agg in agg_map.items():
+            if upstream_filter is not None and _up != upstream_filter:
+                continue
+            if _k < cutoff_key:
+                continue
+            idx = key_to_idx.get(_k)
+            if idx is None:
+                continue
+            b = buckets[idx]
+            b['requests'] += agg.requests
+            for _m, u in agg.tokens.items():
+                if model_filter is not None and _m != model_filter:
+                    continue
+                b['tokens_prompt'] += u.get('prompt', 0) or 0
+                b['tokens_completion'] += u.get('completion', 0) or 0
+                b['cached_read'] += u.get('cached_read', 0) or 0
+            b['pii_requests'] += agg.pii_requests
+            if agg.latency_buckets:
+                b['p95'] = self._percentile_from_buckets(agg.latency_buckets, 0.95)
+        return {'buckets': buckets, 'is_precise': False}
 
     # ── close ──
 

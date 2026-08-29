@@ -170,7 +170,13 @@ get revoke --name "check-mail"
 
 ## Observability 大盘（/_admin，v0.9.25+）
 
-实时指标大盘（请求量/延迟分桶/p95/PII 与凭据命中率/Token 用量/审计分布），单文件 `admin.html` 免构建。
+实时指标大盘（请求量/延迟分桶/p95/PII 与凭据命中率/Token 用量/审计分布/时序折线），单文件 `admin.html` 免构建。
+- **筛选**：模型下拉（从 tokens 键 + 事件行 model 去重自动填充）+ 上游下拉，联动 KPI/图表/趋势/事件表。
+- **时序趋势**：`/_admin/series` 折线（1h 分钟级 60 点 / 24h 24 点 / 7d 168 点 / 30d 30 点），Chart.js 增量更新，SVG 降级。
+- **自动刷新**：SSE 事件 2s 推 + `event: metrics` 全量快照 15s 推（KPI/图表/token 四卡/上游分布自动更新；SSE 断开回退 15s 轮询）。
+- **人性化数字**：KPI/token/分布以 K/M/B 缩写显示，hover 显示完整精确值；延迟 ms 与百分比不缩写。
+- **事件表**：含 model 列 + Cache% 列（输入 token 缓存命中率 `cached_read/input`，hover 显示绝对值）；行 hover 显示脱敏摘要浮窗（Esc/点击外部关闭）。
+- **v0.9.35 起统计口径**：仅对话端点（`chat/completions|v1/messages|v1/responses`）计入统计，非对话请求（`v1/models` 等）**彻底不计**（BREAKING，v0.9.34 及之前归 `other` 的口径废弃）；历史 `daily_agg`/`hourly_agg` 中 `other` 桶在滚动排出前仍含旧非对话数据，24h/7d/30d 对比建议以 1h 精确窗口为准。
 
 ### 鉴权与绑定
 
@@ -202,7 +208,9 @@ open http://127.0.0.1:8878/_admin/
 # API（JSON）
 curl -H "X-Admin-Token: $OBSERVABILITY_ADMIN_TOKEN" http://127.0.0.1:8878/_admin/health
 curl -H "X-Admin-Token: $OBSERVABILITY_ADMIN_TOKEN" "http://127.0.0.1:8878/_admin/metrics?range=24h"
-curl -H "X-Admin-Token: $OBSERVABILITY_ADMIN_TOKEN" "http://127.0.0.1:8878/_admin/events?verdict=deny"
+curl -H "X-Admin-Token: $OBSERVABILITY_ADMIN_TOKEN" "http://127.0.0.1:8878/_admin/metrics?range=24h&model=gpt-4o&upstream=8878"
+curl -H "X-Admin-Token: $OBSERVABILITY_ADMIN_TOKEN" "http://127.0.0.1:8878/_admin/series?range=24h"
+curl -H "X-Admin-Token: $OBSERVABILITY_ADMIN_TOKEN" "http://127.0.0.1:8878/_admin/events?upstream=8878&model=gpt-4o&limit=20"
 
 # SSE 实时流（query token 仅此处回退）
 curl -N "http://127.0.0.1:8878/_admin/events/stream?access_token=$OBSERVABILITY_ADMIN_TOKEN"

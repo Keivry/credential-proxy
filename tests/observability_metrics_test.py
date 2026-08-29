@@ -387,7 +387,7 @@ class TestCollectorCore:
                 upstream='8878',
                 status=200,
                 request_id='a',
-                verdict='allow',
+                model='gpt-4o',
                 tail='chat/completions',
             )
         )
@@ -396,11 +396,11 @@ class TestCollectorCore:
                 upstream='8879',
                 status=200,
                 request_id='b',
-                verdict='deny',
+                model='gpt-4o-mini',
                 tail='chat/completions',
             )
         )
-        evs = collector.events(verdict='deny')
+        evs = collector.events(model='gpt-4o-mini')
         assert len(evs) == 1
         assert evs[0]['request_id'] == 'b'
         evs = collector.events(upstream='8878')

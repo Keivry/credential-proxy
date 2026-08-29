@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-08-29
+goal: 修复 credential-proxy web 仪表盘 6 大问题：模型筛选只有全部、不能按上游筛选、详情改为 tooltip 式 popup、去掉
+  verdict 筛选/列、全区域自动刷新(15s)、历史折线图(1h 分钟级)、非对话请求不统计
