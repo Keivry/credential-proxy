@@ -177,6 +177,7 @@ get revoke --name "check-mail"
 - **人性化数字**：KPI/token/分布以 K/M/B 缩写显示，hover 显示完整精确值；延迟 ms 与百分比不缩写。
 - **事件表**：含 model 列 + Cache% 列（输入 token 缓存命中率 `cached_read/input`，hover 显示绝对值）；行 hover 显示脱敏摘要浮窗（Esc/点击外部关闭）。
 - **v0.9.35 起统计口径**：仅对话端点（`chat/completions|v1/messages|v1/responses`）计入统计，非对话请求（`v1/models` 等）**彻底不计**（BREAKING，v0.9.34 及之前归 `other` 的口径废弃）；历史 `daily_agg`/`hourly_agg` 中 `other` 桶在滚动排出前仍含旧非对话数据，24h/7d/30d 对比建议以 1h 精确窗口为准。
+- **模型筛选范围（Y-8 已知限制）**：`model=` 筛选在 1h 窗口精确（内存 ring 事件带 model 字段）；24h/7d/30d 为近似（DB 无按 model 分桶列，tokens 按 JSON 键存在性近似）。**重启后** 1h 视图仅显示重启以来的请求（ring 内存清空，DB 无 model 维度无法回填）——`is_precise=false` 时 model 视图可能为空属预期，切 24h/7d 看 DB 历史。
 
 ### 鉴权与绑定
 
@@ -352,6 +353,7 @@ cd get && make build  # → /tmp/get-credential-linux-amd64
 
 ## 版本历史
 
+- **v0.9.39** — 四维审查修复 20 项（v0.9.38 后续）：① **F-1 明文 PII 落盘**——`_metrics.py` 强化层 `_redact_extra_pii` 兜底 id_card（GB 校验位）/bank_card（Luhn）/ipv4/ipv6（保留段豁免），占位符区间排除防误伤，`redact_summary` 大文本预截断（limit×3+512）后脱敏性能约 2 倍；② **F-2 events?verdict 破坏性改参**——`_admin.py` 接受旧参数并标注 `verdict_deprecated`；③ Y-1 两处 `collector.flush()` 未 await 修复（RuntimeWarning 清零）；④ Y-2 `_RateLimiter` 双触发清扫（每 1000 次或距上次 >60s）+ SSE 断开 cleanup 接线；⑤ Y-3 Set-Cookie 非法字符拒绝签发（防 401 循环）；⑥ Y-4 `asyncio.Lock`→`threading.Lock` 跨线程互斥，8 个 `incr_sync_*` + `_snapshot`/`ring_stats`/`events` 加锁；⑦ Y-5 flush 去抖 `FLUSH_DEBOUNCE_S=2.0`（SSE 15s 风暴防锁 convoy），独立 `_last_flush_debounce_ts` 游标；⑧ Y-6 `_flush_loop` 异常保护不静默退出；⑨ Y-7 model 白名单含 `:` `@`（`gpt-4o:2024-08-06` 不再归 unknown_model）；⑩ Y-10 flush 先标后拍消除 ring_delta 双计/漏计窗口；⑪ Y-11 `is_chat_tail` 容忍一层自定义后缀；⑫ Y-12 `incr_sync_lru` 移出锁块；⑬ G-1~G-8 限流注释/重复导入/线程池回收/SSE 时钟回拨等清理；⑭ 新增 `tests/redact_extra_test.py` 14 用例（含确定性公网 IP 生成）
 - **v0.9.38** — 仪表盘体验修复 6 项（v0.9.37 后续）：① 上游筛选 PII 关联修复——`incr_sync_pii_detected`/`incr_sync_pii_cache` 改先累进请求 ContextVar（`incr_event` 按正确上游合并），`_token.py` 去掉双计调用，`_query_1h` 的 `_daily` 合并仅在 model_filter（`db_recent is None`）时执行消除 pii_by_type/tokens 双计；② 限流提示 banner 改工具栏上方 tooltip（3s 自动消失）；③ 折线图两侧留白（数据区起点 `pad+gap`，gap=26）；④ 24h 最左 x 标签 `anchor=start` 修复溢出、未来区最右 `anchor=end`；⑤ y 轴画竖线 + 刻度横线向左 tick + 标尺文字移到轴左侧（`anchor=end`）；⑥ 未来区刻度间距与数据区统一（共用 `labelEvery` 节奏）
 - **v0.9.37** — 仪表盘折线图/持久化修复 5 项：① 重启后 1h 折线图保留历史（`_series_1h` DB 小时兜底，ring 精确优先、DB 剩余量摊到空桶，守恒不双计）；② `_series_db` 桶 off-by-one 修复（24h/7d 缺最近 1 小时、30d 缺今天整天 → 含当前桶）；③ 折线图当前时间固定横轴 3/4 处、右侧 1/4 未来区留白；④ SVG 宽度响应式 + 7d hover 点抽稀；⑤ 事件 hover tooltip 错位修复（闭包捕获事件对象 + 真实鼠标坐标）
 - **v0.9.17** — 三层缓冲/keepalive/WHATWG 帧声明：共享 `utils/json_walk.py` 薄包装三处、Vault `next_available_index` 空洞跳过/`rand8=secrets.token_hex(4)`/`__PII_<seq>_<rand8>__`/`PII_FUZZY_RESTORE=0`（`re.IGNORECASE`）、流式 `byte_buf` WHATWG/`line_buf 16KB/30s`/`arg_buf 一次性 walk`/`keepalive 10s`/截断合成 `seen_global_terminal`、检测硬化 `PII_DETECTION_HARDENING=0/1` 总闸（`fc:/fd:` 精确前缀/ReDoS/CJK/`lru_cache(4)`）；新增 3 测试 + `sentinel_{chat,anthropic,responses}.jsonl`（`scripts/sentinel_record.py --check`）

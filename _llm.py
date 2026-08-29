@@ -184,12 +184,24 @@ _DEBUG_DIR = os.environ.get('CREDENTIAL_PROXY_DEBUG_DIR', '')
 def is_chat_tail(tail: str) -> bool:
     """判定对话类 LLM 接口尾（chat/completions | v1/messages | v1/responses）。
 
-    对 `tail.rstrip('/')` 后 endswith 判定，避免 `/v1/responses/` 漏判。
+    对 `tail.rstrip('/')` 后段级判定，避免 `/v1/responses/` 漏判。
+    容忍一层自定义后缀（`.../chat/completions/custom` 等中转自定义路径仍计对话）——
+    Y-11 修复：纯 endswith 会漏这类非标准但确为对话的端点。
     单一共享函数（19 处内联收敛），供埋点与协议分派共用。
     """
-    return tail.rstrip('/').endswith(
-        ('chat/completions', 'v1/messages', 'v1/responses')
-    )
+    t = tail.rstrip('/')
+    if t.endswith(('chat/completions', 'v1/messages', 'v1/responses')):
+        return True
+    # 一层自定义后缀容忍：父路径以已知对话端点结尾 + 仅一层子路径
+    # （如 /v1/chat/completions/custom → 合法；/v1/chat/completions/a/b → 两层，不判）
+    for known in ('chat/completions', 'v1/messages', 'v1/responses'):
+        marker = '/' + known + '/'
+        idx = t.rfind(marker)
+        if idx != -1:
+            suffix = t[idx + len(marker) :]
+            if suffix and '/' not in suffix:
+                return True
+    return False
 
 
 def _capture_usage_ctx(payload: str, metrics_ctx: dict, protocol: str) -> None:

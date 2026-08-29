@@ -79,7 +79,7 @@ class TestModelFilter:
                 tokens={'gpt-4o-mini': {'prompt': 20}},
             )
         )
-        collector.flush()
+        run(collector.flush())
         m = collector.query_range('24h', model_filter='gpt-4o')
         assert list(m['tokens'].keys()) == ['gpt-4o']
         assert m['tokens']['gpt-4o']['prompt'] == 10

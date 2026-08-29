@@ -1,9 +1,9 @@
 """嵌入式可观测性采集器（llm-observability-dashboard change）。
 
 MetricsCollector:
-- 单锁批递增（asyncio.Lock，锁内禁 await）: 每请求一次 `async with self._lock`
-  护住全部计数器 + recent_events.append。
-- 有界 queue.Queue(maxsize=5)（线程安全）+ ThreadPoolExecutor(metrics-writer)
+- 单锁批递增（threading.Lock，锁内禁 await/IO）: 每请求一次 `with self._lock`
+  护住全部计数器 + recent_events.append（Y-4：跨线程互斥，asyncio.Lock 只协作协程）。
+- 有界 queue.Queue(maxsize=512)（线程安全）+ ThreadPoolExecutor(metrics-writer)
   单写者串行覆盖式 UPSERT（INSERT ... ON CONFLICT DO UPDATE SET col=excluded.col）。
 - 固定 12 桶 LATENCY_BUCKETS 二分命中，p95 用独立 p95-worker executor 不与写盘排队。
 - WAL + busy_timeout=5000 + synchronous=NORMAL + user_version=1，文件 0600。
@@ -61,6 +61,9 @@ BUILTIN_KINDS = {
 
 RING_MAXLEN = 10000
 FLUSH_INTERVAL_S = 300  # 5min
+FLUSH_DEBOUNCE_S = (
+    2.0  # Y-5：查询路径同步 flush 去抖（SSE 15s 风暴防 _sqlite_lock convoy）
+)
 # 有界队列上限：单 upstream 满 30d+168h 时 _snapshot 产出 198 条快照，
 # 128 会固定丢最老 70 条；512 覆盖单 U 198 + 多 U 积压余量
 # （flush 后立即 _drain_async 消费，队列主要缓冲单次 flush 积压）
@@ -204,6 +207,56 @@ _PHONE_RE = _re.compile(
     r'(?<!\d)(?:(?:86|\+86)[- ]?)?(?:1[3-9]\d{9}|'
     r'1[3-9]\d[- ]?\d{4}[- ]?\d{4})(?!\d)'
 )
+# 强化层：id_card/bank_card/ipv4/ipv6 明文兜底（复用 _pii.py 校验防误伤）。
+# 仅延迟 import（_pii 在函数内 import _metrics，避免循环）；导入/执行失败 fail-open。
+_EXTRA_KINDS = ('id_card', 'bank_card', 'ipv4', 'ipv6')
+
+
+def _redact_extra_pii(out: str) -> str:
+    """对 id_card/bank_card/ipv4/ipv6 明文做校验后替换（无校验直接替换会误伤数字串）。
+
+    复用 _pii.py 的联合正则与校验回调：
+    - id_card 18 位校验位（GB 11643-1999）
+    - bank_card Luhn 校验 + URL 查询参数防误报
+    - ipv4/ipv6 保留段豁免
+    """
+    try:
+        from _pii import (  # 延迟导入避免循环依赖
+            _COMBINED_RE,
+            _URL_QUERY_PARAM_RE,
+            _id_card_ok,
+            _is_reserved_ip,
+            _luhn_ok,
+        )
+
+        # 占位符区间排除：__PII_*__/__VG_CRED_*__ 内部数字可能被 bank_card 误命中
+        protected_spans: list[tuple[int, int]] = [
+            (m.start(), m.end())
+            for m in _re.finditer(r'__VG_CRED_\d{4,}__|__PII_\d+_[0-9a-fA-F]{8}__', out)
+        ]
+
+        def _overlaps(start: int, end: int) -> bool:
+            return any(s <= start < e or s < end <= e for s, e in protected_spans)
+
+        for m in _COMBINED_RE.finditer(out):
+            kind = m.lastgroup
+            if kind not in _EXTRA_KINDS:
+                continue
+            if _overlaps(m.start(), m.end()):
+                continue
+            value = m.group(0)
+            if kind == 'bank_card' and _URL_QUERY_PARAM_RE.search(value):
+                continue
+            if kind == 'id_card' and not _id_card_ok(value):
+                continue
+            if kind == 'bank_card' and not _luhn_ok(value):
+                continue
+            if kind in ('ipv4', 'ipv6') and _is_reserved_ip(value, kind):
+                continue
+            out = out.replace(value, f'[REDACTED:{kind}]')
+    except Exception:  # fail-open：脱敏兜底层异常不阻断摘要生成
+        pass
+    return out
 
 
 def redact_summary(raw: str, limit: int = 120) -> str:
@@ -211,16 +264,23 @@ def redact_summary(raw: str, limit: int = 120) -> str:
 
     - 替换内部 token 形态为 [REDACTED:token]
     - 替换 sk-/xox 密钥形态与 email 为 [REDACTED:key]/[REDACTED:email]
+    - 强化层：id_card/bank_card/ipv4/ipv6（复用 _pii.py 校验回调）
+    - 大文本先预截断（limit×3+512 安全余量）再脱敏，避免全量正则扫描热路径
     - 截断边界半字符保护：绝不切断多字节字符（Python str 按码点切片天然安全）
     """
     if not raw:
         return ''
+    # 预截断：脱敏替换会变长（如 [REDACTED:bank_card] 16 字符），
+    # 余量保证截断窗口内敏感值完整可识别；小文本直接全量走
+    if len(raw) > limit * 3 + 512:
+        raw = raw[: limit * 3 + 512]
     out = _PII_TOKEN_RE.sub('[REDACTED:token]', raw)
     # _CRED_TOKEN_RE 已被 _PII_TOKEN_RE 覆盖（__VG_CRED_\d{4,}__ 是后者的子集），
     # 删除冗余 sub 避免死分支（保留正则定义供诊断/测试引用）
     out = _API_KEY_RE.sub('[REDACTED:key]', out)
     out = _EMAIL_RE.sub('[REDACTED:email]', out)
     out = _PHONE_RE.sub('[REDACTED:phone]', out)
+    out = _redact_extra_pii(out)
     if len(out) <= limit:
         return out
     # 截断边界半字符保护：Python 按码点切片天然不产生半字符，直接截断
@@ -400,7 +460,12 @@ class MetricsCollector:
     def __init__(self, data_dir: str):
         self.data_dir = data_dir
         self.db_path = os.path.join(data_dir, DB_FILE)
-        self._lock = asyncio.Lock()
+        # 数据锁：threading.Lock 保护 _daily/_hourly/recent_events 跨线程访问。
+        # incr_event/incr_sync_*（事件循环线程）与 _snapshot/_flush_sync/_query_*
+        # （to_thread/executor worker 线程）必须真正互斥——asyncio.Lock 只协作
+        # 协程、对跨线程无效（Y-4 修复：asyncio.Lock → threading.Lock）。
+        # 锁内禁 await/禁 IO（纯内存累加，<20µs）。
+        self._lock = threading.Lock()
         # 进程级聚合计数（请求级 + LRU 级）
         self.counters: dict[str, Any] = {}
         self.recent_events: deque[dict[str, Any]] = deque(maxlen=RING_MAXLEN)
@@ -425,6 +490,9 @@ class MetricsCollector:
         self._first_dropped_ts: float | None = None
         self._last_dropped_ts: float | None = None
         self._last_flush_ts = _utc_now()
+        # Y-5 去抖专用游标：初始 0（从未 flush），与 _last_flush_ts（health age）分离——
+        # _last_flush_ts 构造时设为 now 表示「刚 flush 过」防 age 虚高，但去抖必须从 0 开始
+        self._last_flush_debounce_ts = 0.0
         self._conn: sqlite3.Connection | None = None
         # SQLite 连接不是线程安全的：writer 线程池与主线程查询路径（_flush_sync）
         # 共用 self._conn，必须用 threading.Lock 串行化所有 execute/commit
@@ -631,7 +699,9 @@ class MetricsCollector:
         if not self._sqlite_ok or self._conn is None:
             return
         try:
-            with self._sqlite_lock:  # 串行化 self._conn：writer 线程 vs 主线程 _flush_sync
+            with (
+                self._sqlite_lock
+            ):  # 串行化 self._conn：writer 线程 vs 主线程 _flush_sync
                 day = snapshot.get('date', '')
                 hour = snapshot.get('hour', '')
                 upstream = snapshot.get('upstream', 'other')
@@ -672,7 +742,9 @@ class MetricsCollector:
                         (
                             day,
                             upstream,
-                            json.dumps(snapshot.get('pii_by_type', {}), ensure_ascii=False),
+                            json.dumps(
+                                snapshot.get('pii_by_type', {}), ensure_ascii=False
+                            ),
                             snapshot.get('pii_hits', 0),
                             snapshot.get('pii_miss', 0),
                             snapshot.get('pii_requests', 0),
@@ -682,7 +754,8 @@ class MetricsCollector:
                             snapshot.get('pii_lru_evictions', 0),
                             snapshot.get('requests', 0),
                             json.dumps(
-                                snapshot.get('requests_by_status', {}), ensure_ascii=False
+                                snapshot.get('requests_by_status', {}),
+                                ensure_ascii=False,
                             ),
                             json.dumps(snapshot.get('tokens', {}), ensure_ascii=False),
                             json.dumps(
@@ -727,13 +800,16 @@ class MetricsCollector:
                             upstream,
                             snapshot.get('requests', 0),
                             json.dumps(
-                                snapshot.get('requests_by_status', {}), ensure_ascii=False
+                                snapshot.get('requests_by_status', {}),
+                                ensure_ascii=False,
                             ),
                             json.dumps(snapshot.get('tokens', {}), ensure_ascii=False),
                             json.dumps(
                                 snapshot.get('latency_buckets', {}), ensure_ascii=False
                             ),
-                            json.dumps(snapshot.get('pii_by_type', {}), ensure_ascii=False),
+                            json.dumps(
+                                snapshot.get('pii_by_type', {}), ensure_ascii=False
+                            ),
                             snapshot.get('pii_hits', 0),
                             snapshot.get('pii_miss', 0),
                             snapshot.get('pii_requests', 0),
@@ -748,15 +824,17 @@ class MetricsCollector:
             self._handle_write_error(e)
 
     def _handle_write_error(self, e: Exception) -> None:
+        # G-7：health.sqlite_error 只暴露错误类型（不存 str(e) 全文，防内部路径泄漏）
+        err_cls = type(e).__name__
         if isinstance(e, OSError) and getattr(e, 'errno', None) == 28:
             self._sqlite_ok = False
-            self._sqlite_error = str(e)[:200]
+            self._sqlite_error = f'ENOSPC ({err_cls})'
             logger.error('metrics.sqlite ENOSPC，降级内存-only: %s', e)
         elif isinstance(e, sqlite3.OperationalError) and (
             'disk I/O error' in str(e) or 'database or disk is full' in str(e)
         ):
             self._sqlite_ok = False
-            self._sqlite_error = str(e)[:200]
+            self._sqlite_error = f'disk_io ({err_cls})'
             logger.error('metrics.sqlite 磁盘错误，降级内存-only: %s', e)
         else:
             logger.warning('metrics.sqlite 写入失败: %s', e)
@@ -779,14 +857,15 @@ class MetricsCollector:
 
     def _snapshot(self, now: float) -> list[dict[str, Any]]:
         """深拷贝当前累计 → 按 (date,upstream)/(hour,upstream) 键拆快照。"""
-        out: list[dict[str, Any]] = []
-        for (date, up), agg in list(self._daily.items()):
-            s = {'date': date, 'upstream': up, **_deep_copy_snapshot(agg).to_dict()}
-            out.append(s)
-        for (hour, up), hagg in list(self._hourly.items()):
-            s = {'hour': hour, 'upstream': up, **_copy_hourly(hagg).to_dict()}
-            out.append(s)
-        self._trim_memory(now)
+        with self._lock:  # Y-4：与 incr_event/incr_sync_* 跨线程互斥
+            out: list[dict[str, Any]] = []
+            for (date, up), agg in list(self._daily.items()):
+                s = {'date': date, 'upstream': up, **_deep_copy_snapshot(agg).to_dict()}
+                out.append(s)
+            for (hour, up), hagg in list(self._hourly.items()):
+                s = {'hour': hour, 'upstream': up, **_copy_hourly(hagg).to_dict()}
+                out.append(s)
+            self._trim_memory(now)
         return out
 
     def _trim_memory(self, now: float) -> None:
@@ -876,15 +955,16 @@ class MetricsCollector:
                     cred_hits = _ctx_pii.get('cred_hits', 0)
                 if cred_miss == 0:
                     cred_miss = _ctx_pii.get('cred_miss', 0)
-                for k, v in (_ctx_pii.get('pii_by_type') or{}).items():
+                for k, v in (_ctx_pii.get('pii_by_type') or {}).items():
                     delta_pii[k] = delta_pii.get(k, 0) + v
         # model 白名单/截断（防属性注入/超长；非法则归 unknown_model）
-        if not _re.fullmatch(r'[A-Za-z0-9._/\-]{1,64}', model or ''):
+        # 含 `:`（OpenAI 版本号 gpt-4o:2024-08-06）——Y-7 修复防分桶坍塌
+        if not _re.fullmatch(r'[A-Za-z0-9._/:@\-]{1,64}', model or ''):
             model = 'unknown_model'
         # 锁外做脱敏（5 个正则替换，避免占用全局锁）
         summary_redacted = redact_summary(raw_summary, 120) if raw_summary else ''
 
-        async with self._lock:
+        with self._lock:
             d = self._daily.setdefault((day, d_up), _DailyAgg())
             h = self._hourly.setdefault((hour, d_up), _HourlyAgg())
             d.requests += 1
@@ -982,7 +1062,7 @@ class MetricsCollector:
         now = _utc_now()
         day = _day_key(now)
         hour = _hour_key(now)
-        async with self._lock:
+        with self._lock:
             d = self._daily.setdefault((day, 'other'), _DailyAgg())
             h = self._hourly.setdefault((hour, 'other'), _HourlyAgg())
             d.cred_lru_evictions += cred
@@ -993,33 +1073,33 @@ class MetricsCollector:
     async def incr_placeholder_injected(self) -> None:
         now = _utc_now()
         day = _day_key(now)
-        async with self._lock:
+        with self._lock:
             d = self._daily.setdefault((day, 'other'), _DailyAgg())
             d.placeholder_prompt_injected += 1
 
     async def incr_truncated(self) -> None:
         now = _utc_now()
         day = _day_key(now)
-        async with self._lock:
+        with self._lock:
             d = self._daily.setdefault((day, 'other'), _DailyAgg())
             d.truncated_total += 1
 
     async def incr_audit_log_write_fail(self) -> None:
         """audit_log_write_fail 计数（内存 gauge，不进聚合）。"""
-        async with self._lock:
+        with self._lock:
             self.counters['audit_log_write_fail'] = (
                 self.counters.get('audit_log_write_fail', 0) + 1
             )
 
     async def incr_audit_approval_result(self, result: str) -> None:
         """审批结果分布 audit_approval_result（内存计数，重启归零）。"""
-        async with self._lock:
+        with self._lock:
             cur = self.counters.setdefault('audit_approval_result', {})
             cur[result] = cur.get(result, 0) + 1
 
     async def set_audit_pending_gauge(self, pending: int, overflows: int = 0) -> None:
         """audit_pending_total / audit_hold_overflows 内存 gauge（瞬态）。"""
-        async with self._lock:
+        with self._lock:
             self.counters['audit_pending_total'] = pending
             if overflows:
                 self.counters['audit_hold_overflows'] = overflows
@@ -1055,8 +1135,11 @@ class MetricsCollector:
             # 内存模式（无 DB）：不更新 last_flush —— ring 增量仍有效（_query_1h 依赖）
             return
         now = _utc_now()
-        snapshot = self._snapshot(now)
+        # Y-10 先标后拍：先标记 last_flush 再 snapshot——查询读到 last_flush 后，
+        # ring_delta 取 ts>=last_flush 的事件（snapshot 之后新增，未落盘）与 DB 互补不双计；
+        # 若 snapshot 在前标记在后，查询可能看到「旧 last_flush + 新 snapshot 已含事件」→ 双计。
         self._last_flush_ts = now
+        snapshot = self._snapshot(now)
         if snapshot:
             self._enqueue(snapshot)
 
@@ -1066,20 +1149,31 @@ class MetricsCollector:
             # 内存模式（无 DB）：不更新 last_flush —— ring 增量仍有效（_query_1h 依赖）
             return
         now = _utc_now()
-        snapshot = self._snapshot(now)
+        # Y-5 去抖：SSE 每 15s 推 3 次 metrics/series/health，都会触发查询前 flush。
+        # 2s 内重复 flush 无意义（数据最多旧 2s），跳过避免 _sqlite_lock convoy。
+        # 用独立 debounce 游标（初始 0），与 _last_flush_ts（health age，构造时=now）分离
+        if now - self._last_flush_debounce_ts < FLUSH_DEBOUNCE_S:
+            return
+        # Y-10 先标后拍（见 flush 注释）
         self._last_flush_ts = now
+        self._last_flush_debounce_ts = now
+        snapshot = self._snapshot(now)
         for s in snapshot:
             self._write_flush(s)
 
     async def _flush_loop(self) -> None:
-        try:
-            while True:
-                await asyncio.sleep(FLUSH_INTERVAL_S)
+        while True:
+            await asyncio.sleep(FLUSH_INTERVAL_S)
+            try:
                 await self.flush()
                 # 立即消费队列（单写者 executor 串行写盘）——避免有界队列只入不出的断流
                 await self._drain_async()
-        except asyncio.CancelledError:
-            pass
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Y-6：flush 异常（如 _snapshot 内 json 序列化失败）不能静默终止定时循环。
+                # 记录并继续下一轮；连续失败由 logger.error 频率体现。
+                logger.exception('定时 flush 异常（已跳过本轮）')
 
     async def _drain_async(self) -> None:
         """把队列中的快照交给单写者线程写盘（背压保留：队列仍是有界的）。"""
@@ -1108,12 +1202,20 @@ class MetricsCollector:
         可选按 upstream/model 过滤（1h 窗口查询带筛选时用）。
         """
         now = _utc_now()
-        evs = [
-            e
-            for e in self.recent_events
-            if (upstream_filter is None or e.get('upstream') == upstream_filter)
-            and (model_filter is None or e.get('model') == model_filter)
-        ]
+        with self._lock:  # Y-4：p95 executor 线程读 recent_events 与主线程 append 互斥
+            evs = [
+                e
+                for e in self.recent_events
+                if (upstream_filter is None or e.get('upstream') == upstream_filter)
+                and (model_filter is None or e.get('model') == model_filter)
+            ]
+            if evs:
+                oldest_ts = evs[0]['ts']
+                coverage = now - oldest_ts
+                lat = [e['latency_ms'] for e in evs if e.get('latency_ms') is not None]
+            else:
+                coverage = 0.0
+                lat = []
         if not evs:
             return {
                 'ring_len': len(evs),
@@ -1122,9 +1224,6 @@ class MetricsCollector:
                 'p95': None,
                 'p50': None,
             }
-        oldest_ts = evs[0]['ts']
-        coverage = now - oldest_ts
-        lat = [e['latency_ms'] for e in evs if e.get('latency_ms') is not None]
         precise = coverage >= 3600 and len(lat) >= 100
         p95 = p50 = None
         if lat:
@@ -1727,16 +1826,17 @@ class MetricsCollector:
         逆序扫描早停即可取最新 limit 条，无需全量拷贝+排序（SSE 每 2s 调用）。
         """
         out: list[dict[str, Any]] = []
-        for e in reversed(self.recent_events):
-            if upstream and e['upstream'] != upstream:
-                continue
-            if model and e.get('model') != model:
-                continue
-            if kind and kind not in e.get('summary', ''):
-                continue
-            out.append(e)
-            if len(out) >= limit:
-                break
+        with self._lock:  # Y-4：读 recent_events 与 append 互斥
+            for e in reversed(self.recent_events):
+                if upstream and e['upstream'] != upstream:
+                    continue
+                if model and e.get('model') != model:
+                    continue
+                if kind and kind not in e.get('summary', ''):
+                    continue
+                out.append(e)
+                if len(out) >= limit:
+                    break
         return out
 
     # ── series 时间桶序列 ──
@@ -1834,7 +1934,7 @@ class MetricsCollector:
                 b['cached_read'] += u.get('cached_read', 0) or 0
             lat = e.get('latency_ms')
             if lat is not None:
-                lat_by_min.setdefault(idx,[]).append(lat)
+                lat_by_min.setdefault(idx, []).append(lat)
         for idx, lats in lat_by_min.items():
             if lats:
                 buckets[idx]['p95'] = sorted(lats)[
@@ -2075,16 +2175,16 @@ class MetricsCollector:
         """同步 LRU 淘汰递增（无事件循环环境；直接写内存累计）。"""
 
         def _do() -> None:
-            now = _utc_now()
-            day = _day_key(now)
-            hour = _hour_key(now)
-            # 事件循环单线程中同步调用不会并发 → 直接改（无 await）
-            d = self._daily.setdefault((day, 'other'), _DailyAgg())
-            h = self._hourly.setdefault((hour, 'other'), _HourlyAgg())
-            d.cred_lru_evictions += cred
-            d.pii_lru_evictions += pii
-            h.cred_lru_evictions += cred
-            h.pii_lru_evictions += pii
+            with self._lock:  # Y-4：跨线程互斥
+                now = _utc_now()
+                day = _day_key(now)
+                hour = _hour_key(now)
+                d = self._daily.setdefault((day, 'other'), _DailyAgg())
+                h = self._hourly.setdefault((hour, 'other'), _HourlyAgg())
+                d.cred_lru_evictions += cred
+                d.pii_lru_evictions += pii
+                h.cred_lru_evictions += cred
+                h.pii_lru_evictions += pii
 
         self._sync_fail_open(_do)
 
@@ -2096,15 +2196,16 @@ class MetricsCollector:
         """
 
         def _do() -> None:
-            if accumulate_pii_cache(hit, miss):
-                return  # 已进 ctx，incr_event 合并到正确上游
-            now = _utc_now()
-            d = self._daily.setdefault((_day_key(now), 'other'), _DailyAgg())
-            h = self._hourly.setdefault((_hour_key(now), 'other'), _HourlyAgg())
-            d.pii_hits += hit
-            d.pii_miss += miss
-            h.pii_hits += hit
-            h.pii_miss += miss
+            with self._lock:  # Y-4：跨线程互斥
+                if accumulate_pii_cache(hit, miss):
+                    return  # 已进 ctx，incr_event 合并到正确上游
+                now = _utc_now()
+                d = self._daily.setdefault((_day_key(now), 'other'), _DailyAgg())
+                h = self._hourly.setdefault((_hour_key(now), 'other'), _HourlyAgg())
+                d.pii_hits += hit
+                d.pii_miss += miss
+                h.pii_hits += hit
+                h.pii_miss += miss
 
         self._sync_fail_open(_do)
 
@@ -2116,14 +2217,15 @@ class MetricsCollector:
         """
 
         def _do() -> None:
-            if accumulate_pii_detected(by_kind):
-                return  # 已进 ctx，incr_event 合并到正确上游
-            now = _utc_now()
-            d = self._daily.setdefault((_day_key(now), 'other'), _DailyAgg())
-            h = self._hourly.setdefault((_hour_key(now), 'other'), _HourlyAgg())
-            for kind, n in by_kind.items():
-                d.pii_by_type[kind] = d.pii_by_type.get(kind, 0) + n
-                h.pii_by_type[kind] = h.pii_by_type.get(kind, 0) + n
+            with self._lock:  # Y-4：跨线程互斥
+                if accumulate_pii_detected(by_kind):
+                    return  # 已进 ctx，incr_event 合并到正确上游
+                now = _utc_now()
+                d = self._daily.setdefault((_day_key(now), 'other'), _DailyAgg())
+                h = self._hourly.setdefault((_hour_key(now), 'other'), _HourlyAgg())
+                for kind, n in by_kind.items():
+                    d.pii_by_type[kind] = d.pii_by_type.get(kind, 0) + n
+                    h.pii_by_type[kind] = h.pii_by_type.get(kind, 0) + n
 
         self._sync_fail_open(_do)
 
@@ -2131,10 +2233,11 @@ class MetricsCollector:
         """同步 placeholder_prompt_injected_total 递增（注入发生与否）。"""
 
         def _do() -> None:
-            now = _utc_now()
-            day = _day_key(now)
-            d = self._daily.setdefault((day, 'other'), _DailyAgg())
-            d.placeholder_prompt_injected += 1
+            with self._lock:  # Y-4：跨线程互斥
+                now = _utc_now()
+                day = _day_key(now)
+                d = self._daily.setdefault((day, 'other'), _DailyAgg())
+                d.placeholder_prompt_injected += 1
 
         self._sync_fail_open(_do)
 
@@ -2142,11 +2245,12 @@ class MetricsCollector:
         """同步 cred_hit/miss 递增（_register_secret 钩子调用）。"""
 
         def _do() -> None:
-            now = _utc_now()
-            day = _day_key(now)
-            d = self._daily.setdefault((day, 'other'), _DailyAgg())
-            d.cred_hits += hit
-            d.cred_miss += miss
+            with self._lock:  # Y-4：跨线程互斥
+                now = _utc_now()
+                day = _day_key(now)
+                d = self._daily.setdefault((day, 'other'), _DailyAgg())
+                d.cred_hits += hit
+                d.cred_miss += miss
 
         self._sync_fail_open(_do)
 
@@ -2154,12 +2258,13 @@ class MetricsCollector:
         """同步 audit_by_verdict / audit_by_rule 递增（audit_tool_call 钩子）。"""
 
         def _do() -> None:
-            now = _utc_now()
-            day = _day_key(now)
-            d = self._daily.setdefault((day, 'other'), _DailyAgg())
-            d.audit_by_verdict[verdict] = d.audit_by_verdict.get(verdict, 0) + 1
-            if rule:
-                d.audit_by_rule[rule] = d.audit_by_rule.get(rule, 0) + 1
+            with self._lock:  # Y-4：跨线程互斥
+                now = _utc_now()
+                day = _day_key(now)
+                d = self._daily.setdefault((day, 'other'), _DailyAgg())
+                d.audit_by_verdict[verdict] = d.audit_by_verdict.get(verdict, 0) + 1
+                if rule:
+                    d.audit_by_rule[rule] = d.audit_by_rule.get(rule, 0) + 1
 
         self._sync_fail_open(_do)
 
@@ -2167,9 +2272,10 @@ class MetricsCollector:
         """同步 audit_log_write_fail 计数（内存 gauge，不进聚合）。"""
 
         def _do() -> None:
-            self.counters['audit_log_write_fail'] = (
-                self.counters.get('audit_log_write_fail', 0) + 1
-            )
+            with self._lock:  # Y-4：跨线程互斥
+                self.counters['audit_log_write_fail'] = (
+                    self.counters.get('audit_log_write_fail', 0) + 1
+                )
 
         self._sync_fail_open(_do)
 
@@ -2177,8 +2283,9 @@ class MetricsCollector:
         """同步 audit_approval_result 分布（内存计数，重启归零）。"""
 
         def _do() -> None:
-            cur = self.counters.setdefault('audit_approval_result', {})
-            cur[result] = cur.get(result, 0) + 1
+            with self._lock:  # Y-4：跨线程互斥
+                cur = self.counters.setdefault('audit_approval_result', {})
+                cur[result] = cur.get(result, 0) + 1
 
         self._sync_fail_open(_do)
 

@@ -26,3 +26,15 @@ class TestIsChatTail:
         # rstrip('/') 后仍判定对话
         assert is_chat_tail('/v1/responses/') is True
         assert is_chat_tail('/v1/chat/completions/') is True
+
+    def test_one_level_custom_suffix(self):
+        # Y-11：一层自定义后缀仍计对话（中转自定义路径）
+        assert is_chat_tail('/v1/chat/completions/custom') is True
+        assert is_chat_tail('/v1/chat/completions/custom/') is True
+        assert is_chat_tail('/v1/messages/ext') is True
+        assert is_chat_tail('/v1/responses/extra') is True
+
+    def test_two_level_suffix_not_chat(self):
+        # Y-11：两层及以上后缀不判对话（防误统计非对话端点）
+        assert is_chat_tail('/v1/chat/completions/a/b') is False
+        assert is_chat_tail('/v1/chat/completionsx') is False

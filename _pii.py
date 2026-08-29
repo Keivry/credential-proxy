@@ -564,6 +564,10 @@ class PiiDetector:
             max_workers=PII_RE_DOS_MAX_WORKERS,
             thread_name_prefix='pii-re',
         )
+        # G-6：进程退出时回收线程池（否则非 daemon 线程阻塞退出/泄漏）
+        import atexit as _atexit
+
+        _atexit.register(self._executor.shutdown, wait=False, cancel_futures=True)
         # 字典 recognizer
         self.dict_entries: list[tuple[str, str]] = []  # (name, type)
         self.dict_ver = 0

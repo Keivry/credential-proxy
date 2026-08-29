@@ -1,7 +1,7 @@
 services:
   credential-proxy:
     build: .
-    image: ghcr.io/keivry/credential-proxy:0.9.38
+    image: ghcr.io/keivry/credential-proxy:0.9.39
     container_name: credential-proxy
     restart: unless-stopped
     cap_add:

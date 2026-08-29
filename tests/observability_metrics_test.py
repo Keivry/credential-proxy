@@ -437,7 +437,8 @@ class TestCollectorCore:
     def test_lock_no_await(self):
         src = Path(__file__).parent.parent / '_metrics.py'
         s = src.read_text()
-        idx = s.index('async with self._lock')
+        # Y-4：asyncio.Lock → threading.Lock（跨线程互斥），锁内仍禁 await/IO
+        idx = s.index('with self._lock')
         assert 'await' not in s[idx : idx + 300]
 
     def test_p95_worker_independent(self):

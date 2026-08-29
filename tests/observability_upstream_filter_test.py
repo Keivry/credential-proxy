@@ -53,7 +53,7 @@ class TestUpstreamFilter:
                 upstream='8879', status=200, request_id='b', tail='chat/completions'
             )
         )
-        collector.flush()
+        run(collector.flush())
         m = collector.query_range('24h', upstream_filter='8878')
         assert m['requests'] == 1
 

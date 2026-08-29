@@ -6,7 +6,7 @@
   > `?access_token`（仅 SSE 回退）
 - `OBSERVABILITY_ADMIN_TOKEN` 必填（未设 SystemExit），`hmac.compare_digest`
   时序安全比较，与其它 Token 独立（空值短路交叉检查）
-- 管理接口 `10/min/IP` 限流 + SSE `5/IP` + `60s :ping` + `5min` 强制断开
+- 管理接口 `60/min/IP` 限流 + SSE `5/IP` + `60s :ping` + `5min` 强制断开
 - `trust_proxy_headers=false` 不读代理头；`_is_loopback` 精确回环判定
 """
 
@@ -40,7 +40,7 @@ _NO_STORE_HEADERS = {
 }
 
 # 管理接口限流：60/min/IP（防坏 token 爆破；Dashboard 刷新+轮询正常交互不受限）
-# 10/min 会被「刷新页面 → health+metrics+events 多个请求」几次耗尽 → 429 误伤
+# 60/min 不会被「刷新页面 → health+metrics+events 多个请求」几次耗尽 → 429 误伤
 _RATE_LIMIT_MIN = 60
 _RATE_WINDOW_S = 60
 # SSE 限流：5 concurrent/IP + 60s ping + 5min 强制断开
@@ -152,19 +152,22 @@ def _is_loopback(remote: str) -> bool:
 
 
 class _RateLimiter:
-    """滑动窗口限流（10/min/IP）。on_disconnect 清理计数器防泄漏。"""
+    """滑动窗口限流（60/min/IP）。cleanup 在请求结束/连接断开时调用防泄漏。"""
 
     def __init__(self, limit: int = _RATE_LIMIT_MIN, window_s: int = _RATE_WINDOW_S):
         self.limit = limit
         self.window_s = window_s
         self._hits: dict[str, list[float]] = {}
         self._calls = 0
+        self._last_sweep = 0.0
 
     def allow(self, key: str) -> tuple[bool, int]:
         now = _time.time()
-        # 惰性清扫：每 1000 次调用清一次过期 key，防 IP 轮转/扫描器撑爆字典（防御性）
+        # 惰性清扫：每 1000 次调用或距上次清扫 >60s 时清一次过期 key。
+        # 双触发防「扫描器/IP 轮转 <1000 次永不触发」的内存残留。
         self._calls += 1
-        if self._calls % 1000 == 0:
+        if self._calls % 1000 == 0 or now - self._last_sweep > self.window_s:
+            self._last_sweep = now
             cutoff = now - self.window_s
             for k in [k for k, v in self._hits.items() if not v or v[-1] < cutoff]:
                 self._hits.pop(k, None)
@@ -226,9 +229,8 @@ def init_observability(app: web.Application, collector) -> None:
         admin_html_bytes = admin_html_path.read_bytes()
     html_etag = None
     if admin_html_bytes is not None:
-        import hashlib as _hl
-
-        html_etag = f'"{_hl.md5(admin_html_bytes).hexdigest()[:16]}"'
+        # G-2：复用模块级 hashlib（函数内重复导入已移除）
+        html_etag = f'"{hashlib.md5(admin_html_bytes).hexdigest()[:16]}"'
 
     rate = _RateLimiter()
     sse_reg = _SseRegistry()
@@ -265,14 +267,14 @@ def init_observability(app: web.Application, collector) -> None:
         if not path.startswith(_ADMIN_PATH_PREFIX):
             return web.Response(status=404)
 
-        # 管理接口 10/min/IP 限流（IP 维度，鉴权前计数——防坏 token 爆破）
+        # 管理接口 60/min/IP 限流（IP 维度，鉴权前计数——防坏 token 爆破）
         # 空/None remote 归一为 'unknown' 单列桶，防全局坍缩
         # /_admin/health 豁免限流：前端每次刷新 initAuth 必打，且 token 等长
-        # sha256 比较极廉价；限流 10/min 会被几次刷新耗尽 → 429 被前端误判为未登录
+        # sha256 比较极廉价；限流 60/min 不会被正常刷新耗尽 → 429 被前端误判为未登录
         remote = request.remote or 'unknown'
         # 回环免 token（仅 ENV==dev && ALLOW_LOOPBACK_NO_TOKEN==1 && GET）
         # spec：Docker/反代下回环不可靠，仅 dev 调试时精确回环放行 + warning
-        # 判定先于限流：dev 回环合法请求不计入 10/min 桶（防 dev 自锁）
+        # 判定先于限流：dev 回环合法请求不计入 60/min 桶（防 dev 自锁）
         is_loopback_grace = (
             os.environ.get('ENV', 'prod') == 'dev'
             and os.environ.get('ALLOW_LOOPBACK_NO_TOKEN') == '1'
@@ -326,7 +328,15 @@ def init_observability(app: web.Application, collector) -> None:
         if cookie_src and path != '/_admin/events/stream':
             # tok 收紧为 RFC6265 cookie-octet 安全子集（排除 ; , = 空格等分隔符，
             # 防 Set-Cookie 属性注入；比前轮的 [^\x21-\x7E] 更严）
-            cookie_val = re.sub(r'[^A-Za-z0-9._~+/=-]', '', tok)
+            # ⚠️ 不静默截断：截断后 Cookie 值 ≠ 真实 token → 后续请求必 401 且无日志
+            # （Y-3 修复：token 含非法 cookie-octet 字符时拒绝签发 + 明确提示）
+            if re.search(r'[^A-Za-z0-9._~+/=-]', tok):
+                logger.warning(
+                    '拒绝签发 Cookie：X-Admin-Token 含非法 cookie-octet 字符'
+                    '（建议用 openssl rand -hex 32 生成 token）'
+                )
+                return _unauthorized()
+            cookie_val = tok
             # __Host- 前缀要求 Secure + Path=/（且仅 HTTPS 可用）；回退 admin_token 兼容 http
             scheme = request.scheme
             if scheme == 'https':
@@ -343,7 +353,7 @@ def init_observability(app: web.Application, collector) -> None:
                     + '; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600'
                 )
 
-        # ⑦ 管理接口 10/min/IP 限流（已在鉴权前计数；此处仅 SSE 并发限流）
+        # ⑦ 管理接口 60/min/IP 限流（已在鉴权前计数；此处仅 SSE 并发限流）
         if path == '/_admin/events/stream':
             if not sse_reg.try_acquire(remote):
                 return _too_many(retry_after=60)
@@ -351,6 +361,8 @@ def init_observability(app: web.Application, collector) -> None:
                 return await _handle_sse(request, collector)
             finally:
                 sse_reg.release(remote)
+                # SSE 长连接断开即清理该 IP 限流计数（连接期间无新请求，窗口内计数无意义）
+                rate.cleanup(remote)
         else:
             if path == '/_admin/metrics':
                 resp = await _handle_metrics(request, collector)
@@ -432,7 +444,11 @@ async def _handle_series(request: web.Request, collector) -> web.Response:
 
 
 def _handle_events(request: web.Request, collector) -> web.Response:
-    """GET /_admin/events?limit&kind&upstream&model。"""
+    """GET /_admin/events?limit&kind&upstream&model。
+
+    `verdict` 参数已废弃（v0.9.35 起事件不再携带 verdict 字段，改按 model 筛选）。
+    为兼容旧客户端：接受但忽略，并在响应中标注 `verdict_deprecated`。
+    """
     try:
         limit = int(request.query.get('limit', '50'))
     except ValueError:
@@ -441,8 +457,13 @@ def _handle_events(request: web.Request, collector) -> web.Response:
     kind = request.query.get('kind') or None
     upstream = request.query.get('upstream') or None
     model = request.query.get('model') or None
+    verdict = request.query.get('verdict') or None
     events = collector.events(limit=limit, kind=kind, upstream=upstream, model=model)
-    resp = web.json_response({'events': events}, dumps=json.dumps)
+    payload = {'events': events}
+    if verdict:
+        # 兼容旧参数：不再按 verdict 过滤（字段已移除），显式标注防静默失效
+        payload['verdict_deprecated'] = True
+    resp = web.json_response(payload, dumps=json.dumps)
     for k, v in _NO_STORE_HEADERS.items():
         resp.headers[k] = v
     return resp
@@ -536,6 +557,10 @@ async def _handle_sse(request: web.Request, collector) -> web.StreamResponse:
             # 推送新事件（自上次推送以来，按 request_id 去重）；带 model/upstream 过滤（与建连维度一致）
             # 取数窗口 200：2s 轮询间隔内 QPS≤100 不丢（50 在 >25 rps 时截断丢事件）
             evs = collector.events(limit=200, model=_model, upstream=_upstream)
+            # G-8：时钟回拨防护——last_push_ts 若落在未来（NTP 回拨），重置为当前时间防停推
+            now_ts = _time.time()
+            if last_push_ts > now_ts + 1:
+                last_push_ts = now_ts
             new_evs = [
                 e
                 for e in evs

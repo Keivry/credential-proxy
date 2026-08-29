@@ -286,6 +286,7 @@ class GlobalPiiTokens:
         async with (
             self._lock
         ):  # 7.7: 原子覆盖 used 快照与 token 写入全程（含 resp_p2t 不还原语义）
+            evicted = 0  # Y-12：锁外上报，先初始化防 UnboundLocalError
             table_p2t = self.resp_p2t if response_side else self.pii_p2t
             table_t2p = self.resp_t2p if response_side else self.pii_t2p
             if value in table_p2t:
@@ -324,9 +325,6 @@ class GlobalPiiTokens:
                 _oldest_val, oldest_tok = table_p2t.popitem(last=False)
                 table_t2p.pop(oldest_tok, None)
                 evicted += 1
-            if evicted and self._collector is not None:
-                # 批量淘汰 pii_lru_evictions += n（两表各自触发均累加）
-                self._collector.incr_sync_lru(cred=0, pii=evicted)
             # pii_cache_miss 计数（仅请求侧合法值；响应侧不参与）
             # per-request 累计（事件详情数据源；incr_event 按正确上游合并）
             try:
@@ -335,7 +333,12 @@ class GlobalPiiTokens:
                 accumulate_pii_cache(hit=0, miss=1)
             except Exception:
                 pass
-            return token
+            # Y-12：incr_sync_lru 移到锁外（同步写 metrics，锁内做 IO 会阻塞 register 并发）
+            # 记录 evicted 数量，锁块结束后统一上报
+        if evicted and self._collector is not None:
+            # 批量淘汰 pii_lru_evictions += n（两表各自触发均累加）
+            self._collector.incr_sync_lru(cred=0, pii=evicted)
+        return token
 
     def restore(self, text: str) -> str:
         """还原请求期注册 token；响应期/未注册/格式不符原样保留 + 审计。
