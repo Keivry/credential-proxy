@@ -219,6 +219,10 @@ def _redact_extra_pii(out: str) -> str:
     - id_card 18 位校验位（GB 11643-1999）
     - bank_card Luhn 校验 + URL 查询参数防误报
     - ipv4/ipv6 保留段豁免
+
+    失败语义 fail-closed（Y-13）：强化层异常（如 _pii 导入失败）时返回
+    '[REDACTED:unverified]' 标记而非原样明文——脱敏兜底失败不应让 PII 明文
+    进 recent_events/SSE/落盘；宁可摘要变占位符也不泄漏。
     """
     try:
         from _pii import (  # 延迟导入避免循环依赖
@@ -230,13 +234,15 @@ def _redact_extra_pii(out: str) -> str:
         )
 
         # 占位符区间排除：__PII_*__/__VG_CRED_*__ 内部数字可能被 bank_card 误命中
+        # （注：redact_summary 路径 token 已先替换，此处为空是预期；保留供直调场景）
         protected_spans: list[tuple[int, int]] = [
             (m.start(), m.end())
             for m in _re.finditer(r'__VG_CRED_\d{4,}__|__PII_\d+_[0-9a-fA-F]{8}__', out)
         ]
 
         def _overlaps(start: int, end: int) -> bool:
-            return any(s <= start < e or s < end <= e for s, e in protected_spans)
+            # 修正 superset 包裹漏判：区间相交即重叠（含 span 完全在 match 内）
+            return any(start < e and end > s for s, e in protected_spans)
 
         for m in _COMBINED_RE.finditer(out):
             kind = m.lastgroup
@@ -245,8 +251,14 @@ def _redact_extra_pii(out: str) -> str:
             if _overlaps(m.start(), m.end()):
                 continue
             value = m.group(0)
-            if kind == 'bank_card' and _URL_QUERY_PARAM_RE.search(value):
-                continue
+            if kind == 'bank_card':
+                # URL 上下文防误报（Y-13b）：`_URL_QUERY_PARAM_RE.search(value)`
+                # 对纯数字卡号恒 False（死码）——须检查 match 前后的 URL 参数上下文，
+                # 如 `?id=6225880123456789` / `&order=1234567890123` 的订单号不判银行卡。
+                ctx_start = max(0, m.start() - 64)
+                ctx_end = min(len(out), m.end() + 16)
+                if _URL_QUERY_PARAM_RE.search(out[ctx_start:ctx_end]):
+                    continue
             if kind == 'id_card' and not _id_card_ok(value):
                 continue
             if kind == 'bank_card' and not _luhn_ok(value):
@@ -254,8 +266,9 @@ def _redact_extra_pii(out: str) -> str:
             if kind in ('ipv4', 'ipv6') and _is_reserved_ip(value, kind):
                 continue
             out = out.replace(value, f'[REDACTED:{kind}]')
-    except Exception:  # fail-open：脱敏兜底层异常不阻断摘要生成
-        pass
+    except Exception:
+        # fail-closed：脱敏兜底层异常不得放行明文（宁可标记摘要）
+        return '[REDACTED:unverified]'
     return out
 
 
@@ -855,8 +868,17 @@ class MetricsCollector:
 
     # ── 快照 ──
 
-    def _snapshot(self, now: float) -> list[dict[str, Any]]:
-        """深拷贝当前累计 → 按 (date,upstream)/(hour,upstream) 键拆快照。"""
+    def _snapshot(
+        self, now: float, mark_flushed: bool = False, mark_debounce: bool = False
+    ) -> list[dict[str, Any]]:
+        """深拷贝当前累计 → 按 (date,upstream)/(hour,upstream) 键拆快照。
+
+        mark_flushed=True 时在同一临界区内原子更新 last_flush 游标（Y-10b：
+        "先标后拍"的标与拍必须同锁，否则 mark→snapshot 窗口内的事件既进 DB
+        快照又进 ring_delta（ts>=last_flush）→ 双计）。
+        mark_debounce=True 额外更新 debounce 游标（仅同步写盘路径 _flush_sync 用；
+        flush() 异步入队不写盘，若也 mark debounce 会跳过后续 sync flush → DB 空）。
+        """
         with self._lock:  # Y-4：与 incr_event/incr_sync_* 跨线程互斥
             out: list[dict[str, Any]] = []
             for (date, up), agg in list(self._daily.items()):
@@ -866,6 +888,10 @@ class MetricsCollector:
                 s = {'hour': hour, 'upstream': up, **_copy_hourly(hagg).to_dict()}
                 out.append(s)
             self._trim_memory(now)
+            if mark_flushed:
+                self._last_flush_ts = now
+                if mark_debounce:
+                    self._last_flush_debounce_ts = now
         return out
 
     def _trim_memory(self, now: float) -> None:
@@ -1135,11 +1161,11 @@ class MetricsCollector:
             # 内存模式（无 DB）：不更新 last_flush —— ring 增量仍有效（_query_1h 依赖）
             return
         now = _utc_now()
-        # Y-10 先标后拍：先标记 last_flush 再 snapshot——查询读到 last_flush 后，
-        # ring_delta 取 ts>=last_flush 的事件（snapshot 之后新增，未落盘）与 DB 互补不双计；
-        # 若 snapshot 在前标记在后，查询可能看到「旧 last_flush + 新 snapshot 已含事件」→ 双计。
-        self._last_flush_ts = now
-        snapshot = self._snapshot(now)
+        # Y-10b：标记与快照在同一临界区（_snapshot mark_flushed=True）——
+        # mark→snapshot 窗口内的事件若先标后拍会既进 DB 快照又进 ring_delta（双计），
+        # 先拍后标会漏计（DB 已有但 ring_delta 不补）。同锁原子才互补不双计不漏计。
+        # 注意：flush() 只入队不写盘，不 mark debounce（否则跳过后续 sync flush → DB 空）。
+        snapshot = self._snapshot(now, mark_flushed=True)
         if snapshot:
             self._enqueue(snapshot)
 
@@ -1154,10 +1180,8 @@ class MetricsCollector:
         # 用独立 debounce 游标（初始 0），与 _last_flush_ts（health age，构造时=now）分离
         if now - self._last_flush_debounce_ts < FLUSH_DEBOUNCE_S:
             return
-        # Y-10 先标后拍（见 flush 注释）
-        self._last_flush_ts = now
-        self._last_flush_debounce_ts = now
-        snapshot = self._snapshot(now)
+        # Y-10b：标记与快照同锁原子（见 flush 注释）；同步写盘路径同时 mark debounce
+        snapshot = self._snapshot(now, mark_flushed=True, mark_debounce=True)
         for s in snapshot:
             self._write_flush(s)
 
@@ -1278,7 +1302,12 @@ class MetricsCollector:
 
     def _sum_counter(self, key: str) -> int:
         total = 0
-        for d in self._daily.values():
+        # Y-4b：SSE to_thread 调 health() 在 worker 线程，与主线程 incr_event/incr_sync
+        # 跨线程写 _daily → 裸迭代 dict 会 RuntimeError: dictionary changed size。
+        # 锁内 list() 快照 values 引用（聚合对象本身不在锁内变，安全）。
+        with self._lock:
+            aggs = list(self._daily.values())
+        for d in aggs:
             total += getattr(d, key, 0)
         return total
 
@@ -1330,9 +1359,14 @@ class MetricsCollector:
             db_recent = None
             last_flush = 0.0
         # ring 增量：仅取「上次 flush 之后」的事件（尚未落盘，DB 无对应记录）→ 不重复
+        # Y-4b：SSE 15s 快照经 to_thread 在 worker 线程跑 _query_1h，与主线程 incr_event
+        # 的 append 跨线程并发 → 裸迭代 deque 会抛 RuntimeError: deque mutated during
+        # iteration。先在锁内 list() 快照，释锁后过滤（GIL + 拷贝原子，无撕裂）。
+        with self._lock:
+            events_snapshot = list(self.recent_events)
         ring_delta = [
             e
-            for e in self.recent_events
+            for e in events_snapshot
             if e['ts'] >= last_flush
             and e['ts'] >= cutoff
             and (upstream_filter is None or e.get('upstream') == upstream_filter)
@@ -1372,7 +1406,10 @@ class MetricsCollector:
             dict(db_recent['audit_by_rule']) if db_recent else {}
         )
         if db_recent is None:
-            for (_d, _up), agg in self._daily.items():
+            # Y-4b：SSE to_thread 跑 _query_1h 与主线程写 _daily 跨线程 → 锁内快照再迭代
+            with self._lock:
+                daily_items = list(self._daily.items())
+            for (_d, _up), agg in daily_items:
                 if _d != day_key:
                     continue
                 if upstream_filter is not None and _up != upstream_filter:
@@ -1737,7 +1774,10 @@ class MetricsCollector:
             'json_full_fallback': 0,
             'latency': {'p50': None, 'p95': None, 'is_precise': False},
         }
-        for (_d, _up), d in self._daily.items():
+        # Y-4b：查询在 worker 线程（SSE to_thread）与主线程写 _daily 跨线程 → 锁内快照
+        with self._lock:
+            daily_items = list(self._daily.items())
+        for (_d, _up), d in daily_items:
             if upstream_filter is not None and _up != upstream_filter:
                 continue
             out['requests'] += d.requests
@@ -1890,9 +1930,10 @@ class MetricsCollector:
         DB 只有小时粒度，摊平的小数会误导）。KPI（_query_1h）仍有 DB 兜底显示真实总量。
         """
         cutoff = now - 3600
-        # 快照（deque list() 在 CPython GIL 下原子；series 在 executor 线程，
-        # 不能用 asyncio.Lock，直接拷贝即可——append 与 list() 并发安全）
-        snap = list(self.recent_events)
+        # 快照（Y-4b：series 在 executor 线程跑，与主线程 append 跨线程并发——
+        # 裸 list(deque) 在迭代版本检查下可能 RuntimeError: deque mutated，须锁内拷贝）
+        with self._lock:
+            snap = list(self.recent_events)
         buckets: list[dict[str, Any]] = []
         # 60 个分钟桶：从「当前分钟对齐」往前推 59 分钟，覆盖最近 1h
         now_min = int(now // 60) * 60

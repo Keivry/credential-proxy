@@ -110,11 +110,43 @@ class TestRedactExtraPii:
         out = redact_summary('内网 192.168.1.100', 200)
         assert '192.168.1.100' in out
 
+    def test_ipv6_public_redacted(self):
+        # 程序生成确定公网 IPv6（避开保留段），自包含不依赖占位符
+        import random
+
+        from _pii import _is_reserved_ip
+
+        rnd = random.Random(7)
+        while True:
+            ip6 = ':'.join(f'{rnd.randint(0, 0xFFFF):x}' for _ in range(8))
+            if not _is_reserved_ip(ip6, 'ipv6'):
+                break
+        out = redact_summary(f'访问 {ip6} 正常', 200)
+        assert '[REDACTED:ipv6]' in out
+        assert ip6 not in out
+
+    def test_ipv6_reserved_kept(self):
+        # 保留 IPv6（::1 环回 / fc00::/7 ULA / 2001:db8::/32 文档）不替换
+        for ip6 in ('::1', 'fc00::1', '2001:db8::1'):
+            out = redact_summary(f'地址 {ip6} 保留', 200)
+            assert ip6 in out, f'{ip6} 不应被替换'
+
+    def test_url_param_bankcard_not_redacted(self):
+        # Y-13b：URL 查询参数里的长数字（订单号）不判银行卡
+        order = '6225880123456789'
+        out = redact_summary(f'https://x.com/order?id={order}&amount=100', 200)
+        assert order in out, 'URL 参数订单号不应被替换'
+        assert '[REDACTED:bank_card]' not in out
+
     def test_placeholder_span_protected(self):
-        # 占位符区间不被 bank_card 误命中
-        out = redact_summary('token __PII_96_aeed8ff2__ 已注册', 200)
-        assert '[REDACTED:token]' in out
-        assert 'aeed8ff2' not in out
+        # 占位符区间不被 bank_card 误命中（直调 _redact_extra_pii，绕过 token 预替换）
+        from _metrics import _redact_extra_pii
+
+        # 占位符内部含 16 位数字（模拟 Luhn 可过的卡号子串）→ 不应被替换
+        ph = '__PII_96_6222020200123456__'
+        out = _redact_extra_pii(f'token {ph} 已注册')
+        assert ph in out, '占位符整体不应被破坏'
+        assert '[REDACTED:bank_card]' not in out
 
     def test_plain_phone_email_redacted(self):
         # 明文手机号/邮箱 → [REDACTED:phone]/[REDACTED:email]
