@@ -79,9 +79,9 @@
 
 ## 6. 文档与发布
 
-- [ ] 6.1 README 更新：requests_total 口径变化（仅对话端点，BREAKING）、series 端点、SSE 15s 快照、verdict 移除
+^- [x] 6.1 README 更新：requests_total 口径变化（仅对话端点，BREAKING）、series 端点、SSE 15s 快照、verdict 移除
   - 验收：README 含口径变化说明与 series 端点文档
-- [ ] 6.2 CHANGELOG 更新：v0.9.35（或下一版本）记录 6 大修复
+^- [x] 6.2 CHANGELOG 更新：v0.9.35（或下一版本）记录 6 大修复
   - 验收：CHANGELOG 有对应条目
-- [ ] 6.3 版本 bump（pyproject.toml + docker-compose image tag + uv.lock + README changelog）+ commit + tag + push 触发 CI
+^- [x] 6.3 版本 bump（pyproject.toml + docker-compose image tag + uv.lock + README changelog）+ commit + tag + push 触发 CI
   - 验收：git tag v0.9.35 推送后 GitHub Actions 构建成功
