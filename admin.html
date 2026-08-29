@@ -301,8 +301,11 @@
     var p95Hint = state.range === '1h'
       ? (precise ? '1h 精确' : '1h≈（低流量或高 TPS 属预期）')
       : (state.range + '≈ 桶中位');
+    var rangeLabel = state.range === '1h' ? '近 1 小时请求' :
+      state.range === '24h' ? '近 24 小时请求' :
+      state.range === '7d' ? '近 7 天请求' : '近 30 天请求';
     el.innerHTML =
-      '<div class="kpi"><div class="label">今日请求</div><div class="value" title="' + esc(String(req)) + '">' + fmtNum(req) + '</div></div>' +
+      '<div class="kpi"><div class="label">' + rangeLabel + '</div><div class="value" title="' + esc(String(req)) + '">' + fmtNum(req) + '</div></div>' +
       '<div class="kpi"><div class="label">脱敏占比</div><div class="value" title="' + esc(piiReqs + ' / ' + req) + '">' + redactedRatio.toFixed(1) + '%</div><div class="hint">含 PII 请求 ' + fmtNum(piiReqs) + ' / 总 ' + fmtNum(req) + '</div></div>' +
       '<div class="kpi"><div class="label">PII Token 缓存</div><div class="value" title="' + esc(String(piiHits)) + '">' + fmtNum(piiHits) + '</div><div class="hint">hit(复用) ' + fmtNum(metrics.pii_hits || 0) + ' / miss(新值) ' + fmtNum(metrics.pii_miss || 0) + '</div></div>' +
       '<div class="kpi"><div class="label">阻断数</div><div class="value" title="' + esc(String(deny)) + '">' + fmtNum(deny) + '</div><div class="hint">deny verdict</div></div>' +
@@ -468,8 +471,9 @@
                   ticks: { callback: function (val) { return fmtNum(val); }, color: '#8a93ab' }, grid: { color: '#2a2f42' }
                 },
                 x: {
-                  title: { display: true, text: state.range === '1h' ? '分钟' : (state.range === '24h' ? '小时' : '日期'), color: '#8a93ab', font: { size: 10 } },
-                  ticks: { color: '#8a93ab', maxTicksLimit: 10 }
+                  title: { display: true, text: state.range === '1h' ? '分钟' : (state.range === '24h' ? '小时' : '日期'), color: '#8a93ab', font: { size: 10 }, padding: { top: 8 } },
+                  ticks: { color: '#8a93ab', maxTicksLimit: state.range === '1h' ? 12 : 10, maxRotation: 0, minRotation: 0, autoSkip: true, padding: 6 },
+                  grid: { display: false }
                 }
               }
             }
@@ -488,33 +492,64 @@
     chartEl.innerHTML = '';
     // SVG 折线降级（带横纵轴标尺 + <title> 精确值 hover）
     if (buckets.length) {
-      var W = 600, H = 160, pad = 8;
+      // 响应式宽度：svgEl 是普通 div，clientWidth = 布局内容区宽（不含 padding）。
+      // 用 parentElement.clientWidth 会包含 panel 的 padding（16px*2）导致 SVG 超宽溢出。
+      var contW = svgEl.clientWidth || svgEl.parentElement.clientWidth || 0;
+      var W = Math.max(480, contW - 4), H = 160, pad = 8;
+      // 布局：当前时间（最后一个桶）固定在横轴 3/4 处，右侧 1/4 留白给未来（无数据不画）
+      var plotW = (W - 2 * pad) * 0.75;
       var maxV = Math.max.apply(null, buckets.map(function (b) { return b.requests || 0; })) || 1;
-      var step = W / (buckets.length - 1 || 1);
+      var step = plotW / (buckets.length - 1 || 1);
       var pts = buckets.map(function (b, i) {
         var x = pad + i * step, y = H - pad - ((b.requests || 0) / maxV) * (H - 2 * pad);
         return x.toFixed(1) + ',' + y.toFixed(1);
       }).join(' ');
-      var circles = buckets.map(function (b, i) {
+      // hover 采样点：7d=168 小时桶太密，抽稀到 ~24 个（polyline 保留全点保持折线形状，
+      // 但视觉点/hover 热区只画采样点，密度与 24h/30d 一致）；1h/24h/30d 全量画点
+      var maxPts = state.range === '7d' ? 24 : buckets.length;
+      var ptIdxs = [];
+      if (buckets.length <= maxPts) { for (var pi = 0; pi < buckets.length; pi++) ptIdxs.push(pi); }
+      else {
+        for (var pk = 0; pk < maxPts; pk++) ptIdxs.push(Math.round(pk * (buckets.length - 1) / (maxPts - 1)));
+      }
+      // hover 热区：透明大圆（r=8 好命中）+ 视觉小点（r=2），两层叠加；<title> 精确值
+      var circles = ptIdxs.map(function (i) {
+        var b = buckets[i];
         var x = pad + i * step, y = H - pad - ((b.requests || 0) / maxV) * (H - 2 * pad);
-        return '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="2" fill="#4cc2ff"><title>' +
-          esc(labels[i]) + ' requests=' + (b.requests || 0).toLocaleString('en-US') + ' tokens_prompt=' +
-          (b.tokens_prompt || 0).toLocaleString('en-US') + ' p95=' + (b.p95 != null ? Math.round(b.p95) : '—') +
-          '</title></circle>';
+        return '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="8" fill="transparent" style="cursor:pointer">' +
+          '<title>' + esc(labels[i]) + ' requests=' + (b.requests || 0).toLocaleString('en-US') +
+          ' tokens_prompt=' + (b.tokens_prompt || 0).toLocaleString('en-US') +
+          ' p95=' + (b.p95 != null ? Math.round(b.p95) : '—') + '</title></circle>' +
+          '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="2" fill="#4cc2ff" pointer-events="none"/>';
       }).join('');
-      // Y 轴刻度（4 档）+ X 轴底线 + 标签
+      // Y 轴刻度（4 档，横线画到数据区右边界 3/4 处）+ X 轴底线（同 3/4）+ 标签（放轴线下方 12px）
+      var plotRight = pad + plotW; // 数据区右边界 = 当前时间位置
       var yTicks = '';
       for (var t = 0; t <= 4; t++) {
         var yy = H - pad - (t / 4) * (H - 2 * pad);
-        yTicks += '<line x1="' + pad + '" y1="' + yy.toFixed(1) + '" x2="' + (W - pad) + '" y2="' + yy.toFixed(1) + '" stroke="#2a2f42" stroke-width="0.5"/>' +
+        yTicks += '<line x1="' + pad + '" y1="' + yy.toFixed(1) + '" x2="' + plotRight.toFixed(1) + '" y2="' + yy.toFixed(1) + '" stroke="#2a2f42" stroke-width="0.5"/>' +
           '<text x="2" y="' + (yy + 3).toFixed(1) + '" fill="#8a93ab" font-size="8">' + fmtNum(maxV * t / 4) + '</text>';
       }
-      var xLabel = labels.length > 8 ? labels[0] + ' … ' + labels[labels.length - 1] : (labels[0] || '');
-      svgEl.innerHTML = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">' +
-        '<line x1="' + pad + '" y1="' + (H - pad) + '" x2="' + (W - pad) + '" y2="' + (H - pad) + '" stroke="#3a3f55" stroke-width="1"/>' +
+      // x 轴标签：1h 取 12 个、24h 取 12 个、7d/30d 取 10 个均匀分布时间点，放轴下方（不重叠）
+      var xLabels = '';
+      var n = labels.length;
+      var maxXL = state.range === '1h' ? 12 : (state.range === '24h' ? 12 : 10);
+      var idxs = [];
+      if (n <= maxXL) { for (var i = 0; i < n; i++) idxs.push(i); }
+      else {
+        for (var k = 0; k < maxXL; k++) idxs.push(Math.round(k * (n - 1) / (maxXL - 1)));
+      }
+      idxs.forEach(function (i) {
+        var xx = pad + i * step;
+        xLabels += '<text x="' + xx.toFixed(1) + '" y="' + (H - pad + 16) + '" fill="#8a93ab" font-size="8" text-anchor="middle">' + esc(labels[i]) + '</text>';
+      });
+      svgEl.innerHTML = '<svg width="' + W + '" height="' + (H + 28) + '" viewBox="0 0 ' + W + ' ' + (H + 28) + '">' +
+        '<line x1="' + pad + '" y1="' + (H - pad) + '" x2="' + plotRight.toFixed(1) + '" y2="' + (H - pad) + '" stroke="#3a3f55" stroke-width="1"/>' +
+        // 右侧 1/4 未来区：虚线标记"现在"分界（当前时间竖线），提示未来无数据
+        '<line x1="' + plotRight.toFixed(1) + '" y1="' + pad + '" x2="' + plotRight.toFixed(1) + '" y2="' + (H - pad) + '" stroke="#3a3f55" stroke-width="1" stroke-dasharray="3 3"/>' +
         yTicks +
         '<polyline points="' + pts + '" fill="none" stroke="#4cc2ff" stroke-width="1.5"/>' + circles +
-        '<text x="' + (W - pad) + '" y="' + (H - 2) + '" fill="#8a93ab" font-size="8" text-anchor="end">' + esc(xLabel) + '</text>' +
+        xLabels +
         '</svg>';
     } else {
       svgEl.innerHTML = '<span style="color:var(--dim)">' + esc(state.range) + ' 窗口无数据</span>';
@@ -537,6 +572,9 @@
 
   // ── 事件表 ──
   function renderEvents(events) {
+    // 列表重建前先隐藏 tooltip，避免重建瞬间旧 tooltip 残留 + 新行索引错位
+    hideEvTooltip();
+    clearTimeout(hoverTimer);
     // 按 request_id 去重（SSE 增量与全量加载竞态时可能重复），保留最新顺序
     var seen = {};
     state.ev = (events ||[]).filter(function (e) {
@@ -580,13 +618,15 @@
   function bindRowHover(tbody) {
     var rows = tbody.querySelectorAll('tr.clickable');
     Array.prototype.forEach.call(rows, function (tr) {
-      tr.addEventListener('mouseenter', function () {
-        var idx = Number(tr.getAttribute('data-i'));
-        var e = state.ev[idx];
-        if (!e) return;
+      var idx = Number(tr.getAttribute('data-i'));
+      var e = state.ev[idx];
+      if (!e) return;
+      // 闭包直接捕获事件对象 e（而非索引）——列表刷新重建 DOM 后，
+      // 旧闭包/旧行引用失效，用索引会读到 state.ev 里“后移一位”的别的行事件 → tooltip 错位
+      tr.addEventListener('mouseenter', function (evt) {
         clearTimeout(hoverTimer);
         hoverRow = tr;
-        hoverTimer = setTimeout(function () { showEvTooltip(e, tr); }, 200);
+        hoverTimer = setTimeout(function () { showEvTooltip(e, tr, evt); }, 200);
       });
       tr.addEventListener('mouseleave', function () {
         clearTimeout(hoverTimer);
@@ -595,15 +635,13 @@
           if (tip && !tip.matches(':hover')) hideEvTooltip();
         }, 150);
       });
-      tr.addEventListener('click', function () {
-        var idx = Number(tr.getAttribute('data-i'));
-        var e = state.ev[idx];
-        if (e) showEvTooltip(e, tr); // 点击固定
+      tr.addEventListener('click', function (evt) {
+        if (e) showEvTooltip(e, tr, evt); // 点击固定
       });
     });
   }
 
-  function showEvTooltip(e, tr) {
+  function showEvTooltip(e, tr, evt) {
     var tip = document.getElementById('ev-tooltip');
     // 脱敏摘要 + 关键字段（原样保留 __PII_*__/__VG_CRED_*__ 占位符，不还原）
     var toks = e.tokens || {};
@@ -624,15 +662,17 @@
       'summary: ' + summary;
     tip.appendChild(pre);
     tip.hidden = false;
-    // 定位跟随行（fixed，防溢出视口：右侧放不下换左侧；底部放不下上移，保证完整可见）
+    // 定位跟随鼠标（fixed，防溢出视口：右侧放不下换左侧；底部放不下上移，保证完整可见）
     var rect = tr.getBoundingClientRect();
-    var left = rect.right + 8;
-    if (left + 420 > window.innerWidth) left = rect.left - 428;
+    var cx = (evt && typeof evt.clientX === 'number') ? evt.clientX : (rect.left + rect.width / 2);
+    var cy = (evt && typeof evt.clientY === 'number') ? evt.clientY : rect.top;
+    var left = cx + 16; // 鼠标右侧 16px，避免遮住鼠标下的内容
+    if (left + 420 > window.innerWidth) left = cx - 428; // 右侧放不下 → 鼠标左侧
     tip.style.left = Math.max(4, left) + 'px';
     // 先显示再测量实际高度（max-height 60vh 可能更矮）
     var th = tip.offsetHeight;
-    var top = rect.top;
-    // 行在视口底部：上移让 tooltip 完整显示（顶部至少留 4px）
+    var top = cy - th - 12; // 默认在鼠标上方（不挡行内容）
+    if (top < 4) top = cy + 18; // 上方放不下 → 鼠标下方
     if (top + th > window.innerHeight - 4) top = Math.max(4, window.innerHeight - th - 8);
     tip.style.top = top + 'px';
   }
@@ -813,10 +853,10 @@
       cacheTd +
       '<td class="num">' + (e.latency_ms != null ? Math.round(e.latency_ms) : '—') + '</td>';
     // hover tooltip（复用 renderEvents 的 bindRowHover——但单行插入后手动绑定）
-    row.addEventListener('mouseenter', function () {
+    row.addEventListener('mouseenter', function (evt) {
       clearTimeout(hoverTimer);
       hoverRow = row;
-      hoverTimer = setTimeout(function () { showEvTooltip(e, row); }, 200);
+      hoverTimer = setTimeout(function () { showEvTooltip(e, row, evt); }, 200);
     });
     row.addEventListener('mouseleave', function () {
       clearTimeout(hoverTimer);
@@ -825,7 +865,7 @@
         if (tip && !tip.matches(':hover')) hideEvTooltip();
       }, 150);
     });
-    row.addEventListener('click', function () { showEvTooltip(e, row); });
+    row.addEventListener('click', function (evt) { showEvTooltip(e, row, evt); });
     if (first) tbody.insertBefore(row, first);
     else tbody.appendChild(row);
   }

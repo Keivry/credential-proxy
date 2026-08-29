@@ -352,6 +352,7 @@ cd get && make build  # → /tmp/get-credential-linux-amd64
 
 ## 版本历史
 
+- **v0.9.37** — 仪表盘折线图/持久化修复 5 项：① 重启后 1h 折线图保留历史（`_series_1h` DB 小时兜底，ring 精确优先、DB 剩余量摊到空桶，守恒不双计）；② `_series_db` 桶 off-by-one 修复（24h/7d 缺最近 1 小时、30d 缺今天整天 → 含当前桶）；③ 折线图当前时间固定横轴 3/4 处、右侧 1/4 未来区留白；④ SVG 宽度响应式 + 7d hover 点抽稀；⑤ 事件 hover tooltip 错位修复（闭包捕获事件对象 + 真实鼠标坐标）
 - **v0.9.17** — 三层缓冲/keepalive/WHATWG 帧声明：共享 `utils/json_walk.py` 薄包装三处、Vault `next_available_index` 空洞跳过/`rand8=secrets.token_hex(4)`/`__PII_<seq>_<rand8>__`/`PII_FUZZY_RESTORE=0`（`re.IGNORECASE`）、流式 `byte_buf` WHATWG/`line_buf 16KB/30s`/`arg_buf 一次性 walk`/`keepalive 10s`/截断合成 `seen_global_terminal`、检测硬化 `PII_DETECTION_HARDENING=0/1` 总闸（`fc:/fd:` 精确前缀/ReDoS/CJK/`lru_cache(4)`）；新增 3 测试 + `sentinel_{chat,anthropic,responses}.jsonl`（`scripts/sentinel_record.py --check`）
 - **v0.9.14** — 细化 `byte_buf` 残余 `data:` 前缀走 SSE 行级 `json-aware`，避免残余 `plain` 回退破坏
 - **v0.9.12** — 补全剩余流式 JSON-aware 遗漏：快路径 `data:`/`event:` 与 `byte_buf` 残余双路径改走 `json-aware` 且残余清理改用 `_strip_token_forms_json_aware`，修复 `p@ss"quote`/`\u` 在 fast/残余路径的 `Expecting value: line 1 column 1 (char 0)` 闭环

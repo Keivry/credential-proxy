@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import bisect
+import calendar
 import contextvars
 import json
 import logging
@@ -427,8 +428,115 @@ class MetricsCollector:
         self._last_flush_ts = _utc_now()
         self._conn: sqlite3.Connection | None = None
         self._connect_db()
+        self._load_existing_today()
 
     # ── DB ──
+
+    def _load_existing_today(self) -> None:
+        """启动时把 DB 今日 daily/hourly 累计载入内存（解决覆盖式写盘导致重启后今日总量缩水）。
+
+        覆盖式 UPSERT 的语义是「当前进程累计」：若重启后内存从 0 起步，
+        首次 flush 会用 0+新增量覆盖 DB 里的今日旧值 → 今日总量永久缩水。
+        启动时先加载 DB 今日值到 _daily/_hourly，incr_event 在其上继续累加，
+        后续 flush 覆盖 = DB 旧值 + 新增量 = 正确累计（同进程多次 flush 不重复）。
+        """
+        if self._conn is None:
+            return
+        now = _utc_now()
+        today = _day_key(now)
+        try:
+            # daily：今日行 → _daily（含扩展列）
+            cols_d = [
+                'date',
+                'upstream',
+                'pii_by_type',
+                'pii_hits',
+                'pii_miss',
+                'pii_requests',
+                'cred_hits',
+                'cred_miss',
+                'cred_lru_evictions',
+                'pii_lru_evictions',
+                'requests',
+                'requests_by_status',
+                'tokens',
+                'audit_by_verdict',
+                'audit_by_rule',
+                'latency_buckets',
+                'placeholder_prompt_injected',
+                'truncated_total',
+                'json_aware_success',
+                'json_leaf_fallback',
+                'json_full_fallback',
+            ]
+            for row in self._conn.execute(
+                'SELECT ' + ', '.join(cols_d) + ' FROM daily_agg WHERE date = ?',
+                (today,),
+            ).fetchall():
+                r = dict(zip(cols_d, row))
+                up = r.pop('upstream')
+                agg = _DailyAgg()
+                agg.pii_by_type = json.loads(r['pii_by_type'] or '{}')
+                agg.pii_hits = r['pii_hits'] or 0
+                agg.pii_miss = r['pii_miss'] or 0
+                agg.pii_requests = r['pii_requests'] or 0
+                agg.cred_hits = r['cred_hits'] or 0
+                agg.cred_miss = r['cred_miss'] or 0
+                agg.cred_lru_evictions = r['cred_lru_evictions'] or 0
+                agg.pii_lru_evictions = r['pii_lru_evictions'] or 0
+                agg.requests = r['requests'] or 0
+                agg.requests_by_status = json.loads(r['requests_by_status'] or '{}')
+                agg.tokens = json.loads(r['tokens'] or '{}')
+                agg.audit_by_verdict = json.loads(r['audit_by_verdict'] or '{}')
+                agg.audit_by_rule = json.loads(r['audit_by_rule'] or '{}')
+                agg.latency_buckets = json.loads(r['latency_buckets'] or '{}')
+                agg.placeholder_prompt_injected = r['placeholder_prompt_injected'] or 0
+                agg.truncated_total = r['truncated_total'] or 0
+                agg.json_aware_success = r['json_aware_success'] or 0
+                agg.json_leaf_fallback = r['json_leaf_fallback'] or 0
+                agg.json_full_fallback = r['json_full_fallback'] or 0
+                self._daily[(today, up)] = agg
+            # hourly：今日所有小时 → _hourly（轻量子集）
+            cols_h = [
+                'hour',
+                'upstream',
+                'requests',
+                'requests_by_status',
+                'tokens',
+                'latency_buckets',
+                'pii_by_type',
+                'pii_hits',
+                'pii_miss',
+                'pii_requests',
+                'pii_lru_evictions',
+                'cred_lru_evictions',
+            ]
+            for row in self._conn.execute(
+                'SELECT ' + ', '.join(cols_h) + ' FROM hourly_agg WHERE hour >= ?',
+                (today + 'T00:00:00Z',),
+            ).fetchall():
+                r = dict(zip(cols_h, row))
+                up = r.pop('upstream')
+                agg = _HourlyAgg()
+                agg.requests = r['requests'] or 0
+                agg.requests_by_status = json.loads(r['requests_by_status'] or '{}')
+                agg.tokens = json.loads(r['tokens'] or '{}')
+                agg.latency_buckets = json.loads(r['latency_buckets'] or '{}')
+                agg.pii_by_type = json.loads(r['pii_by_type'] or '{}')
+                agg.pii_hits = r['pii_hits'] or 0
+                agg.pii_miss = r['pii_miss'] or 0
+                agg.pii_requests = r['pii_requests'] or 0
+                agg.pii_lru_evictions = r['pii_lru_evictions'] or 0
+                agg.cred_lru_evictions = r['cred_lru_evictions'] or 0
+                self._hourly[(r['hour'], up)] = agg
+            if self._daily or self._hourly:
+                logger.info(
+                    '加载 DB 今日累计: daily=%d 行, hourly=%d 行',
+                    len(self._daily),
+                    len(self._hourly),
+                )
+        except (OSError, sqlite3.Error, json.JSONDecodeError) as e:
+            logger.warning('加载 DB 今日累计失败（继续以空累计启动）: %s', e)
 
     def _connect_db(self) -> None:
         try:
@@ -750,6 +858,20 @@ class MetricsCollector:
             else {}
         )
         latency_ms_v = latency_ms if latency_ms is not None else None
+        # 从 ContextVar 读 per-request 真实计数（sync 钩子累计）：
+        # pii_hits/pii_miss/cred_hits/cred_miss 若调用方显式传参则优先，否则取 ctx 累计。
+        # 必须在锁内聚合（d/h.pii_hits += ...）之前合并，否则聚合用 0 而 ring 用 ctx 值 → 不一致。
+        if request_id:
+            _ctx_pii = _req_pii_var.get()
+            if _ctx_pii:
+                if pii_hits == 0:
+                    pii_hits = _ctx_pii.get('pii_hits', 0)
+                if pii_miss == 0:
+                    pii_miss = _ctx_pii.get('pii_miss', 0)
+                if cred_hits == 0:
+                    cred_hits = _ctx_pii.get('cred_hits', 0)
+                if cred_miss == 0:
+                    cred_miss = _ctx_pii.get('cred_miss', 0)
         # model 白名单/截断（防属性注入/超长；非法则归 unknown_model）
         if not _re.fullmatch(r'[A-Za-z0-9._/\-]{1,64}', model or ''):
             model = 'unknown_model'
@@ -814,18 +936,6 @@ class MetricsCollector:
                 self._merge_tokens(h.tokens, tokens_d)
             # recent_events
             if request_id:
-                # 从 ContextVar 读 per-request 真实计数（sync 钩子累计）：
-                # pii_hits/pii_miss 若调用方显式传参则优先，否则取 ctx 累计
-                _ctx_pii = _req_pii_var.get()
-                if _ctx_pii:
-                    if pii_hits == 0:
-                        pii_hits = _ctx_pii.get('pii_hits', 0)
-                    if pii_miss == 0:
-                        pii_miss = _ctx_pii.get('pii_miss', 0)
-                    if cred_hits == 0:
-                        cred_hits = _ctx_pii.get('cred_hits', 0)
-                    if cred_miss == 0:
-                        cred_miss = _ctx_pii.get('cred_miss', 0)
                 self.recent_events.append(
                     {
                         'ts': now,
@@ -935,6 +1045,9 @@ class MetricsCollector:
 
     async def flush(self) -> None:
         """深拷贝当前累计 → 入队 → 单写者写盘。锁内禁 await。"""
+        if not self._sqlite_ok or self._conn is None:
+            # 内存模式（无 DB）：不更新 last_flush —— ring 增量仍有效（_query_1h 依赖）
+            return
         now = _utc_now()
         snapshot = self._snapshot(now)
         self._last_flush_ts = now
@@ -943,6 +1056,9 @@ class MetricsCollector:
 
     def _flush_sync(self) -> None:
         """同步 flush（供 close 前调用；事件循环外）。"""
+        if not self._sqlite_ok or self._conn is None:
+            # 内存模式（无 DB）：不更新 last_flush —— ring 增量仍有效（_query_1h 依赖）
+            return
         now = _utc_now()
         snapshot = self._snapshot(now)
         self._last_flush_ts = now
@@ -1095,22 +1211,44 @@ class MetricsCollector:
     ) -> dict[str, Any]:
         now = _utc_now()
         cutoff = now - 3600
-        evs = [
-            e
-            for e in self.recent_events
-            if e['ts'] >= cutoff
-            and (upstream_filter is None or e.get('upstream') == upstream_filter)
-            and (model_filter is None or e.get('model') == model_filter)
-        ]
         ring = self.ring_stats(
             upstream_filter=upstream_filter, model_filter=model_filter
         )
-        requests = len(evs)
-        by_status: dict[str, int] = {}
-        pii_by_type: dict[str, int] = {}
-        tokens: dict[str, dict[str, Any]] = {}
-        pii_hits = pii_miss = pii_requests = cred_hits = cred_miss = 0
-        for e in evs:
+        # ── 1h 兜底历史：DB hourly_agg 最近 2 小时（重启后内存 ring 为空时，仍显示重启前 1h 内请求）──
+        # DB 是"截至上次 flush 的累计快照"；ring 提供"last_flush 之后的实时增量"。
+        # 两者相加即"最近 1h 总量"，不重复（ring 中 ts >= last_flush_ts 的事件尚未落盘）。
+        # 注意：hourly_agg 无 model 维度（仅 upstream），model_filter 时 DB 兜底不可用 → 纯 ring。
+        if model_filter is None:
+            db_recent = self._query_1h_db_recent(model_filter, upstream_filter)
+            last_flush = getattr(self, '_last_flush_ts', 0.0)
+        else:
+            db_recent = None
+            last_flush = 0.0
+        # ring 增量：仅取「上次 flush 之后」的事件（尚未落盘，DB 无对应记录）→ 不重复
+        ring_delta = [
+            e
+            for e in self.recent_events
+            if e['ts'] >= last_flush
+            and e['ts'] >= cutoff
+            and (upstream_filter is None or e.get('upstream') == upstream_filter)
+            and (model_filter is None or e.get('model') == model_filter)
+        ]
+        requests = (db_recent['requests'] if db_recent else 0) + len(ring_delta)
+        by_status: dict[str, int] = (
+            dict(db_recent['requests_by_status']) if db_recent else {}
+        )
+        pii_by_type: dict[str, int] = (
+            dict(db_recent['pii_by_type']) if db_recent else {}
+        )
+        tokens: dict[str, dict[str, Any]] = (
+            {k: dict(v) for k, v in db_recent['tokens'].items()} if db_recent else {}
+        )
+        pii_hits = db_recent['pii_hits'] if db_recent else 0
+        pii_miss = db_recent['pii_miss'] if db_recent else 0
+        pii_requests = db_recent['pii_requests'] if db_recent else 0
+        cred_hits = db_recent['cred_hits'] if db_recent else 0
+        cred_miss = db_recent['cred_miss'] if db_recent else 0
+        for e in ring_delta:
             s = e['status']
             by_status[s] = by_status.get(s, 0) + 1
             # recent_events 不含 pii_by_type 明细（含类型分布需从 daily 拉近 1h）
@@ -1120,8 +1258,12 @@ class MetricsCollector:
             pii_miss += e.get('pii_miss', 0)
         # 1h 的 pii_by_type / tokens 从 daily 当日累计近似（按 1h 窗口取当日）
         day_key = _day_key(now)
-        audit_by_verdict: dict[str, int] = {}
-        audit_by_rule: dict[str, int] = {}
+        audit_by_verdict: dict[str, int] = (
+            dict(db_recent['audit_by_verdict']) if db_recent else {}
+        )
+        audit_by_rule: dict[str, int] = (
+            dict(db_recent['audit_by_rule']) if db_recent else {}
+        )
         for (_d, _up), agg in self._daily.items():
             if _d != day_key:
                 continue
@@ -1166,6 +1308,89 @@ class MetricsCollector:
                 'is_precise': ring['is_precise'],
             },
         }
+
+    def _query_1h_db_recent(
+        self,
+        model_filter: str | None = None,
+        upstream_filter: str | None = None,
+    ) -> dict[str, Any]:
+        """1h 兜底：DB hourly_agg 最近 2 小时（重启后内存 ring 为空时提供历史）。
+
+        与 _query_db 同款只读连接 + 查询前同步 flush，保证读到最新落盘值。
+        只取最近 2 个整点小时（当前小时 + 上一小时），近似"最近 1h"，
+        避免跨 24h/7d 窗口的过度覆盖。
+        """
+        out: dict[str, Any] = {
+            'requests': 0,
+            'requests_by_status': {},
+            'pii_by_type': {},
+            'pii_hits': 0,
+            'pii_miss': 0,
+            'pii_requests': 0,
+            'cred_hits': 0,
+            'cred_miss': 0,
+            'tokens': {},
+            'audit_by_verdict': {},
+            'audit_by_rule': {},
+        }
+        try:
+            self._flush_sync()
+        except Exception:
+            pass  # flush 失败仍继续查（可能读到旧数据）
+        if self._conn is None:
+            return out
+        cutoff_hour = _hour_key(_utc_now() - 2 * 3600)
+        try:
+            ro_conn = sqlite3.connect(
+                f'file:{urllib.parse.quote(self.db_path, safe="/")}?mode=ro',
+                uri=True,
+                timeout=5.0,
+            )
+            try:
+                if upstream_filter is not None:
+                    rows = ro_conn.execute(
+                        'SELECT hour, upstream, requests, requests_by_status, tokens, '
+                        'latency_buckets, pii_by_type, pii_hits, pii_miss, pii_requests, '
+                        'pii_lru_evictions, cred_lru_evictions '
+                        'FROM hourly_agg WHERE hour >= ? AND upstream = ?',
+                        (cutoff_hour, upstream_filter),
+                    ).fetchall()
+                else:
+                    rows = ro_conn.execute(
+                        'SELECT hour, upstream, requests, requests_by_status, tokens, '
+                        'latency_buckets, pii_by_type, pii_hits, pii_miss, pii_requests, '
+                        'pii_lru_evictions, cred_lru_evictions '
+                        'FROM hourly_agg WHERE hour >= ?',
+                        (cutoff_hour,),
+                    ).fetchall()
+                for (
+                    _h,
+                    _up,
+                    requests,
+                    rbs,
+                    tokens,
+                    _buckets,
+                    pii_by_type,
+                    pii_hits,
+                    pii_miss,
+                    pii_requests,
+                    _pii_lru,
+                    _cred_lru,
+                ) in rows:
+                    out['requests'] += requests or 0
+                    self._merge_json_counter(out['requests_by_status'], rbs)
+                    self._merge_tokens(
+                        out['tokens'], json.loads(tokens) if tokens else {}
+                    )
+                    self._merge_json_counter(out['pii_by_type'], pii_by_type)
+                    out['pii_hits'] += pii_hits or 0
+                    out['pii_miss'] += pii_miss or 0
+                    out['pii_requests'] += pii_requests or 0
+            finally:
+                ro_conn.close()
+        except sqlite3.Error:
+            pass  # DB 不可用则返回空兜底
+        return out
 
     def _query_db(
         self,
@@ -1550,7 +1775,13 @@ class MetricsCollector:
         model_filter: str | None,
         upstream_filter: str | None,
     ) -> dict[str, Any]:
-        """1h 分钟桶：recent_events 锁内快照后归并。"""
+        """1h 分钟桶：recent_events 锁内快照后归并，历史区间用 DB 小时摊平兜底。
+
+        重启后 ring 清空 → 重启前几分钟桶会全 0（但 KPI 有 DB 兜底显示正常）。
+        DB 只有小时粒度，无法恢复分钟分布：对 ts < last_flush 的桶，
+        用 hourly_agg 该小时总量 / 60 均匀摊平近似；ts >= last_flush 用 ring 精确。
+        model_filter 时 DB 兜底不可用（hourly 无 model 维度）→ 纯 ring。
+        """
         cutoff = now - 3600
         # 快照（deque list() 在 CPython GIL 下原子；series 在 executor 线程，
         # 不能用 asyncio.Lock，直接拷贝即可——append 与 list() 并发安全）
@@ -1572,9 +1803,15 @@ class MetricsCollector:
                     'pii_requests': 0,
                 }
             )
+        # ── ring 归并（先算，DB 摊平需要知道每个小时 ring 已覆盖多少）──
         lat_by_min: dict[int, list[float]] = {}
+        ring_cnt = [0] * 60  # 每桶 ring 事件数
+        ring_delta_only = model_filter is None
+        last_flush = getattr(self, '_last_flush_ts', 0.0)
         for e in snap:
             if e['ts'] < cutoff:
+                continue
+            if ring_delta_only and e['ts'] < last_flush:
                 continue
             if upstream_filter is not None and e.get('upstream') != upstream_filter:
                 continue
@@ -1585,6 +1822,7 @@ class MetricsCollector:
                 continue
             b = buckets[idx]
             b['requests'] += 1
+            ring_cnt[idx] += 1
             if e.get('pii_found'):
                 b['pii_requests'] += 1
             toks = e.get('tokens') or {}
@@ -1596,7 +1834,63 @@ class MetricsCollector:
                 b['cached_read'] += u.get('cached_read', 0) or 0
             lat = e.get('latency_ms')
             if lat is not None:
-                lat_by_min.setdefault(idx, []).append(lat)
+                lat_by_min.setdefault(idx,[]).append(lat)
+        # ── DB 小时兜底（仅无 model_filter 时；ring 精确优先，只补"该小时 ring 未覆盖的剩余量"）──
+        # 重启后 ring 缺历史：DB 只有小时总量，无法恢复分钟分布，按"该小时剩余量/空桶数"均匀摊平。
+        # 守恒：DB 小时总量 - 该小时内 ring 已计事件数 = 剩余量，只摊到 ring 为空的桶（不双计）。
+        if model_filter is None:
+            try:
+                self._flush_sync()
+            except Exception:
+                pass
+            if self._conn is not None:
+                cutoff_hour = _hour_key(now - 2 * 3600)
+                try:
+                    ro_conn = sqlite3.connect(
+                        f'file:{urllib.parse.quote(self.db_path, safe="/")}?mode=ro',
+                        uri=True,
+                        timeout=5.0,
+                    )
+                    try:
+                        if upstream_filter is not None:
+                            rows = ro_conn.execute(
+                                'SELECT hour, requests FROM hourly_agg WHERE hour >= ? AND upstream = ?',
+                                (cutoff_hour, upstream_filter),
+                            ).fetchall()
+                        else:
+                            rows = ro_conn.execute(
+                                'SELECT hour, requests FROM hourly_agg WHERE hour >= ?',
+                                (cutoff_hour,),
+                            ).fetchall()
+                        for _h, req in rows:
+                            req = req or 0
+                            if not req:
+                                continue
+                            h_ts = calendar.timegm(
+                                time.strptime(_h, '%Y-%m-%dT%H:00:00Z')
+                            )
+                            # 该小时在窗口内的桶 idx
+                            in_hour = [
+                                i
+                                for i in range(60)
+                                if h_ts <= buckets[i]['ts'] < h_ts + 3600
+                            ]
+                            if not in_hour:
+                                continue
+                            h_ring = sum(ring_cnt[i] for i in in_hour)
+                            remain = max(0, req - h_ring)
+                            if remain <= 0:
+                                continue
+                            empty = [i for i in in_hour if ring_cnt[i] == 0]
+                            if not empty:
+                                continue
+                            per_min = remain / len(empty)
+                            for i in empty:
+                                buckets[i]['requests'] += per_min
+                    finally:
+                        ro_conn.close()
+                except (sqlite3.Error, OSError, ValueError):
+                    pass  # DB 不可用/格式异常 → 纯 ring
         for idx, lats in lat_by_min.items():
             if lats:
                 buckets[idx]['p95'] = sorted(lats)[
@@ -1666,11 +1960,12 @@ class MetricsCollector:
                         'FROM daily_agg WHERE date >= ?',
                         (cutoff_key,),
                     ).fetchall()
-            # 建桶（空桶补零）
+            # 建桶（空桶补零）。桶序列覆盖 [now-(n-1)*bucket_s, now]，包含当前桶
+            # （旧实现 now-(n-i)*bucket_s 缺当前桶：24h/7d 缺最近 1 小时、30d 缺今天整天）
             now = _utc_now()
             n_buckets = int(hours * 3600 // bucket_s)
             bucket_ts = [
-                int((now - (n_buckets - i) * bucket_s) // bucket_s) * bucket_s
+                int((now - (n_buckets - 1 - i) * bucket_s) // bucket_s) * bucket_s
                 for i in range(n_buckets)
             ]
             buckets = [
@@ -1729,7 +2024,7 @@ class MetricsCollector:
         cutoff = now - hours * 3600
         n_buckets = int(hours * 3600 // bucket_s)
         bucket_ts = [
-            int((now - (n_buckets - i) * bucket_s) // bucket_s) * bucket_s
+            int((now - (n_buckets - 1 - i) * bucket_s) // bucket_s) * bucket_s
             for i in range(n_buckets)
         ]
         buckets = [
