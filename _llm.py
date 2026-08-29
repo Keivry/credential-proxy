@@ -227,11 +227,17 @@ def _capture_usage_ctx(payload: str, metrics_ctx: dict, protocol: str) -> None:
         usage = obj['usage']
     else:
         # Responses: response.completed.response.usage
+        # 实测 muse-spark（opencode zen/go /v1/responses）为单层
+        # {"type":"response.completed","response":{"id":...,"usage":{...}}}
+        # 兼容双层 {"response":{"response":{"usage":...}}} 历史形态
         resp_inner = obj.get('response')
         if isinstance(resp_inner, dict):
-            inner2 = resp_inner.get('response')
-            if isinstance(inner2, dict) and isinstance(inner2.get('usage'), dict):
-                usage = inner2['usage']
+            if isinstance(resp_inner.get('usage'), dict):
+                usage = resp_inner['usage']
+            else:
+                inner2 = resp_inner.get('response')
+                if isinstance(inner2, dict) and isinstance(inner2.get('usage'), dict):
+                    usage = inner2['usage']
         # Anthropic message_delta.usage
         delta_inner = obj.get('delta')
         if isinstance(delta_inner, dict) and isinstance(delta_inner.get('usage'), dict):
