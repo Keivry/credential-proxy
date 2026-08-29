@@ -47,7 +47,18 @@
     padding: 14px 16px; margin-bottom: 18px;
   }
   .panel h2 { font-size: 14px; margin-bottom: 10px; }
-  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; position: relative; }
+  .rt-tip {
+    position: absolute; top: -34px; left: 50%; transform: translateX(-50%);
+    background: #b3472e; color: #fff; padding: 6px 12px; border-radius: 6px;
+    font-size: 11px; white-space: nowrap; box-shadow: 0 2px 10px rgba(0,0,0,.4);
+    display: none; z-index: 140; pointer-events: none;
+  }
+  .rt-tip.show { display: block; }
+  .rt-tip::after {
+    content: ''; position: absolute; top: 100%; left: 50%; transform: translateX(-50%);
+    border: 5px solid transparent; border-top-color: #b3472e;
+  }
   .toolbar button, .toolbar select, .toolbar input {
     background: var(--panel2); color: var(--text); border: 1px solid var(--border);
     border-radius: 6px; padding: 6px 10px; font-size: 12px; cursor: pointer;
@@ -113,6 +124,7 @@
   <div class="panel">
     <h2>时序趋势</h2>
     <div class="toolbar" id="range-bar">
+      <span class="rt-tip" id="rt-tip">请求过于频繁（限流 10/min），请稍候再试…</span>
       <button data-range="1h" class="active">1h</button>
       <button data-range="24h">24h</button>
       <button data-range="7d">7d</button>
@@ -223,9 +235,19 @@
     opts.credentials = 'include';
     return fetch(path, opts).then(function (r) {
       if (r.status === 401) { throw new Error('unauthorized'); }
+      if (r.status === 429) { throw new Error('ratelimited'); }
       if (!r.ok) { throw new Error('HTTP ' + r.status); }
       return r.json();
     });
+  }
+
+  // 限流提示：切换 range/筛选太频繁触发 10/min 限流时，在工具栏上方弹出 tooltip（3s 自动消失）
+  function showRateLimit() {
+    var tip = document.getElementById('rt-tip');
+    if (!tip) return;
+    tip.className = 'rt-tip show';
+    clearTimeout(tip._t);
+    tip._t = setTimeout(function () { tip.className = 'rt-tip'; }, 3000);
   }
 
   // ── 登录流程 ──
@@ -495,13 +517,14 @@
       // 响应式宽度：svgEl 是普通 div，clientWidth = 布局内容区宽（不含 padding）。
       // 用 parentElement.clientWidth 会包含 panel 的 padding（16px*2）导致 SVG 超宽溢出。
       var contW = svgEl.clientWidth || svgEl.parentElement.clientWidth || 0;
-      var W = Math.max(480, contW - 4), H = 160, pad = 8;
-      // 布局：当前时间（最后一个桶）固定在横轴 3/4 处，右侧 1/4 留白给未来（无数据不画）
-      var plotW = (W - 2 * pad) * 0.75;
+      var W = Math.max(480, contW - 4), H = 160, pad = 8, gap = 26;
+      // 布局：数据区两侧各留 gap（给 y 轴标尺 + x 轴首尾标签空间），当前时间（最后一个桶）固定在数据区 3/4 处，右侧 1/4 留白给未来（无数据不画）
+      var x0 = pad + gap;
+      var plotW = (W - 2 * pad - 2 * gap) * 0.75;
       var maxV = Math.max.apply(null, buckets.map(function (b) { return b.requests || 0; })) || 1;
       var step = plotW / (buckets.length - 1 || 1);
       var pts = buckets.map(function (b, i) {
-        var x = pad + i * step, y = H - pad - ((b.requests || 0) / maxV) * (H - 2 * pad);
+        var x = x0 + i * step, y = H - pad - ((b.requests || 0) / maxV) * (H - 2 * pad);
         return x.toFixed(1) + ',' + y.toFixed(1);
       }).join(' ');
       // hover 采样点：7d=168 小时桶太密，抽稀到 ~24 个（polyline 保留全点保持折线形状，
@@ -515,22 +538,26 @@
       // hover 热区：透明大圆（r=8 好命中）+ 视觉小点（r=2），两层叠加；<title> 精确值
       var circles = ptIdxs.map(function (i) {
         var b = buckets[i];
-        var x = pad + i * step, y = H - pad - ((b.requests || 0) / maxV) * (H - 2 * pad);
+        var x = x0 + i * step, y = H - pad - ((b.requests || 0) / maxV) * (H - 2 * pad);
         return '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="8" fill="transparent" style="cursor:pointer">' +
           '<title>' + esc(labels[i]) + ' requests=' + (b.requests || 0).toLocaleString('en-US') +
           ' tokens_prompt=' + (b.tokens_prompt || 0).toLocaleString('en-US') +
           ' p95=' + (b.p95 != null ? Math.round(b.p95) : '—') + '</title></circle>' +
           '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="2" fill="#4cc2ff" pointer-events="none"/>';
       }).join('');
-      // Y 轴刻度（4 档，横线画到数据区右边界 3/4 处）+ X 轴底线（同 3/4）+ 标签（放轴线下方 12px）
-      var plotRight = pad + plotW; // 数据区右边界 = 当前时间位置
+      // Y 轴：竖线在数据区左侧（axisX），刻度横线从轴向左延伸小 tick + 贯穿到数据区右边界；
+      // 标尺文字在轴左边（anchor=end），X 轴底线 + 数据区/未来区标签
+      var plotRight = x0 + plotW; // 数据区右边界 = 当前时间位置
+      var axisX = x0 - 6; // y 轴竖线位置（数据区左侧 6px）
       var yTicks = '';
       for (var t = 0; t <= 4; t++) {
         var yy = H - pad - (t / 4) * (H - 2 * pad);
-        yTicks += '<line x1="' + pad + '" y1="' + yy.toFixed(1) + '" x2="' + plotRight.toFixed(1) + '" y2="' + yy.toFixed(1) + '" stroke="#2a2f42" stroke-width="0.5"/>' +
-          '<text x="2" y="' + (yy + 3).toFixed(1) + '" fill="#8a93ab" font-size="8">' + fmtNum(maxV * t / 4) + '</text>';
+        yTicks += '<line x1="' + (axisX - 6) + '" y1="' + yy.toFixed(1) + '" x2="' + plotRight.toFixed(1) + '" y2="' + yy.toFixed(1) + '" stroke="#2a2f42" stroke-width="0.5"/>' +
+          '<text x="' + (axisX - 8) + '" y="' + (yy + 3).toFixed(1) + '" fill="#8a93ab" font-size="8" text-anchor="end">' + fmtNum(maxV * t / 4) + '</text>';
       }
-      // x 轴标签：1h 取 12 个、24h 取 12 个、7d/30d 取 10 个均匀分布时间点，放轴下方（不重叠）
+      // x 轴标签：1h 取 12 个、24h 取 12 个、7d/30d 取 10 个均匀分布时间点，放轴下方（不重叠）。
+      // 数据区与未来区共用同一刻度节奏（labelEvery 桶 1 个），间距一致；
+      // 最左标签 anchor=start（避免左溢出被裁），最右（未来区最后一个）anchor=end
       var xLabels = '';
       var n = labels.length;
       var maxXL = state.range === '1h' ? 12 : (state.range === '24h' ? 12 : 10);
@@ -539,12 +566,35 @@
       else {
         for (var k = 0; k < maxXL; k++) idxs.push(Math.round(k * (n - 1) / (maxXL - 1)));
       }
+      // 数据区标签的均匀间隔（桶数），未来区沿用同一节奏
+      var labelEvery = (n > 1) ? (n - 1) / Math.max(1, maxXL - 1) : 1;
       idxs.forEach(function (i) {
-        var xx = pad + i * step;
-        xLabels += '<text x="' + xx.toFixed(1) + '" y="' + (H - pad + 16) + '" fill="#8a93ab" font-size="8" text-anchor="middle">' + esc(labels[i]) + '</text>';
+        var xx = x0 + i * step;
+        var anchor = (i === idxs[0]) ? 'start' : 'middle';
+        xLabels += '<text x="' + xx.toFixed(1) + '" y="' + (H - pad + 16) + '" fill="#8a93ab" font-size="8" text-anchor="' + anchor + '">' + esc(labels[i]) + '</text>';
       });
+      // 未来区（3/4 右侧 1/4）：延续数据区同一刻度节奏（labelEvery 桶 1 个），
+      // 画未来标签（弱化色，opacity 0.7），不画折线（无数据）
+      var lastBucketTs = buckets[buckets.length - 1].ts;
+      var bucketSpan = (buckets.length > 1) ? (buckets[buckets.length - 1].ts - buckets[buckets.length - 2].ts) : 60;
+      var futureIdx = 1;
+      while (true) {
+        var fx = plotRight + futureIdx * step * labelEvery;
+        if (fx > W - pad) break;
+        var fts = lastBucketTs + futureIdx * bucketSpan * labelEvery;
+        var fl = new Date(fts * 1000);
+        var fLabel = state.range === '1h' ? fl.toLocaleTimeString('zh-CN', { hour12: false, minute: '2-digit' })
+          : state.range === '24h' ? fl.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit' })
+          : fl.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
+        xLabels += '<text x="' + fx.toFixed(1) + '" y="' + (H - pad + 16) + '" fill="#5a6275" font-size="8" text-anchor="end" opacity="0.7">' + esc(fLabel) + '</text>';
+        futureIdx++;
+      }
       svgEl.innerHTML = '<svg width="' + W + '" height="' + (H + 28) + '" viewBox="0 0 ' + W + ' ' + (H + 28) + '">' +
-        '<line x1="' + pad + '" y1="' + (H - pad) + '" x2="' + plotRight.toFixed(1) + '" y2="' + (H - pad) + '" stroke="#3a3f55" stroke-width="1"/>' +
+        // y 轴竖线（数据区左侧）
+        '<line x1="' + axisX + '" y1="' + pad + '" x2="' + axisX + '" y2="' + (H - pad) + '" stroke="#3a3f55" stroke-width="1"/>' +
+        // x 轴底线延伸全宽（未来区也有横轴）；数据区到 3/4 实线，未来区虚线
+        '<line x1="' + x0 + '" y1="' + (H - pad) + '" x2="' + plotRight.toFixed(1) + '" y2="' + (H - pad) + '" stroke="#3a3f55" stroke-width="1"/>' +
+        '<line x1="' + plotRight.toFixed(1) + '" y1="' + (H - pad) + '" x2="' + (W - pad) + '" y2="' + (H - pad) + '" stroke="#3a3f55" stroke-width="1" stroke-dasharray="3 3"/>' +
         // 右侧 1/4 未来区：虚线标记"现在"分界（当前时间竖线），提示未来无数据
         '<line x1="' + plotRight.toFixed(1) + '" y1="' + pad + '" x2="' + plotRight.toFixed(1) + '" y2="' + (H - pad) + '" stroke="#3a3f55" stroke-width="1" stroke-dasharray="3 3"/>' +
         yTicks +
@@ -690,27 +740,31 @@
     var q = '?range=' + state.range;
     if (state.model) q += '&model=' + encodeURIComponent(state.model);
     if (state.upstream) q += '&upstream=' + encodeURIComponent(state.upstream);
-    api('/_admin/metrics' + q).then(function (m) {
+    var eq = '/_admin/events?limit=100' + (state.model ? '&model=' + encodeURIComponent(state.model) : '') + (state.upstream ? '&upstream=' + encodeURIComponent(state.upstream) : '');
+    // 并行拉取（metrics/series/events 互不依赖），减少串行延迟与限流压力
+    Promise.all([
+      api('/_admin/metrics' + q),
+      api('/_admin/series' + q),
+      api(eq)
+    ]).then(function (res) {
       if (seq !== loadSeq) return;
+      var m = res[0], s = res[1], d = res[2];
       renderKpis(m);
       renderTokens4(m);
       renderCharts(m);
-      return api('/_admin/series' + q).then(function (s) {
-        if (seq !== loadSeq) return;
-        renderTrend(s);
-        return api('/_admin/events?limit=100' + (state.model ? '&model=' + encodeURIComponent(state.model) : '') + (state.upstream ? '&upstream=' + encodeURIComponent(state.upstream) : '')).then(function (d) {
-          if (seq !== loadSeq) return;
-          var evs = d.events || [];
-          renderEvents(evs);
-          renderUpstream(m, evs);
-          fillUpstreamFilter(evs);
-          fillModelFilter(m, evs);
-        });
-      });
+      renderTrend(s);
+      var evs = d.events || [];
+      renderEvents(evs);
+      renderUpstream(m, evs);
+      fillUpstreamFilter(evs);
+      fillModelFilter(m, evs);
     }).catch(function (err) {
+      if (seq !== loadSeq) return;
       if (err.message === 'unauthorized') {
         state.token = '';
         showLogin();
+      } else if (err.message === 'ratelimited') {
+        showRateLimit();
       }
     });
   }

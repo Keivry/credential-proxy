@@ -295,9 +295,7 @@ class GlobalPiiTokens:
                 if tok in table_t2p:
                     table_t2p.move_to_end(tok)
                 # pii_cache_hit 计数（仅请求侧合法值；响应侧 resp_p2t 不参与）
-                if not response_side and self._collector is not None:
-                    self._collector.incr_sync_pii_cache(hit=1, miss=0)
-                # per-request 累计（事件详情数据源）
+                # per-request 累计（事件详情数据源；incr_event 按正确上游合并）
                 try:
                     from _metrics import accumulate_pii_cache
 
@@ -330,9 +328,7 @@ class GlobalPiiTokens:
                 # 批量淘汰 pii_lru_evictions += n（两表各自触发均累加）
                 self._collector.incr_sync_lru(cred=0, pii=evicted)
             # pii_cache_miss 计数（仅请求侧合法值；响应侧不参与）
-            if not response_side and self._collector is not None:
-                self._collector.incr_sync_pii_cache(hit=0, miss=1)
-            # per-request 累计（事件详情数据源）
+            # per-request 累计（事件详情数据源；incr_event 按正确上游合并）
             try:
                 from _metrics import accumulate_pii_cache
 

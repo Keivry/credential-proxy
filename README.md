@@ -352,6 +352,7 @@ cd get && make build  # → /tmp/get-credential-linux-amd64
 
 ## 版本历史
 
+- **v0.9.38** — 仪表盘体验修复 6 项（v0.9.37 后续）：① 上游筛选 PII 关联修复——`incr_sync_pii_detected`/`incr_sync_pii_cache` 改先累进请求 ContextVar（`incr_event` 按正确上游合并），`_token.py` 去掉双计调用，`_query_1h` 的 `_daily` 合并仅在 model_filter（`db_recent is None`）时执行消除 pii_by_type/tokens 双计；② 限流提示 banner 改工具栏上方 tooltip（3s 自动消失）；③ 折线图两侧留白（数据区起点 `pad+gap`，gap=26）；④ 24h 最左 x 标签 `anchor=start` 修复溢出、未来区最右 `anchor=end`；⑤ y 轴画竖线 + 刻度横线向左 tick + 标尺文字移到轴左侧（`anchor=end`）；⑥ 未来区刻度间距与数据区统一（共用 `labelEvery` 节奏）
 - **v0.9.37** — 仪表盘折线图/持久化修复 5 项：① 重启后 1h 折线图保留历史（`_series_1h` DB 小时兜底，ring 精确优先、DB 剩余量摊到空桶，守恒不双计）；② `_series_db` 桶 off-by-one 修复（24h/7d 缺最近 1 小时、30d 缺今天整天 → 含当前桶）；③ 折线图当前时间固定横轴 3/4 处、右侧 1/4 未来区留白；④ SVG 宽度响应式 + 7d hover 点抽稀；⑤ 事件 hover tooltip 错位修复（闭包捕获事件对象 + 真实鼠标坐标）
 - **v0.9.17** — 三层缓冲/keepalive/WHATWG 帧声明：共享 `utils/json_walk.py` 薄包装三处、Vault `next_available_index` 空洞跳过/`rand8=secrets.token_hex(4)`/`__PII_<seq>_<rand8>__`/`PII_FUZZY_RESTORE=0`（`re.IGNORECASE`）、流式 `byte_buf` WHATWG/`line_buf 16KB/30s`/`arg_buf 一次性 walk`/`keepalive 10s`/截断合成 `seen_global_terminal`、检测硬化 `PII_DETECTION_HARDENING=0/1` 总闸（`fc:/fd:` 精确前缀/ReDoS/CJK/`lru_cache(4)`）；新增 3 测试 + `sentinel_{chat,anthropic,responses}.jsonl`（`scripts/sentinel_record.py --check`）
 - **v0.9.14** — 细化 `byte_buf` 残余 `data:` 前缀走 SSE 行级 `json-aware`，避免残余 `plain` 回退破坏

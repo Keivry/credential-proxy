@@ -385,7 +385,7 @@ wheels = [
 
 [[package]]
 name = "credential-proxy"
-version = "0.9.37"
+version = "0.9.38"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
