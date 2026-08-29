@@ -480,8 +480,14 @@ async def _handle_sse(request: web.Request, collector) -> web.StreamResponse:
     # 已推送事件去重：set 提供 O(1) 判重，deque 维持 2000 淘汰（set+deque 双结构防 O(n·m) 扫描）
     sent_set: set[str] = set()
     sent_ids: deque[str] = deque(maxlen=2000)
-    # 连接时先推最近历史快照，避免"刚连上空白"（dashboard 打开即有数据）
-    for e in reversed(collector.events(limit=50)):
+    # SSE 绑定查询维度（前端切 range/model/upstream 会重建 SSE，这里读取建连时参数）
+    _range = request.query.get('range', '1h')
+    if _range not in ('1h', '24h', '7d', '30d'):
+        _range = '1h'
+    _model = request.query.get('model') or None
+    _upstream = request.query.get('upstream') or None
+    # 连接时先推最近历史快照，避免"刚连上空白"（dashboard 打开即有数据）；带过滤防混入不符维度事件
+    for e in reversed(collector.events(limit=50, model=_model, upstream=_upstream)):
         _rid = e.get('request_id', '')
         if _rid and _rid not in sent_set:
             sent_set.add(_rid)
@@ -493,12 +499,6 @@ async def _handle_sse(request: web.Request, collector) -> web.StreamResponse:
     last_ping_ts = _time.time()
     last_metrics_ts = _time.time()
     start = _time.time()
-    # SSE 绑定查询维度（前端切 range/model/upstream 会重建 SSE，这里读取建连时参数）
-    _range = request.query.get('range', '1h')
-    if _range not in ('1h', '24h', '7d', '30d'):
-        _range = '1h'
-    _model = request.query.get('model') or None
-    _upstream = request.query.get('upstream') or None
     try:
         while True:
             # 15s 全量 metrics 快照（单 writer 顺序写，不另起 task 防并发写 StreamResponse 交织）
@@ -533,9 +533,9 @@ async def _handle_sse(request: web.Request, collector) -> web.StreamResponse:
                     f'event: metrics\ndata: {json.dumps(_snap, ensure_ascii=False)}\n\n'.encode()
                 )
                 last_metrics_ts = _time.time()
-            # 推送新事件（自上次推送以来，按 request_id 去重）
+            # 推送新事件（自上次推送以来，按 request_id 去重）；带 model/upstream 过滤（与建连维度一致）
             # 取数窗口 200：2s 轮询间隔内 QPS≤100 不丢（50 在 >25 rps 时截断丢事件）
-            evs = collector.events(limit=200)
+            evs = collector.events(limit=200, model=_model, upstream=_upstream)
             new_evs = [
                 e
                 for e in evs

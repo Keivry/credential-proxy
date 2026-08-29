@@ -163,7 +163,9 @@
 <script>
 (function () {
   'use strict';
-  var state = { range: '1h', token: '', live: true, ev: [], model: '', upstream: '' };
+  var state = { range: '1h', token: '', live: true, ev: [], model: '', upstream: '',
+    // 累积全量集合（只增不减）：下拉选项永不随过滤收缩，保证任意维度可切换
+    allModels: {}, allUpstreams:{} };
 
   function esc(s) {
     var d = document.createElement('div');
@@ -374,7 +376,11 @@
                   }
                 }
               },
-              scales: { y: { beginAtZero: true, ticks: { callback: function (v) { return fmtNum(v); } } } }
+              scales: {
+                y: { beginAtZero: true, ticks: { callback: function (v) { return fmtNum(v); } } },
+                // X 轴类别标签：长标签自动旋转 45° 防重叠截断（完整值 hover 见 tooltip）
+                x: { ticks: { maxRotation: 45, minRotation: 0, autoSkip: true, maxTicksLimit: 20 } }
+              }
             }
           });
         } else {
@@ -392,11 +398,19 @@
     var max = Math.max.apply(null, keys.map(function (k) { return data[k]; }));
     var w = 480, h = 160, bw = 40;
     var bars = keys.map(function (k, i) {
-      var bh = (data[k] / max) * (h - 30);
+      // 最高柱 bh = h-36（留 16px 顶部空间给数值文字），柱顶文字不越界
+      var bh = Math.max(2, (data[k] / max) * (h - 36));
+      var valY = h - bh - 26;
+      // 最高柱文字若贴顶（<8）则移入柱内顶部显示，避免被裁
+      if (valY < 8) valY = Math.min(h - bh + 12, h - 8);
+      // X 轴类别标签：短标签直接显示，长标签截断 + title 完整值（hover 可见）
+      var label = String(k).slice(0, 10);
+      var labelFull = esc(String(k));
+      var labelTd = labelFull !== esc(label) ? ' title="' + labelFull + '"' : '';
       return '<g><rect x="' + (i * (bw + 8) + 8) + '" y="' + (h - bh - 20) + '" width="' + bw + '" height="' + bh + '" fill="#4cc2ff66" stroke="#4cc2ff"><title>' +
         esc(k) + ': ' + Number(data[k]).toLocaleString('en-US') + '</title></rect>' +
-        '<text x="' + (i * (bw + 8) + 8 + bw / 2) + '" y="' + (h - bh - 26) + '" text-anchor="middle">' + fmtNum(data[k]) + '</text>' +
-        '<text x="' + (i * (bw + 8) + 8 + bw / 2) + '" y="' + (h - 6) + '" text-anchor="middle">' + esc(String(k).slice(0, 10)) + '</text></g>';
+        '<text x="' + (i * (bw + 8) + 8 + bw / 2) + '" y="' + valY + '" text-anchor="middle">' + fmtNum(data[k]) + '</text>' +
+        '<text x="' + (i * (bw + 8) + 8 + bw / 2) + '" y="' + (h - 6) + '" text-anchor="middle"' + labelTd + '>' + esc(label) + '</text></g>';
     }).join('');
     document.getElementById(id + '-chart').innerHTML = '';
     svgEl.innerHTML = '<svg width="' + Math.max(w, keys.length * (bw + 8)) + '" height="' + h + '">' + bars + '</svg>';
@@ -435,7 +449,8 @@
             type: 'line',
             data: { labels: labels, datasets: datasets },
             options: {
-              interaction: { mode: 'index', intersect: false },
+              // 宽松 hover：nearest 就近任意点触发（index 模式要求落在索引区间内，判定过严）
+              interaction: { mode: 'nearest', intersect: false, axis: 'x' },
               plugins: {
                 legend: { labels: { color: '#8a93ab', font: { size: 10 } } },
                 tooltip: {
@@ -448,8 +463,14 @@
                 }
               },
               scales: {
-                y: { ticks: { callback: function (val) { return fmtNum(val); }, color: '#8a93ab' }, grid: { color: '#2a2f42' } },
-                x: { ticks: { color: '#8a93ab', maxTicksLimit: 10 } }
+                y: {
+                  title: { display: true, text: '数量 / ms', color: '#8a93ab', font: { size: 10 } },
+                  ticks: { callback: function (val) { return fmtNum(val); }, color: '#8a93ab' }, grid: { color: '#2a2f42' }
+                },
+                x: {
+                  title: { display: true, text: state.range === '1h' ? '分钟' : (state.range === '24h' ? '小时' : '日期'), color: '#8a93ab', font: { size: 10 } },
+                  ticks: { color: '#8a93ab', maxTicksLimit: 10 }
+                }
               }
             }
           });
@@ -465,7 +486,7 @@
       } catch (e) { /* fallthrough */ }
     }
     chartEl.innerHTML = '';
-    // SVG 折线降级
+    // SVG 折线降级（带横纵轴标尺 + <title> 精确值 hover）
     if (buckets.length) {
       var W = 600, H = 160, pad = 8;
       var maxV = Math.max.apply(null, buckets.map(function (b) { return b.requests || 0; })) || 1;
@@ -481,8 +502,20 @@
           (b.tokens_prompt || 0).toLocaleString('en-US') + ' p95=' + (b.p95 != null ? Math.round(b.p95) : '—') +
           '</title></circle>';
       }).join('');
+      // Y 轴刻度（4 档）+ X 轴底线 + 标签
+      var yTicks = '';
+      for (var t = 0; t <= 4; t++) {
+        var yy = H - pad - (t / 4) * (H - 2 * pad);
+        yTicks += '<line x1="' + pad + '" y1="' + yy.toFixed(1) + '" x2="' + (W - pad) + '" y2="' + yy.toFixed(1) + '" stroke="#2a2f42" stroke-width="0.5"/>' +
+          '<text x="2" y="' + (yy + 3).toFixed(1) + '" fill="#8a93ab" font-size="8">' + fmtNum(maxV * t / 4) + '</text>';
+      }
+      var xLabel = labels.length > 8 ? labels[0] + ' … ' + labels[labels.length - 1] : (labels[0] || '');
       svgEl.innerHTML = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">' +
-        '<polyline points="' + pts + '" fill="none" stroke="#4cc2ff" stroke-width="1.5"/>' + circles + '</svg>';
+        '<line x1="' + pad + '" y1="' + (H - pad) + '" x2="' + (W - pad) + '" y2="' + (H - pad) + '" stroke="#3a3f55" stroke-width="1"/>' +
+        yTicks +
+        '<polyline points="' + pts + '" fill="none" stroke="#4cc2ff" stroke-width="1.5"/>' + circles +
+        '<text x="' + (W - pad) + '" y="' + (H - 2) + '" fill="#8a93ab" font-size="8" text-anchor="end">' + esc(xLabel) + '</text>' +
+        '</svg>';
     } else {
       svgEl.innerHTML = '<span style="color:var(--dim)">' + esc(state.range) + ' 窗口无数据</span>';
     }
@@ -504,7 +537,14 @@
 
   // ── 事件表 ──
   function renderEvents(events) {
-    state.ev = events || [];
+    // 按 request_id 去重（SSE 增量与全量加载竞态时可能重复），保留最新顺序
+    var seen = {};
+    state.ev = (events ||[]).filter(function (e) {
+      var rid = e.request_id || '';
+      if (rid && seen[rid]) return false;
+      if (rid) seen[rid] = 1;
+      return true;
+    });
     var tbody = document.querySelector('#ev-table tbody');
     tbody.innerHTML = (state.ev ||[]).map(function (e, idx) {
       var tokens = e.tokens || {};
@@ -584,12 +624,17 @@
       'summary: ' + summary;
     tip.appendChild(pre);
     tip.hidden = false;
-    // 定位跟随行（fixed，防溢出视口）
+    // 定位跟随行（fixed，防溢出视口：右侧放不下换左侧；底部放不下上移，保证完整可见）
     var rect = tr.getBoundingClientRect();
     var left = rect.right + 8;
     if (left + 420 > window.innerWidth) left = rect.left - 428;
     tip.style.left = Math.max(4, left) + 'px';
-    tip.style.top = Math.max(4, rect.top) + 'px';
+    // 先显示再测量实际高度（max-height 60vh 可能更矮）
+    var th = tip.offsetHeight;
+    var top = rect.top;
+    // 行在视口底部：上移让 tooltip 完整显示（顶部至少留 4px）
+    if (top + th > window.innerHeight - 4) top = Math.max(4, window.innerHeight - th - 8);
+    tip.style.top = top + 'px';
   }
 
   function hideEvTooltip() {
@@ -633,10 +678,9 @@
   function fillModelFilter(metrics, evs) {
     var sel = document.getElementById('model-filter');
     var cur = sel.value;
-    var models = {};
-    // tokens 键（成本归因维度）
+    var models = state.allModels;
+    // 累积全量（只增不减）：tokens 键 + 事件行 model 并入集合，过滤后仍保留全部选项
     Object.keys((metrics && metrics.tokens) ||{}).forEach(function (m) { models[m] = 1; });
-    // 事件行 model（补充无 usage 请求）
     (evs ||[]).forEach(function (e) { if (e.model) models[e.model] = 1; });
     var html = '<option value="">全部模型</option>';
     Object.keys(models).sort().forEach(function (m) {
@@ -651,8 +695,9 @@
   function fillUpstreamFilter(evs) {
     var sel = document.getElementById('ev-upstream');
     var cur = sel.value;
-    var ups = {};
-    evs.forEach(function (e) { ups[e.upstream || 'other'] = 1; });
+    var ups = state.allUpstreams;
+    // 累积全量（只增不减）：过滤后仍保留全部上游选项
+    (evs ||[]).forEach(function (e) { ups[e.upstream || 'other'] = 1; });
     var html = '<option value="">全部上游</option>';
     Object.keys(ups).sort().forEach(function (u) { html += '<option value="' + esc(u) + '">' + esc(u) + '</option>'; });
     sel.innerHTML = html;
@@ -728,6 +773,16 @@
 
   function prependEvent(e) {
     var evs = state.ev || [];
+    // 新事件并入累积集合（下拉选项跟随真实数据，SSE 增量也生效）
+    if (e.model) state.allModels[e.model] = 1;
+    if (e.upstream) state.allUpstreams[e.upstream] = 1;
+    // 按 request_id 去重：SSE 重连历史快照重推 / 快照与轮询竞态时跳过已存在事件，防重复行
+    var rid = e.request_id || '';
+    if (rid) {
+      for (var i = 0; i < evs.length; i++) {
+        if (evs[i].request_id === rid) return; // 已存在，跳过
+      }
+    }
     evs.unshift(e);
     evs = evs.slice(0, 100);
     state.ev = evs;
