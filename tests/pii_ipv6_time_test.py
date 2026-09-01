@@ -8,17 +8,22 @@
 无法验证正则命中）。
 """
 
-from _pii import _COMBINED_RE, _is_reserved_ip, _is_valid_ipv6
+from _pii import _COMBINED_RE, _is_reserved_ip
 
 
 def _ipv6_hits(text: str) -> list[str]:
-    return [
-        m.group(0)
-        for m in _COMBINED_RE.finditer(text)
-        if m.lastgroup == 'ipv6'
-        and _is_valid_ipv6(m.group(0))
-        and not _is_reserved_ip(m.group(0), 'ipv6')
-    ]
+    """端到端判定：调用真实 PiiDetector.scan()，返回 ipv6 命中值。
+
+    走生产路径（正则粗筛 + 标点剥离 + 标准库校验 + 保留段豁免），
+    不在此处重写逻辑——保证回归测试锁住真实 scan 行为。
+    """
+    import asyncio
+
+    from _pii import PiiDetector
+
+    d = PiiDetector()
+    hits = asyncio.run(d.scan(text))
+    return [v for k, v in hits if k == 'ipv6']
 
 
 # 非保留段真实公网 IPv6 样例
@@ -67,6 +72,27 @@ def test_compressed_middle_double_colon_hit():
 def test_compressed_trailing_double_colon_hit():
     hits = _ipv6_hits(PUB_IPV6_TAIL)
     assert len(hits) == 1
+
+
+# ── 句末标点剥离（Y-1 回归：粗筛贪婪尾串粘连句号导致漏检）──
+def test_sentence_end_period_hit():
+    # 真实公网 IPv6 后跟句号：粗筛吞掉句号 → 剥离后应命中
+    hits = _ipv6_hits(f'{PUB_IPV6_FULL}.')
+    assert len(hits) == 1
+    assert hits[0] == PUB_IPV6_FULL
+
+
+def test_sentence_end_comma_hit():
+    hits = _ipv6_hits(f'use {PUB_IPV6_COMPRESSED}, then continue')
+    assert len(hits) == 1
+    assert hits[0] == PUB_IPV6_COMPRESSED
+
+
+def test_trailing_double_colon_kept():
+    # rstrip 不能剥 `:`（双冒号结尾是合法压缩 IPv6）
+    hits = _ipv6_hits(f'prefix {PUB_IPV6_TAIL}')
+    assert len(hits) == 1
+    assert hits[0] == PUB_IPV6_TAIL
 
 
 def test_loopback_hit_then_reserved():

@@ -424,7 +424,10 @@
         var covTxt = (ringCov != null ? Math.round(ringCov) + 's' : '?');
         var lenTxt = (ringLen != null ? ringLen + '条' : '?');
         if (state.range === '1h') {
-          return 'PII 采样采集中（近似）：当前 1h 环 ' + lenTxt + ' / ' + covTxt + '，需 100条+3600s 才精确，但悬停已展示近似 Top3；切换 24h 可看持久化精确数据（PERSIST=1 已启用）';
+          if (persist === true) {
+            return 'PII 采样采集中（近似）：当前 1h 环 ' + lenTxt + ' / ' + covTxt + '，需 100条+3600s 才精确，但悬停已展示近似 Top3；切换 24h 可看持久化精确数据（PERSIST=1 已启用）';
+          }
+          return 'PII 采样采集中（近似）：当前 1h 环 ' + lenTxt + ' / ' + covTxt + '，需 100条+3600s 才精确，但悬停已展示近似 Top3；24h/7d 历史需开启持久化（PII_VALUE_SAMPLE_PERSIST=1）';
         }
         return 'PII 采样采集中（近似）：当前窗口未达精确阈值，悬停已展示近似 Top3';
       }
@@ -1046,6 +1049,8 @@
           if ((snap.upstream || null) !== (state.upstream || null)) return;
           var m = snap.metrics || {};
           if (m && m.error) return;
+          // SSE 快照同步 health（piiHintText 依赖 enabled/persist/ring 热状态）
+          if (snap.health && !snap.health.error) state.lastHealth = snap.health;
           renderKpis(m);
           renderTokens4(m);
           renderCharts(m);

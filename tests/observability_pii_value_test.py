@@ -281,6 +281,94 @@ class TestApi401:
             'Cache-Control', ''
         ) or 'no-store' in _NO_STORE_HEADERS.get('Cache-Control', '')
 
+    @pytest.mark.asyncio
+    async def test_metrics_401_real_request_no_leak(self, tmp_path, monkeypatch):
+        """真实 aiohttp 请求：未带 token 访问 /_admin/metrics 必须 401 且不泄露 pii_value_samples。
+
+        其它测试文件（credential/llm/matrix）在模块级 mock 了 aiohttp.web，
+        这里显式恢复真实模块 + 重载 _admin，验证真实 HTTP 路径。
+        """
+        import importlib
+        import importlib.util
+        import sys
+
+        # 保存被污染的模块引用，结束后恢复
+        saved = {
+            'aiohttp': sys.modules.get('aiohttp'),
+            'aiohttp.web': sys.modules.get('aiohttp.web'),
+            'aiohttp.client_exceptions': sys.modules.get('aiohttp.client_exceptions'),
+            '_admin': sys.modules.get('_admin'),
+        }
+
+        try:
+            # 恢复真实 aiohttp.web / aiohttp / client_exceptions
+            import aiohttp
+
+            for sub in ('web', 'client_exceptions'):
+                full = f'aiohttp.{sub}'
+                spec = importlib.util.find_spec(full)
+                if spec is None:
+                    pytest.skip(f'无法定位真实模块 {full}')
+                assert spec.loader is not None
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules[full] = mod
+                spec.loader.exec_module(mod)
+            # 重新加载 aiohttp 本体（让 __getattr__ 重新指向真实子模块）
+            importlib.reload(aiohttp)
+            # 重载 _admin（绑定真实 web）
+            if '_admin' in sys.modules:
+                importlib.reload(sys.modules['_admin'])
+            else:
+                import _admin  # noqa: F401
+
+            from aiohttp import web
+            from aiohttp.test_utils import TestClient, TestServer
+
+            from _admin import init_observability
+
+            monkeypatch.setenv('PII_VALUE_SAMPLE_ENABLED', '1')
+            monkeypatch.setenv('PII_VALUE_SAMPLE_PERSIST', '1')
+            monkeypatch.setenv(
+                'OBSERVABILITY_ADMIN_TOKEN', 'test-token-0123456789abcdef'
+            )
+
+            c = MetricsCollector(str(tmp_path))
+            # 注入一条采样数据，验证 401 路径下确实不会带出
+            ctx = _req_pii_ctx()
+            ctx['pii_value_samples'] = {
+                'phone': {'138****0000': {'count': 3, 'hash': 'a' * 16}}
+            }
+            await c.incr_event(
+                upstream='8878',
+                status=200,
+                request_id='r-auth',
+                tail='chat/completions',
+            )
+            c._flush_sync()
+
+            app = web.Application()
+            init_observability(app, c)
+            server = TestServer(app)
+            client = TestClient(server)
+            await client.start_server()
+            try:
+                resp = await client.get('/_admin/metrics?range=1h')
+                assert resp.status == 401
+                text = await resp.text()
+                assert 'pii_value_samples' not in text
+                assert 'unauthorized' in text
+                assert 'no-store' in resp.headers.get('Cache-Control', '')
+            finally:
+                await client.close()
+            await c.close()
+        finally:
+            # 恢复被污染的模块引用（保持其它测试的 mock 环境）
+            for name, mod in saved.items():
+                if mod is not None:
+                    sys.modules[name] = mod
+                else:
+                    sys.modules.pop(name, None)
+
     def test_handle_metrics_includes_pii_when_auth(self, tmp_path, monkeypatch):
         monkeypatch.setenv('PII_VALUE_SAMPLE_ENABLED', '1')
         from _admin import _NO_STORE_HEADERS

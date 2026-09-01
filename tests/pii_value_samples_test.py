@@ -19,15 +19,11 @@ class TestMaskPiiValue:
         assert mask_pii_value('phone', '__PII_82_8f6a798b__') == '__P****8b__'
         assert mask_pii_value('phone', '__PII_73_456a6eab__') == '__P****ab__'
         assert mask_pii_value('phone', '') == '***'
-        # real phone
-        assert (
-            mask_pii_value('phone', '__PII_82_8f6a798b__') == '138****1234'
-            or mask_pii_value('phone', '__PII_82_8f6a798b__') == '__P****8b__'
-        )  # placeholder
+        # real phone（占位符形态输入走占位符掩码 first3****last4）
+        assert mask_pii_value('phone', '__PII_82_8f6a798b__') == '__P****8b__'
+        assert mask_pii_value('phone', '__PII_40_45aa7dbb__') == '__P****bb__'
         assert mask_pii_value('phone', '__PII_82_8f6a798b__') != '__PII_82_8f6a798b__'
         assert mask_pii_value('phone', '__PII_82_8f6a798b__') == '__P****8b__'
-        assert mask_pii_value('phone', '__PII_82_8f6a798b__') == '__P****8b__'
-        assert mask_pii_value('phone', '__PII_82_8f6a798b__') == '__P****8b__' or True
 
     def test_email(self):
         # new mask hides local/domain first char: ***@***.suffix (防 a***@b.com 侧信道)

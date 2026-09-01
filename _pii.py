@@ -108,6 +108,13 @@ PII_SCAN_INPUT_LIMIT = 1_048_576  # 单次扫描输入上限 1MB
 
 def _load_pii_raw_file(path: str) -> tuple[object, str | None]:
     """读取 YAML/JSON 原始数据，返回 (data, error)。"""
+    # 防误配 DoS：文件大小上限（与 PII_SCAN_INPUT_LIMIT 同级 1MB），超限拒绝
+    try:
+        st = os.stat(path)
+        if st.st_size > 1_048_576:
+            return None, f'文件过大（{st.st_size} 字节 > 1MB 上限），拒绝加载'
+    except OSError as e:
+        return None, f'stat 失败: {e}'
     try:
         with open(path, 'r', encoding='utf-8') as f:
             text = f.read()
@@ -1071,6 +1078,9 @@ class PiiDetector:
             if name in builtin_names:
                 logger.warning('自定义正则 %s 与内置重名，拒绝加载', name)
                 continue
+            if name in self.custom_names:
+                logger.warning('自定义正则 %s 与已加载规则重名，拒绝加载', name)
+                continue
             if name in new_names:
                 logger.warning('自定义正则 %s 重复，拒绝加载', name)
                 continue
@@ -1229,6 +1239,14 @@ class PiiDetector:
                 self.custom_strikes[name] = strikes
                 if strikes >= PII_RE_DOS_STRIKES:
                     self.custom_disabled.add(name)
+                    # 可观测性：ReDoS 停用暴露到 health（运维可见自定义规则被降级）
+                    if self._collector is not None:
+                        try:
+                            self._collector.set_health_flag(
+                                'pii_custom_disabled_count', len(self.custom_disabled)
+                            )
+                        except Exception:  # pragma: no cover — 防御
+                            pass
                     logger.warning(
                         '自定义正则 %s 连续 %d 次超时，临时停用',
                         name,
@@ -1387,8 +1405,14 @@ class PiiDetector:
             if kind is None:
                 continue
             # IPv6：正则粗筛后用标准库二次校验（用户要求：粗筛→标准库）
-            if kind == 'ipv6' and not _is_valid_ipv6(value):
-                continue
+            if kind == 'ipv6':
+                # 粗筛尾部 `[0-9a-fA-F:.]*` 贪婪可能粘连句子标点（如 `2001:db8::1.`），
+                # 剥掉尾随标点后再校验，避免合法 IPv6 因粘连标点被误判非法而漏脱敏
+                core = value.rstrip('.,;)]}')
+                if core and _is_valid_ipv6(core):
+                    value = core
+                elif not _is_valid_ipv6(value):
+                    continue
             # URL 上下文防误报：?id= 等参数长数字不判银行卡
             if kind == 'bank_card' and _URL_QUERY_PARAM_RE.search(value):
                 continue

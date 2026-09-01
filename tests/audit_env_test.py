@@ -191,6 +191,23 @@ class TestParsePiiEnvConfig:
         cfg = parse_pii_env_config()
         assert cfg['errors']
 
+    def test_custom_rules_file_too_large_rejected(self, tmp_path):
+        """防误配 DoS：自定义规则文件 >1MB 拒绝加载（fail-closed 进 errors）。"""
+        big = tmp_path / 'big.yaml'
+        big.write_text('-' * 2_000_000, encoding='utf-8')
+        os.environ['PII_CUSTOM_RULES_FILE'] = str(big)
+        cfg = parse_pii_env_config()
+        assert cfg['errors']
+        assert any('过大' in e for e in cfg['errors'])
+        os.environ.pop('PII_CUSTOM_RULES_FILE', None)
+
+    def test_custom_rules_file_missing_rejected(self, tmp_path):
+        os.environ['PII_CUSTOM_RULES_FILE'] = str(tmp_path / 'nope.yaml')
+        cfg = parse_pii_env_config()
+        assert cfg['errors']
+        assert any('不存在' in e for e in cfg['errors'])
+        os.environ.pop('PII_CUSTOM_RULES_FILE', None)
+
 
 class TestEnsureAuditInitDefensive:
     """R6 回归：_ensure_audit_init 防御性校验（approve + 空白名单降级 block）。"""

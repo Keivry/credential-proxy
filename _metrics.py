@@ -1554,6 +1554,9 @@ class MetricsCollector:
         ring = self.ring_stats()
         return {
             'pii_enabled': bool(self.counters.get('_pii_enabled', True)),
+            'pii_custom_disabled_count': self.counters.get(
+                'pii_custom_disabled_count', 0
+            ),
             'audit_mode': self.counters.get('_audit_mode', ''),
             'placeholder_prompt_enabled': bool(
                 self.counters.get('_placeholder_prompt_enabled', True)
@@ -1642,28 +1645,6 @@ class MetricsCollector:
                         continue
                     mk = masked[:64] if len(masked) > 64 else masked
                     dest[mk] = dest.get(mk, 0) + cnt_i
-        # hash lookup from in-memory daily/hourly（首写 wins，1h 需按 upstream 过滤避免跨上游串 hash）
-        hash_lookup: dict[str, dict[str, str]] = {}
-        with self._lock:
-            # _daily/_hourly key 为 (day|hour, upstream)，上游过滤时仅取匹配分片
-            daily_items = list(self._daily.items())
-            hourly_items = list(self._hourly.items())
-            for (dk, up), agg in daily_items:
-                if upstream_filter is not None and up != upstream_filter:
-                    continue
-                for kind, inner in getattr(agg, 'pii_value_samples', {}).items():
-                    hl = hash_lookup.setdefault(kind, {})
-                    for mk, meta in inner.items():
-                        if mk not in hl and isinstance(meta, dict) and meta.get('hash'):
-                            hl[mk] = str(meta['hash'])[:16]
-            for (hk, up), agg in hourly_items:
-                if upstream_filter is not None and up != upstream_filter:
-                    continue
-                for kind, inner in getattr(agg, 'pii_value_samples', {}).items():
-                    hl = hash_lookup.setdefault(kind, {})
-                    for mk, meta in inner.items():
-                        if mk not in hl and isinstance(meta, dict) and meta.get('hash'):
-                            hl[mk] = str(meta['hash'])[:16]
         pii_out: dict[str, dict[str, dict]] = {}
         truncated: dict[str, bool] = {}
         enabled = _is_pii_value_sample_enabled()
@@ -1765,8 +1746,9 @@ class MetricsCollector:
                         inner[masked] = cnt
                 if inner:
                     pii_out[kind] = inner
-            # is_precise：PERSIST=1 已走 DB 即精确（与空无关，内存近似走 1h 路径）
-            is_precise = True
+            # is_precise：PERSIST=1 已走 DB 即精确；但空结果（无任何采样数据）不标精确，
+            # 让前端能区分「持久化已开但暂无数据」与「有精确数据」两种状态
+            is_precise = bool(pii_out)
             return pii_out, truncated, is_precise
         except sqlite3.Error:
             return {}, {}, False
