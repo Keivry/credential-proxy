@@ -49,6 +49,15 @@ services:
       # - PII_VALUE_SAMPLE_PERSIST=0  # 0=内存-only（重启清空），1=日级持久化（隐含 ENABLED=1）
       # - PII_VALUE_SAMPLE_HMAC_KEY=  # 可选 HMAC 盐：设后 hash=HMAC-SHA256(SALT,明文)[:16] 防 phone 1万枚举；未设退化 sha256
 
+      # ── 自定义脱敏规则（pii-custom，新增；JSON/YAML，YAML 正则需单引号）──
+      # 合并文件（推荐，含 patterns + names）：
+      # - PII_CUSTOM_RULES_FILE=/data/pii-custom.yaml  # 指向 examples/pii-custom.yaml 挂载
+      # 分离文件（与合并文件可叠加）：
+      # - PII_CUSTOM_PATTERNS_FILE=/data/pii-custom-patterns.yaml
+      # - PII_DICT_FILE=/data/pii-custom-dict.yaml  # 别名 PII_SENSITIVE_DICT_FILE / PII_SENSITIVE_NAMES_FILE
+      # 格式：JSON（{}/[] 开头）或极简 YAML（audit-policy 同款解析），校验失败 SystemExit 拒绝启动
+      # 示例：examples/pii-custom.yaml + examples/pii-custom.json
+
       # ── 输出审计（默认关闭，启用需显式设置）──
       # block = 自动拦截危险 tool call；approve = Matrix 人工审批（需 APPROVAL_WHITELIST）
       # - AUDIT_MODE=block

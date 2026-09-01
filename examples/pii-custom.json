@@ -1,0 +1,38 @@
+{
+  "patterns": [
+    {
+      "name": "emp_no",
+      "pattern": "(?P<emp_no>工号\\d{6})"
+    },
+    {
+      "name": "proj_code",
+      "pattern": "(?P<proj_code>PRJ-[A-Z]{2}-\\d{4})"
+    },
+    {
+      "name": "inner_domain",
+      "pattern": "(?P<inner_domain>(?<![0-9A-Za-z._-])[A-Za-z0-9-]+\\.corp\\.local(?![0-9A-Za-z._-]))"
+    }
+  ],
+  "names": [
+    {
+      "name": "张三",
+      "type": "name"
+    },
+    {
+      "name": "李四",
+      "type": "name"
+    },
+    {
+      "name": "王小明",
+      "type": "name"
+    },
+    {
+      "name": "员工4999",
+      "type": "emp_no"
+    },
+    {
+      "name": "db-prod-01",
+      "type": "hostname"
+    }
+  ]
+}

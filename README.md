@@ -247,6 +247,11 @@ curl -N "http://127.0.0.1:8878/_admin/events/stream?access_token=$OBSERVABILITY_
 | `PII_VALUE_SAMPLE_PERSIST` | PII 值级采样持久化：`1` 时将 `hash+masked_sample+count` 按日聚合持久化到 `metrics.sqlite:pii_value_agg(day,upstream,kind,hash)`（不存明文，仅掩码），7 天滚动 `DELETE WHERE day < ?`，文件含 `-wal/-shm` 均 `0600`；`1` 时隐含 `ENABLED=1`；默认 `0` 仅内存环（重启清空，`1h` 精确，`24h/7d` 需持久化） | `0`（默认内存-only） |
 | `PII_VALUE_SAMPLE_HMAC_KEY` | PII 值级采样 hash 的 HMAC 盐（任意随机串，建议 `openssl rand -hex 32`）：设后 `hash=HMAC-SHA256(SALT,明文)[:16]` 防 phone 7位 1万匿名集枚举；未设退化 `sha256(明文)[:16]` 小空间可枚举（文档声明风险） | 空（退化 sha256） |
 | `PII_VAULT_GAP_AWARE` | 内置稳态下标（非开关，`next_available_index` 空洞跳过，`__PII_<seq>_<rand8>__` 其中 `rand8=secrets.token_hex(4)`） | —（内置） |
+| `PII_CUSTOM_RULES_FILE` | 自定义 PII 规则合并文件（推荐，含 `patterns` + `names` 两段，任一即可），JSON 或极简 YAML；与 `PII_CUSTOM_PATTERNS_FILE` / `PII_DICT_FILE` 可叠加 | 空（不加载） |
+| `PII_CUSTOM_PATTERNS_FILE` | 仅自定义正则文件（别名 `PII_CUSTOM_PATTERN_FILE`），JSON/YAML `patterns: [{name, pattern}]`，单文件亦可扁平 `name: pattern` 映射 | 空（不加载） |
+| `PII_DICT_FILE` | 仅敏感名称名单文件（别名 `PII_SENSITIVE_DICT_FILE` / `PII_SENSITIVE_NAMES_FILE`），JSON/YAML `names: [{name, type}]`，TXT 回退每行一名 | 空（不加载） |
+
+> **自定义脱敏规则文件加载（pii-custom）：** 三变量均在 `parse_pii_env_config()` 启动校验——**文件不存在 / 解析失败 → 记 `errors` 并 `SystemExit` 拒绝启动（fail-closed，防静默未加载）**；空文件 / 零命中仅 `warning`。YAML 需单引号包裹含反斜杠的正则：`'(?P<emp_no>工号\d{6})'`（JSON 需双重转义 `\\d`）。详见 [自定义脱敏规则](#自定义脱敏规则)。
 
 > **Vault 稳态与保留前缀**：`__PII_<seq>_<rand8>__`（`seq` 为 `next_available_index` 空洞跳过递增，`rand8=secrets.token_hex(4)` CSPRNG）与 `__VG_CRED_NNNNNN__` 为保留前缀，完整形态原样保留不剥离；`resp_p2t`（响应期注册）不还原为明文（仅请求期 `pii_t2p` 可还原），响应侧命中仅提升 LRU 不泄漏；并发 `register` 全程持 `asyncio.Lock` 原子覆盖 `used set` 快照与 `token` 写入，`asyncio.gather` 100 并发无下标冲突。
 | `AUDIT_MODE` | 输出审计模式：`off`/`block`/`approve` | `off`（默认关闭） |
@@ -272,6 +277,115 @@ curl -N "http://127.0.0.1:8878/_admin/events/stream?access_token=$OBSERVABILITY_
 > ```
 >
 > 完整 proxy（`proxy.py`）支持 `AUDIT_MODE=approve`（含 Matrix 审批）；轻量入口（`llm-proxy-only.py` / `credential-proxy-only.py`）无 Matrix 审批能力，配置 `approve` 时会**降级为 block 并打印告警**。
+
+## 自定义脱敏规则
+
+内置 6 种（`email`/`phone`/`id_card`/`bank_card`/`ipv4`/`ipv6`/`api_key`）之外的企业敏感信息，通过**自定义正则** + **字典名单**参与同一脱敏管线（`__PII_<seq>_<rand8>__`，与内置同等替换与还原，不干扰 `__VG_CRED_*__` 凭据 token）。
+
+示例文件：`examples/pii-custom.yaml`（推荐，YAML 合并版）+ `examples/pii-custom.json`（JSON 等价），开箱可 `docker compose` 挂载使用。
+
+### 方式一：文件配置（推荐，生产环境）
+
+```bash
+# 1. 复制示例并按需编辑
+cp examples/pii-custom.yaml /data/pii-custom.yaml
+vim /data/pii-custom.yaml   # 增删 patterns / names
+
+# 2. 环境变量指向文件（任选其一）
+PII_CUSTOM_RULES_FILE=/data/pii-custom.yaml            # 合并文件（推荐，含 patterns + names）
+# 或分离文件
+PII_CUSTOM_PATTERNS_FILE=/data/pii-custom-patterns.yaml  # 仅正则
+PII_DICT_FILE=/data/pii-custom-dict.yaml                # 仅名单（TXT 每行一名亦可）
+# 别名：PII_CUSTOM_PATTERN_FILE / PII_SENSITIVE_DICT_FILE / PII_SENSITIVE_NAMES_FILE / PII_RULES_FILE
+
+# 3. 启动（校验失败直接 SystemExit 拒绝启动，防静默未加载）
+PII_REDACTION_ENABLED=1 PII_CUSTOM_RULES_FILE=/data/pii-custom.yaml docker compose up -d
+# 启动日志应出现：PII 自定义正则已加载: 3 条 / PII 字典已加载: 6 条
+
+# 4. 验证
+curl -H "X-Admin-Token: $OBSERVABILITY_ADMIN_TOKEN" http://127.0.0.1:8878/_admin/metrics | jq .pii_by_type
+# 命中后 pii_by_type 出现 emp_no / proj_code / inner_domain 等自定义 kind（sanitize_kind 消毒后 custom_other 归一除外）
+```
+
+文件格式：JSON（`{`/`[` 开头）或极简 YAML（与 `examples/audit-policy.yaml` 同款解析：顶层 `key:` + `"- name: ..."` 列表）。YAML 中含 `\d` 的正则必须**单引号**：`'(?P<emp_no>工号\d{6})'`（JSON 需双重转义 `\\d`）。
+
+`examples/pii-custom.yaml` 结构：
+
+```yaml
+patterns:
+  - name: emp_no
+    pattern: '(?P<emp_no>工号\d{6})'
+  - name: proj_code
+    pattern: '(?P<proj_code>PRJ-[A-Z]{2}-\d{4})'
+  - name: inner_domain
+    pattern: '(?P<inner_domain>(?<![0-9A-Za-z._-])[A-Za-z0-9-]+\.corp\.local(?![0-9A-Za-z._-]))'
+names:
+  - name: 张三
+    type: name
+  - name: db-prod-01
+    type: hostname
+```
+
+亦支持扁平映射简写（正则）：`{"emp_no": "(?P<emp_no>工号\\d{6})"}`；名单 TXT 回退：每行一名（`#` 注释忽略）。
+
+三变量可叠加（先加载 `PII_CUSTOM_RULES_FILE`，再叠加 `PII_CUSTOM_PATTERNS_FILE` / `PII_DICT_FILE`），**文件不存在 / 解析失败 → `parse_pii_env_config()` 记 `errors` 并 `SystemExit`（fail-closed）**；空文件 / 零命中仅 `warning`。
+
+挂载示例（`docker-compose.yml`）：
+
+```yaml
+volumes:
+  - ./examples/pii-custom.yaml:/data/pii-custom.yaml:ro
+environment:
+  - PII_REDACTION_ENABLED=1
+  - PII_CUSTOM_RULES_FILE=/data/pii-custom.yaml
+```
+
+### 方式二：代码层 API（高级 / 测试 / 动态注入）
+
+```python
+from _pii import PiiDetector
+from _token import RequestScopedTokens
+
+detector = PiiDetector(request_tokens=RequestScopedTokens())
+detector.load_custom_patterns([
+    ('emp_no', r'(?P<emp_no>工号\d{6})'),
+    ('proj_code', r'(?P<proj_code>PRJ-[A-Z]{2}-\d{4})'),
+])
+detector.load_dict([
+    ('张三', 'name'),
+    ('db-prod-01', 'hostname'),
+])
+hits = await detector.scan('我的工号123456，联系张三，域名 db.corp.local')
+# hits == [('emp_no','工号123456'), ('name','张三'), ('inner_domain','db.corp.local')]
+out = await detector.detect_and_redact('工号123456')  # → '__PII_0_a1b2c3d4__'
+```
+
+启动期动态文件亦可：`detector.load_custom_patterns(_extract_patterns_from_data(_load_pii_raw_file(path)[0]))`（`_pii.py` 已导出 `_load_pii_raw_file` / `_extract_*` 供复用）。
+
+### 约束（硬性，违规拒绝加载并告警）
+
+**命名**：`name` 必须与 `(?P<name>...)` 内同名；与内置 6 种重名（`phone`/`email`/`id_card`/`bank_card`/`ipv4`/`ipv6`/`api_key`）直接拒绝。
+**边界**：禁止 `\b`（中文紧贴下零命中，如 `联系__PII_50_149be4fc__处理`）；必须用 lookaround `(?<![\d])...(?!\d)` 或 `(?<![0-9A-Za-z._-])`。
+**嵌套**：禁止嵌套命名组 `(?P<outer>(?P<inner>...))`，`lastgroup` 返回最内层导致分类错乱。
+**ReDoS**：单规则 100ms `ThreadPool(2)+asyncio.timeout` 守卫，连续 3 次超时临时停用；超长输入按 1MB 分块扫描（不丢尾）。
+**区间保护**：任何与 `__PII_*__`/`__VG_CRED_*__` 重叠的匹配整体跳过；值已在凭据 `credential_p2t` 中的跳过（凭据优先，避免双 token 串扰）。
+**字典**：独立扫描不并入联合正则（5000 名单 124μs→13.8ms 分支爆炸已规避，实测 190μs/1KB）；`type=name/person` 走 CJK 边界 `(?<![\w\u4e00-\u9fff])`（`张三` 不误伤 `张三丰`），其余 `type` 仅挡 ASCII 粘连（`员工4999在` 命中，`abc员工4999x` 不命中）。
+
+### 验证与排障
+
+```bash
+# 启动日志
+docker logs credential-proxy | grep -E "PII 自定义|字典已加载|PII 配置错误"
+# 指标大盘（pii_by_type 出现自定义 kind，hit/miss 计数）
+curl -s -H "X-Admin-Token: $TOKEN" http://127.0.0.1:8878/_admin/metrics?range=1h | jq .pii_by_type
+# 常见错误
+# PII_CUSTOM_RULES_FILE 文件不存在 → 检查挂载路径与 :ro 权限
+# 解析失败 → YAML 是否用单引号包裹正则？JSON 是否双重转义？
+# 自定义正则含 \b → 拒绝加载，请改 lookaround
+# 与内置重名 → 改名（如 phone_custom）
+```
+
+更多约束与性能锚点见 `openspec/changes/llm-privacy-gateway/specs/pii-redaction/spec.md` 与 `design.md D1`。
 
 ### Caller 注册
 

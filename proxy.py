@@ -240,6 +240,13 @@ class CredentialProxy(
             'placeholder_prompt_enabled', True
         )
         self.pii_placeholder_prompt_text = pii_cfg.get('placeholder_prompt_text', '')
+        # 自定义规则文件加载（pii-custom）
+        if pii_cfg.get('custom_patterns'):
+            self._pii_detector.load_custom_patterns(pii_cfg['custom_patterns'])
+            logger.info('PII 自定义正则已加载: %d 条', len(pii_cfg['custom_patterns']))
+        if pii_cfg.get('dict_entries'):
+            self._pii_detector.load_dict(pii_cfg['dict_entries'])
+            logger.info('PII 字典已加载: %d 条', len(pii_cfg['dict_entries']))
         # 可观测性：注入 collector 到 PII/Token 组件
         self._inject_metrics_collector()
 

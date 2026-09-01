@@ -100,6 +100,13 @@ class CredentialProxyOnly(TokenMixin, PiiMixin, CredentialMixin, LlmMixin):
             for e in pii_cfg['errors']:
                 logger.error('PII 配置错误: %s', e)
             raise SystemExit(f'PII 配置错误: {pii_cfg["errors"][0]}')
+        # 自定义规则文件加载（pii-custom）
+        if pii_cfg.get('custom_patterns'):
+            self._pii_detector.load_custom_patterns(pii_cfg['custom_patterns'])
+            logger.info('PII 自定义正则已加载: %d 条', len(pii_cfg['custom_patterns']))
+        if pii_cfg.get('dict_entries'):
+            self._pii_detector.load_dict(pii_cfg['dict_entries'])
+            logger.info('PII 字典已加载: %d 条', len(pii_cfg['dict_entries']))
         if self.pii_enabled:
             logger.info(
                 'PII 脱敏启用: response_side=%s hold_max=%d',

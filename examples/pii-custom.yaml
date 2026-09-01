@@ -1,0 +1,62 @@
+# pii-custom.yaml — 自定义 PII 脱敏规则示例（credential-proxy）
+#
+# 用法（任选其一）：
+#   1) 合并文件（推荐，单文件同时含 patterns + names）：
+#        PII_CUSTOM_RULES_FILE=/data/pii-custom.yaml
+#   2) 分离文件：
+#        PII_CUSTOM_PATTERNS_FILE=/data/pii-custom-patterns.yaml
+#        PII_DICT_FILE=/data/pii-custom-dict.yaml
+#      别名亦可：PII_CUSTOM_PATTERN_FILE / PII_SENSITIVE_DICT_FILE / PII_SENSITIVE_NAMES_FILE
+#      合并文件与分离文件可叠加（先加载合并，再叠加分离，去重由引擎处理）
+#
+# 格式：JSON（{}/[] 开头）或极简 YAML（与 examples/audit-policy.yaml 同款解析：顶层 key + "- name: ... / pattern: ..." 列表）
+#  - YAML 中 pattern 含反斜杠/括号需用单引号包裹：'(?P<emp_no>工号\d{6})'
+#  - JSON 中需双重转义：\"(?P<emp_no>工号\\\\d{6})\"
+#
+# 约束（与 _pii.py load_custom_patterns / load_dict 一致，违规拒绝加载并告警）：
+#   - name 必须与正则内 (?P<name>...) 同名，且不能与内置重名（phone/email/id_card/bank_card/ipv4/ipv6/api_key）
+#   - 禁止 \b（中文环境失效，请用 lookaround：(?<![\d])...(?!\d) 或 (?<![0-9A-Za-z._-])）
+#   - 禁止嵌套命名组 (?P<outer>(?P<inner>...))，lastgroup 会错乱
+#   - ReDoS 防护：单规则 100ms 超时守卫，连续 3 次超时临时停用，超长输入按 1MB 分块扫描
+#   - 占位符区间保护：任何与 __PII_*__/__VG_CRED_*__ 重叠的匹配整体跳过
+#   - 字典 5000 名单单 chunk ≤1ms 独立扫描，type 决定边界策略（见下方说明）
+#
+# 验证：启动日志应出现 "PII 自定义正则已加载: N 条" / "PII 字典已加载: N 条"
+#       错误路径会 SystemExit 并打印 "PII 配置错误: ... 文件不存在/解析失败"
+
+# ── 自定义正则 ──
+# 与内置 6 种（email/phone/id_card/bank_card/ipv4/ipv6/api_key）同等参与检测与替换
+# 按 lastgroup 区分类型，命中后替换为 __PII_<seq>_<rand8>__（rand8=secrets.token_hex(4) CSPRNG）
+# 示例已覆盖：工号 / 项目代号 / 内网域名；按需增删
+patterns:
+  - name: emp_no
+    pattern: '(?P<emp_no>工号\d{6})'
+  - name: proj_code
+    pattern: '(?P<proj_code>PRJ-[A-Z]{2}-\d{4})'
+  - name: inner_domain
+    pattern: '(?P<inner_domain>(?<![0-9A-Za-z._-])[A-Za-z0-9-]+\.corp\.local(?![0-9A-Za-z._-]))'
+  # 中文人名若有强格式（罕见）也可用正则；无格式人名请用下方 names 名单
+  # - name: student_id
+  #   pattern: '(?P<student_id>(?<![\d])学号\d{8}(?!\d))'
+
+# ── 敏感名称名单（字典型 recognizer）──
+# 精确匹配，独立扫描不并入联合正则（防 alternation 分支爆炸）
+# type 决定边界策略：
+#   - name / person：CJK 边界（(?<![\w\u4e00-\u9fff]) / (?![\w\u4e00-\u9fff])，硬化时严格）
+#     张三 不误伤 张三丰，员工4999 不误伤 员工4999在 的前后 CJK 粘连判定
+#   - emp_no / hostname / domain 等其它 type：仅挡 ASCII 字母数字粘连
+#       员工4999在 → 命中；abc员工4999x → 不命中（ASCII 粘连挡）
+# 性能：5000 名单编译 61ms，单 1KB chunk 扫描约 190μs（容器实测 491μs），<1ms 锚点
+names:
+  - name: 张三
+    type: name
+  - name: 李四
+    type: name
+  - name: 王小明
+    type: name
+  - name: 员工4999
+    type: emp_no
+  - name: db-prod-01
+    type: hostname
+  - name: corp-secret-project
+    type: project

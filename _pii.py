@@ -102,6 +102,175 @@ PII_RE_DOS_MAX_WORKERS = 2  # 独立线程池（与日志写 run_in_executor 不
 PII_RE_DOS_STRIKES = 3  # 连续超时 3 次临时停用
 PII_SCAN_INPUT_LIMIT = 1_048_576  # 单次扫描输入上限 1MB
 
+# ── 自定义规则文件加载（pii-custom）────────────────────
+# 零依赖：JSON 优先，YAML 走 _audit._parse_simple_yaml（存在则复用，缺失则回退极简解析）
+
+
+def _load_pii_raw_file(path: str) -> tuple[object, str | None]:
+    """读取 YAML/JSON 原始数据，返回 (data, error)。"""
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            text = f.read()
+    except Exception as e:
+        return None, f'读取失败: {e}'
+    stripped = text.lstrip()
+    if not stripped:
+        return None, '文件为空'
+    # JSON 直判
+    if stripped.startswith('{') or stripped.startswith('['):
+        try:
+            return _json.loads(text), None
+        except Exception as e:
+            return None, f'JSON 解析失败: {e}'
+    # YAML：优先复用 _audit 的极简解析（零依赖）
+    try:
+        from _audit import _parse_simple_yaml as _audit_yaml  # type: ignore
+
+        return _audit_yaml(text), None
+    except Exception:
+        pass
+    # 回退：尝试 JSON 兼容的宽松解析（单引号转双引号等不处理，直接报错提示用 JSON）
+    return (
+        None,
+        'YAML 解析失败（请用 JSON 或 audit-policy 同款极简 YAML：顶层 key + "- key: value" 列表）',
+    )
+
+
+def _extract_patterns_from_data(data: object) -> list[tuple[str, str]]:
+    """从解析后的数据中提取 [(name, pattern)]。"""
+    if data is None:
+        return []
+    # list 形态：直接是 patterns 列表
+    if isinstance(data, list):
+        out: list[tuple[str, str]] = []
+        for item in data:
+            if isinstance(item, dict):
+                name = (
+                    item.get('name')
+                    or item.get('type')
+                    or item.get('kind')
+                    or item.get('id')
+                )
+                pat = (
+                    item.get('pattern')
+                    or item.get('regex')
+                    or item.get('re')
+                    or item.get('value')
+                )
+                if name and pat:
+                    out.append((str(name), str(pat)))
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                out.append((str(item[0]), str(item[1])))
+        return out
+    if isinstance(data, dict):
+        # 已知 patterns 键
+        for k in (
+            'patterns',
+            'custom_patterns',
+            'customPatterns',
+            'pii_patterns',
+            'rules',
+            'custom_rules',
+        ):
+            if k in data:
+                v = data[k]
+                if isinstance(v, list):
+                    return _extract_patterns_from_data(v)
+                if isinstance(v, dict):
+                    # {"patterns": {"emp_no": "(?P<emp_no>..."}}
+                    return [
+                        (str(k2), str(v2))
+                        for k2, v2 in v.items()
+                        if isinstance(v2, str)
+                    ]
+        # 扁平 name->pattern 映射（排除 names/dict 干扰）
+        if (
+            data
+            and all(isinstance(v, str) for v in data.values())
+            and not any(
+                k in data
+                for k in (
+                    'names',
+                    'sensitive_names',
+                    'sensitiveNames',
+                    'dict',
+                    'entries',
+                    'words',
+                )
+            )
+        ):
+            # 启发：pattern 值含正则特征 (?P< 或包含 \d 等，dict 映射值通常不含
+            # 但为稳妥，仅当调用方明确要 patterns 时才按映射处理；此处放宽，返回映射
+            # 由调用方决定是否为 patterns 场景
+            return [(str(k), str(v)) for k, v in data.items()]
+    return []
+
+
+def _extract_dict_from_data(data: object) -> list[tuple[str, str]]:
+    """从解析后的数据中提取 [(name, type)]。"""
+    if data is None:
+        return []
+    if isinstance(data, list):
+        out: list[tuple[str, str]] = []
+        for item in data:
+            if isinstance(item, str):
+                if item.strip():
+                    out.append((item.strip(), 'name'))
+            elif isinstance(item, dict):
+                name = (
+                    item.get('name')
+                    or item.get('value')
+                    or item.get('word')
+                    or item.get('key')
+                )
+                typ = (
+                    item.get('type')
+                    or item.get('kind')
+                    or item.get('category')
+                    or 'name'
+                )
+                if name:
+                    out.append((str(name).strip(), str(typ).strip() or 'name'))
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                out.append((str(item[0]).strip(), str(item[1]).strip() or 'name'))
+        return out
+    if isinstance(data, dict):
+        for k in (
+            'names',
+            'sensitive_names',
+            'sensitiveNames',
+            'dict',
+            'entries',
+            'dictionary',
+            'words',
+            'custom_dict',
+            'sensitive_dict',
+            'people',
+            'personnel',
+        ):
+            if k in data:
+                v = data[k]
+                if isinstance(v, list):
+                    return _extract_dict_from_data(v)
+                if isinstance(v, dict):
+                    return [
+                        (str(k2), str(v2) if isinstance(v2, str) else 'name')
+                        for k2, v2 in v.items()
+                    ]
+        # 扁平 name->type 映射
+        if (
+            data
+            and all(isinstance(v, str) for v in data.values())
+            and not any(k in data for k in ('patterns', 'custom_patterns', 'rules'))
+        ):
+            return [
+                (str(k).strip(), str(v).strip() or 'name')
+                for k, v in data.items()
+                if str(k).strip()
+            ]
+    return []
+
+
 # ── 占位符说明提示词（pii-placeholder-prompt）──
 # 注入给上游 LLM 的默认说明文案：告知 __PII_*__ / __VG_CRED_*__ 是脱敏占位符。
 # 安全不变量（design D5）：
@@ -364,6 +533,138 @@ def parse_pii_env_config() -> dict:
     pii_value_sample_enabled = vs_enabled
     pii_value_sample_persist = vs_persist
 
+    # ── 自定义规则文件（pii-custom，新增）────────────────
+    # 支持：
+    #   PII_CUSTOM_RULES_FILE         — 合并文件（含 patterns + names，两者任一）
+    #   PII_CUSTOM_PATTERNS_FILE      — 仅自定义正则（别名 PII_CUSTOM_PATTERN_FILE）
+    #   PII_DICT_FILE / PII_SENSITIVE_DICT_FILE / PII_SENSITIVE_NAMES_FILE — 仅字典名单
+    # 格式：JSON（{}/[] 开头）或极简 YAML（audit-policy 同款解析：顶层 key + "- name: ... / pattern: ..." 列表）
+    # 校验：文件不存在 / 解析失败 → 记 errors（启动拒绝，fail-closed）；空文件 / 零命中仅 warning
+    custom_patterns: list[tuple[str, str]] = []
+    dict_entries: list[tuple[str, str]] = []
+    raw_combined = (
+        os.environ.get('PII_CUSTOM_RULES_FILE')
+        or os.environ.get('PII_RULES_FILE')
+        or ''
+    ).strip()
+    raw_pat = (
+        os.environ.get('PII_CUSTOM_PATTERNS_FILE')
+        or os.environ.get('PII_CUSTOM_PATTERN_FILE')
+        or ''
+    ).strip()
+    raw_dict = (
+        os.environ.get('PII_DICT_FILE')
+        or os.environ.get('PII_SENSITIVE_DICT_FILE')
+        or os.environ.get('PII_SENSITIVE_NAMES_FILE')
+        or ''
+    ).strip()
+
+    def _load_patterns_file(p: str, label: str):
+        if not p:
+            return
+        if not os.path.exists(p):
+            errors.append(f'{label} 文件不存在: {p!r}')
+            return
+        data, err = _load_pii_raw_file(p)
+        if err:
+            errors.append(f'{label} 解析失败 {p!r}: {err}')
+            return
+        pats = _extract_patterns_from_data(data)
+        # 合并文件场景：若按 patterns 键提不到，尝试从顶层 dict 的 patterns 嵌套里已在上面处理
+        # 扁平映射场景已在 extractor 内处理；零命中仅 warning
+        if not pats:
+            logger.warning(
+                '%s %r 未解析到有效 patterns（需 patterns: [{name, pattern}]）',
+                label,
+                p,
+            )
+            return
+        custom_patterns.extend(pats)
+        logger.info('%s 已加载 %d 条自定义正则: %s', label, len(pats), p)
+
+    def _load_dict_file(p: str, label: str):
+        if not p:
+            return
+        if not os.path.exists(p):
+            errors.append(f'{label} 文件不存在: {p!r}')
+            return
+        # 纯文本回退：若 YAML/JSON 解析零命中，尝试按行读取（每行一名单）
+        data, err = _load_pii_raw_file(p)
+        if err:
+            # 尝试按行回退（txt 名单）
+            try:
+                with open(p, 'r', encoding='utf-8') as f:
+                    lines = [
+                        ln.strip()
+                        for ln in f
+                        if ln.strip() and not ln.strip().startswith('#')
+                    ]
+                if lines:
+                    dict_entries.extend([(ln, 'name') for ln in lines])
+                    logger.info('%s 已加载 %d 条字典（按行）: %s', label, len(lines), p)
+                    return
+            except Exception:
+                pass
+            errors.append(f'{label} 解析失败 {p!r}: {err}')
+            return
+        ents = _extract_dict_from_data(data)
+        if not ents:
+            # 按行回退
+            try:
+                with open(p, 'r', encoding='utf-8') as f:
+                    lines = [
+                        ln.strip()
+                        for ln in f
+                        if ln.strip() and not ln.strip().startswith('#')
+                    ]
+                if lines:
+                    ents = [(ln, 'name') for ln in lines]
+                else:
+                    logger.warning(
+                        '%s %r 未解析到有效 names（需 names: [{name, type}] 或每行一名）',
+                        label,
+                        p,
+                    )
+                    return
+            except Exception as e2:
+                errors.append(f'{label} 字典解析失败 {p!r}: {e2}')
+                return
+        dict_entries.extend(ents)
+        logger.info('%s 已加载 %d 条字典: %s', label, len(ents), p)
+
+    # 合并文件优先：同时提取 patterns + names（互不覆盖，叠加）
+    if raw_combined:
+        if not os.path.exists(raw_combined):
+            errors.append(f'PII_CUSTOM_RULES_FILE 文件不存在: {raw_combined!r}')
+        else:
+            data, err = _load_pii_raw_file(raw_combined)
+            if err:
+                errors.append(f'PII_CUSTOM_RULES_FILE 解析失败 {raw_combined!r}: {err}')
+            else:
+                c_pats = _extract_patterns_from_data(data)
+                c_ents = _extract_dict_from_data(data)
+                if not c_pats and not c_ents:
+                    logger.warning(
+                        'PII_CUSTOM_RULES_FILE %r 未解析到 patterns/names', raw_combined
+                    )
+                if c_pats:
+                    custom_patterns.extend(c_pats)
+                    logger.info(
+                        'PII_CUSTOM_RULES_FILE 已加载 %d 条自定义正则: %s',
+                        len(c_pats),
+                        raw_combined,
+                    )
+                if c_ents:
+                    dict_entries.extend(c_ents)
+                    logger.info(
+                        'PII_CUSTOM_RULES_FILE 已加载 %d 条字典: %s',
+                        len(c_ents),
+                        raw_combined,
+                    )
+
+    _load_patterns_file(raw_pat, 'PII_CUSTOM_PATTERNS_FILE')
+    _load_dict_file(raw_dict, 'PII_DICT_FILE')
+
     return {
         'enabled': enabled,
         'response_side': response_side,
@@ -374,6 +675,8 @@ def parse_pii_env_config() -> dict:
         'placeholder_prompt_text': placeholder_prompt_text,
         'pii_value_sample_enabled': pii_value_sample_enabled,
         'pii_value_sample_persist': pii_value_sample_persist,
+        'custom_patterns': custom_patterns,
+        'dict_entries': dict_entries,
         'errors': errors,
     }
 
