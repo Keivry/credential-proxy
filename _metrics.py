@@ -1970,8 +1970,14 @@ class MetricsCollector:
             for _m, u in toks.items():
                 if model_filter is not None and _m != model_filter:
                     continue
-                b['tokens_prompt'] += u.get('prompt', 0) or 0
-                b['tokens_completion'] += u.get('completion', 0) or 0
+                b['tokens_prompt'] += (
+                    u.get('prompt') if u.get('prompt') is not None else u.get('input')
+                ) or 0
+                b['tokens_completion'] += (
+                    u.get('completion')
+                    if u.get('completion') is not None
+                    else u.get('output')
+                ) or 0
                 b['cached_read'] += u.get('cached_read', 0) or 0
             lat = e.get('latency_ms')
             if lat is not None:
@@ -2077,8 +2083,16 @@ class MetricsCollector:
                 for _m, u in toks.items():
                     if model_filter is not None and _m != model_filter:
                         continue
-                    b['tokens_prompt'] += u.get('prompt', 0) or 0
-                    b['tokens_completion'] += u.get('completion', 0) or 0
+                    b['tokens_prompt'] += (
+                        u.get('prompt')
+                        if u.get('prompt') is not None
+                        else u.get('input')
+                    ) or 0
+                    b['tokens_completion'] += (
+                        u.get('completion')
+                        if u.get('completion') is not None
+                        else u.get('output')
+                    ) or 0
                     b['cached_read'] += u.get('cached_read', 0) or 0
                 b['pii_requests'] += row[5] or 0
                 lb = json.loads(row[4]) if row[4] else {}
@@ -2140,8 +2154,14 @@ class MetricsCollector:
             for _m, u in agg.tokens.items():
                 if model_filter is not None and _m != model_filter:
                     continue
-                b['tokens_prompt'] += u.get('prompt', 0) or 0
-                b['tokens_completion'] += u.get('completion', 0) or 0
+                b['tokens_prompt'] += (
+                    u.get('prompt') if u.get('prompt') is not None else u.get('input')
+                ) or 0
+                b['tokens_completion'] += (
+                    u.get('completion')
+                    if u.get('completion') is not None
+                    else u.get('output')
+                ) or 0
                 b['cached_read'] += u.get('cached_read', 0) or 0
             b['pii_requests'] += agg.pii_requests
             if agg.latency_buckets:

@@ -1,6 +1,6 @@
 [project]
 name = "credential-proxy"
-version = "0.9.41"
+version = "0.9.42"
 description = "三因子认证凭据代理服务 — Matrix 审批 + TPM 硬件解封 + KeePassXC 后端 + LLM 脱敏反向代理"
 requires-python = ">=3.12"
 license = {text = "MIT"}

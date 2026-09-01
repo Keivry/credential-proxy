@@ -204,15 +204,17 @@
   }
 
   // 输入 token 缓存命中率：cached_read/input，input 缺省回退 prompt；分母 0/缺失 → '-'
+  // 多模型时求和（sum input / sum cr），避免首模型遮蔽
   function fmtCache(e) {
     var toks = e.tokens || {};
-    var cr = 0, input = null;
+    var cr = 0, input = 0;
     Object.keys(toks).forEach(function (m) {
       var t = toks[m];
       cr += t.cached_read || 0;
-      if (input == null) input = t.input != null ? t.input : (t.prompt != null ? t.prompt : null);
+      var cur = t.input != null ? t.input : (t.prompt != null ? t.prompt : 0);
+      input += cur;
     });
-    if (input == null || input === 0) return null; // null → 显示 '-'
+    if (!input) return null; // 0 → 显示 '-'
     return { pct: (cr / input * 100).toFixed(1) + '%', cr: cr, input: input };
   }
 
@@ -341,8 +343,8 @@
     var prompt = 0, completion = 0, cachedRead = 0, cachedWrite = 0;
     Object.keys(toks).forEach(function (m) {
       var t = toks[m];
-      prompt += t.prompt || 0;
-      completion += t.completion || (t.output || 0);
+      prompt += t.prompt != null ? t.prompt : (t.input || 0);
+      completion += t.completion != null ? t.completion : (t.output || 0);
       cachedRead += t.cached_read || 0;
       cachedWrite += t.cached_write || 0;
     });
@@ -639,7 +641,7 @@
       var tokTotal = 0;
       Object.keys(tokens).forEach(function (m) {
         var t = tokens[m];
-        tokTotal += (t.prompt || 0) + (t.completion || t.output || 0);
+        tokTotal += (t.prompt != null ? t.prompt : (t.input || 0)) + (t.completion != null ? t.completion : (t.output || 0));
       });
       var cache = fmtCache(e);
       var cacheTd = cache
@@ -697,7 +699,7 @@
     var toks = e.tokens || {};
     var tokLines = Object.keys(toks).map(function (m) {
       var t = toks[m];
-      return m + ': prompt=' + (t.prompt || 0) + ' completion=' + (t.completion || t.output || 0) +
+      return m + ': prompt=' + (t.prompt != null ? t.prompt : (t.input || 0)) + ' completion=' + (t.completion != null ? t.completion : (t.output || 0)) +
         ' cached_read=' + (t.cached_read || 0);
     }).join('\n') || '(无 usage)';
     var summary = e.summary || e.raw_summary || '';
@@ -887,7 +889,7 @@
     var tokTotal = 0;
     Object.keys(tokens).forEach(function (m) {
       var t = tokens[m];
-      tokTotal += (t.prompt || 0) + (t.completion || t.output || 0);
+      tokTotal += (t.prompt != null ? t.prompt : (t.input || 0)) + (t.completion != null ? t.completion : (t.output || 0));
     });
     var cache = fmtCache(e);
     var cacheTd = cache
