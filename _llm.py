@@ -2271,6 +2271,11 @@ class LlmMixin(AuditMixin):
             _cv_audit_created_ids_tok = _audit_created_ids_var.set([])
             tail = request.match_info['tail']
             is_dialog_tail = is_chat_tail(tail)
+            try:
+                _ctx_tail = _req_pii_ctx()
+                _ctx_tail['tail'] = tail
+            except Exception:
+                pass
             target_url = f'{upstream.rstrip("/")}/{tail}'
             if request.query_string:
                 target_url += '?' + request.query_string
@@ -2356,9 +2361,11 @@ class LlmMixin(AuditMixin):
                 if is_dialog_tail and getattr(self, 'pii_enabled', False):
                     self._pii_request_scope()
                     if hasattr(self, 'pii_redact_json_aware'):
-                        body_text = await self.pii_redact_json_aware(body_text)
+                        body_text = await self.pii_redact_json_aware(
+                            body_text, tail=tail
+                        )
                     else:
-                        body_text = await self.pii_redact(body_text)
+                        body_text = await self.pii_redact(body_text, tail=tail)
                 if is_dialog_tail and hasattr(self, '_redact_json_aware'):
                     out_body = self._redact_json_aware(body_text, snapshot_p2t).encode(
                         'utf-8'

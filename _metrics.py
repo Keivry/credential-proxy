@@ -75,6 +75,56 @@ DB_FILE = 'metrics.sqlite'
 # SQLite 权限（0600）——含 -wal/-shm
 MODE_0600 = 0o600
 
+# ── PII 值级采样开关（热读，每次 os.getenv；PERSIST=1 隐含 ENABLED=1）──
+
+
+def _is_pii_value_sample_enabled() -> bool:
+    """热读 PII_VALUE_SAMPLE_ENABLED / PERSIST，非法值告警回退 0，PERSIST=1 隐含 ENABLED=1。"""
+    raw_p = os.getenv('PII_VALUE_SAMPLE_PERSIST', '0')
+    raw_e = os.getenv('PII_VALUE_SAMPLE_ENABLED', '0')
+    persist_valid = raw_p in ('0', '1')
+    enabled_valid = raw_e in ('0', '1')
+    if not persist_valid:
+        logger.warning('PII_VALUE_SAMPLE_PERSIST 非法值(仅 0/1): %r, 回退 0', raw_p)
+    if not enabled_valid:
+        logger.warning('PII_VALUE_SAMPLE_ENABLED 非法值(仅 0/1): %r, 回退 0', raw_e)
+    persist = (raw_p == '1') if persist_valid else False
+    enabled = (raw_e == '1') if enabled_valid else False
+    if persist:
+        return True
+    return enabled
+
+
+def _is_pii_value_sample_persist() -> bool:
+    """热读 PII_VALUE_SAMPLE_PERSIST，非法值告警回退 0。"""
+    raw_p = os.getenv('PII_VALUE_SAMPLE_PERSIST', '0')
+    if raw_p == '1':
+        return True
+    if raw_p == '0':
+        return False
+    logger.warning('PII_VALUE_SAMPLE_PERSIST 非法值(仅 0/1): %r, 回退 0', raw_p)
+    return False
+
+
+def parse_pii_value_sample_config() -> dict:
+    """解析 PII 值级采样开关，返回 {enabled, persist, errors}。供启动期校验。"""
+    errors: list[str] = []
+    raw_e = os.getenv('PII_VALUE_SAMPLE_ENABLED', '0')
+    raw_p = os.getenv('PII_VALUE_SAMPLE_PERSIST', '0')
+    enabled_valid = raw_e in ('0', '1')
+    persist_valid = raw_p in ('0', '1')
+    if not enabled_valid:
+        errors.append(f'PII_VALUE_SAMPLE_ENABLED 非法值(仅 0/1): {raw_e!r}')
+        logger.warning('PII_VALUE_SAMPLE_ENABLED 非法值(仅 0/1): %r, 回退 0', raw_e)
+    if not persist_valid:
+        errors.append(f'PII_VALUE_SAMPLE_PERSIST 非法值(仅 0/1): {raw_p!r}')
+        logger.warning('PII_VALUE_SAMPLE_PERSIST 非法值(仅 0/1): %r, 回退 0', raw_p)
+    persist = (raw_p == '1') if persist_valid else False
+    enabled = (raw_e == '1') if enabled_valid else False
+    if persist:
+        enabled = True
+    return {'enabled': enabled, 'persist': persist, 'errors': errors}
+
 
 def metrics_bucket(latency_ms: float) -> float:
     """二分命中首个 >= latency_ms 的桶上界。Inf 桶为 float('inf')。"""
@@ -324,6 +374,7 @@ class _DailyAgg:
         'pii_lru_evictions',
         'pii_miss',
         'pii_requests',
+        'pii_value_samples',
         'placeholder_prompt_injected',
         'requests',
         'requests_by_status',
@@ -351,6 +402,7 @@ class _DailyAgg:
         self.json_aware_success = 0
         self.json_leaf_fallback = 0
         self.json_full_fallback = 0
+        self.pii_value_samples: dict[str, dict[str, dict]] = {}
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为 dict（快照用）。"""
@@ -374,6 +426,7 @@ class _DailyAgg:
             'json_aware_success': self.json_aware_success,
             'json_leaf_fallback': self.json_leaf_fallback,
             'json_full_fallback': self.json_full_fallback,
+            'pii_value_samples': self.pii_value_samples,
         }
 
 
@@ -388,6 +441,7 @@ class _HourlyAgg:
         'pii_lru_evictions',
         'pii_miss',
         'pii_requests',
+        'pii_value_samples',
         'requests',
         'requests_by_status',
         'tokens',
@@ -404,6 +458,7 @@ class _HourlyAgg:
         self.pii_requests = 0
         self.pii_lru_evictions = 0
         self.cred_lru_evictions = 0
+        self.pii_value_samples: dict[str, dict[str, dict]] = {}
 
     def to_dict(self) -> dict[str, Any]:
         """序列化为 dict（快照用）。"""
@@ -418,6 +473,7 @@ class _HourlyAgg:
             'pii_requests': self.pii_requests,
             'pii_lru_evictions': self.pii_lru_evictions,
             'cred_lru_evictions': self.cred_lru_evictions,
+            'pii_value_samples': self.pii_value_samples,
         }
 
 
@@ -443,6 +499,14 @@ def _deep_copy_snapshot(agg: _DailyAgg) -> _DailyAgg:
     copy.json_aware_success = agg.json_aware_success
     copy.json_leaf_fallback = agg.json_leaf_fallback
     copy.json_full_fallback = agg.json_full_fallback
+    # pii_value_samples 深拷贝：dict[kind, dict[masked, dict[count,hash]]]
+    if getattr(agg, 'pii_value_samples', None):
+        copy.pii_value_samples = {
+            k: {mk: dict(v) for mk, v in inner.items()}
+            for k, inner in agg.pii_value_samples.items()
+        }
+    else:
+        copy.pii_value_samples = {}
     return copy
 
 
@@ -458,6 +522,13 @@ def _copy_hourly(agg: _HourlyAgg) -> _HourlyAgg:
     copy.pii_requests = agg.pii_requests
     copy.pii_lru_evictions = agg.pii_lru_evictions
     copy.cred_lru_evictions = agg.cred_lru_evictions
+    if getattr(agg, 'pii_value_samples', None):
+        copy.pii_value_samples = {
+            k: {mk: dict(v) for mk, v in inner.items()}
+            for k, inner in agg.pii_value_samples.items()
+        }
+    else:
+        copy.pii_value_samples = {}
     return copy
 
 
@@ -706,6 +777,21 @@ class MetricsCollector:
             cols = {r[1] for r in conn.execute(f'PRAGMA table_info({table})')}
             if col not in cols:
                 conn.execute(f'ALTER TABLE {table} ADD COLUMN {col} INT')
+        # 可选表 pii_value_agg 仅当 PERSIST=1 时创建（热读）
+        if _is_pii_value_sample_persist():
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pii_value_agg (
+                    day TEXT NOT NULL,
+                    upstream TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    hash TEXT NOT NULL,
+                    masked_sample TEXT NOT NULL,
+                    count INT NOT NULL,
+                    PRIMARY KEY(day, upstream, kind, hash)
+                )
+                """
+            )
 
     def _write_flush(self, snapshot: dict[str, Any]) -> None:
         """单写者覆盖式 UPSERT（线程中运行）。"""
@@ -830,6 +916,58 @@ class MetricsCollector:
                             snapshot.get('cred_lru_evictions', 0),
                         ),
                     )
+                # pii_value_agg 按日覆盖式 UPSERT（仅 PERSIST=1 时）
+                if _is_pii_value_sample_persist() and _is_pii_value_sample_enabled():
+                    pii_samples = snapshot.get('pii_value_samples') or {}
+                    day_val = snapshot.get('date') or snapshot.get('day') or day
+                    if pii_samples and day_val:
+                        # 首次写入时若表未创建（例如启动时 PERSIST=0 之后热切到 1），惰性建表
+                        conn.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS pii_value_agg (
+                                day TEXT NOT NULL,
+                                upstream TEXT NOT NULL,
+                                kind TEXT NOT NULL,
+                                hash TEXT NOT NULL,
+                                masked_sample TEXT NOT NULL,
+                                count INT NOT NULL,
+                                PRIMARY KEY(day, upstream, kind, hash)
+                            )
+                            """
+                        )
+                        for kind, masked_dict in pii_samples.items():
+                            sk = sanitize_kind(kind)
+                            if not isinstance(masked_dict, dict):
+                                continue
+                            for masked, meta in masked_dict.items():
+                                if not isinstance(masked, str):
+                                    continue
+                                masked_sample = (
+                                    masked[:64] if len(masked) > 64 else masked
+                                )
+                                if not isinstance(meta, dict):
+                                    continue
+                                cnt = meta.get('count', 0)
+                                hsh = meta.get('hash', '')
+                                try:
+                                    cnt_i = int(cnt)
+                                except Exception:
+                                    cnt_i = 0
+                                if cnt_i <= 0:
+                                    continue
+                                if not isinstance(hsh, str) or not hsh:
+                                    continue
+                                hsh = hsh[:16]
+                                conn.execute(
+                                    """
+                                    INSERT INTO pii_value_agg (day, upstream, kind, hash, masked_sample, count)
+                                    VALUES (?, ?, ?, ?, ?, ?)
+                                    ON CONFLICT(day, upstream, kind, hash) DO UPDATE SET
+                                        masked_sample=excluded.masked_sample,
+                                        count=excluded.count
+                                    """,
+                                    (day_val, upstream, sk, hsh, masked_sample, cnt_i),
+                                )
                 self._trim_old(conn)
                 conn.commit()
                 _chmod_0600(self.db_path)
@@ -865,6 +1003,12 @@ class MetricsCollector:
         )
         conn.execute('DELETE FROM daily_agg WHERE date < ?', (cutoff_date,))
         conn.execute('DELETE FROM hourly_agg WHERE hour < ?', (cutoff_hour,))
+        # pii_value_agg 7天滚动（复用 _day_key，UTC）
+        try:
+            cutoff_pii = _day_key(now - 7 * 86400)
+            conn.execute('DELETE FROM pii_value_agg WHERE day < ?', (cutoff_pii,))
+        except sqlite3.OperationalError:
+            pass  # 表不存在时（PERSIST=0 未建表）忽略
 
     # ── 快照 ──
 
@@ -983,6 +1127,62 @@ class MetricsCollector:
                     cred_miss = _ctx_pii.get('cred_miss', 0)
                 for k, v in (_ctx_pii.get('pii_by_type') or {}).items():
                     delta_pii[k] = delta_pii.get(k, 0) + v
+        # 锁外收集 pii_value_samples delta（热读开关，拷贝后立即 clear）
+        delta_pii_value_samples: dict[str, dict[str, dict]] = {}
+        try:
+            _ctx2 = _req_pii_var.get()
+        except Exception:
+            _ctx2 = None
+        if _ctx2 is not None:
+            raw_samples = _ctx2.get('pii_value_samples')
+            if isinstance(raw_samples, dict) and raw_samples:
+                for k, inner in list(raw_samples.items()):
+                    if not isinstance(inner, dict):
+                        continue
+                    sk = sanitize_kind(k)
+                    copied_inner: dict[str, dict] = {}
+                    for mk, meta in list(inner.items()):
+                        if not isinstance(mk, str) or not isinstance(meta, dict):
+                            continue
+                        mk_t = mk[:64] if len(mk) > 64 else mk
+                        cnt = meta.get('count', 1)
+                        hsh = meta.get('hash', '')
+                        try:
+                            cnt_i = int(cnt)
+                        except Exception:
+                            cnt_i = 1
+                        cnt_i = max(cnt_i, 1)
+                        if not isinstance(hsh, str):
+                            hsh = str(hsh)[:16] if hsh else ''
+                        else:
+                            hsh = hsh[:16]
+                        copied_inner[mk_t] = {'count': cnt_i, 'hash': hsh}
+                    if copied_inner:
+                        if sk in delta_pii_value_samples:
+                            exist = delta_pii_value_samples[sk]
+                            for mk, meta in copied_inner.items():
+                                if mk in exist:
+                                    exist[mk]['count'] += meta['count']
+                                else:
+                                    exist[mk] = meta
+                        else:
+                            delta_pii_value_samples[sk] = copied_inner
+                # clear after copy（防跨请求叠加）
+                try:
+                    raw_samples.clear()
+                except Exception:
+                    pass
+        if not _is_pii_value_sample_enabled():
+            delta_pii_value_samples = {}
+        else:
+            # kind 数量上限 8（白名单已限，此处兜底截断）
+            if len(delta_pii_value_samples) > 8:
+                sorted_kinds = sorted(
+                    delta_pii_value_samples.items(),
+                    key=lambda kv: sum(v['count'] for v in kv[1].values()),
+                    reverse=True,
+                )[:8]
+                delta_pii_value_samples = dict(sorted_kinds)
         # model 白名单/截断（防属性注入/超长；非法则归 unknown_model）
         # 含 `:`（OpenAI 版本号 gpt-4o:2024-08-06）——Y-7 修复防分桶坍塌
         if not _re.fullmatch(r'[A-Za-z0-9._/:@\-]{1,64}', model or ''):
@@ -1046,29 +1246,88 @@ class MetricsCollector:
             if tokens_d:
                 self._merge_tokens(d.tokens, tokens_d)
                 self._merge_tokens(h.tokens, tokens_d)
+            # pii_value_samples 聚合（Top5 per kind，hash 首写 wins，kind <=8）
+            if delta_pii_value_samples:
+                for kind, masked_dict in delta_pii_value_samples.items():
+                    # daily
+                    target_d = d.pii_value_samples.setdefault(kind, {})
+                    for masked, meta in masked_dict.items():
+                        if masked in target_d:
+                            target_d[masked]['count'] += meta['count']
+                        else:
+                            target_d[masked] = {
+                                'count': meta['count'],
+                                'hash': meta['hash'],
+                            }
+                    if len(target_d) > 5:
+                        sorted_items = sorted(
+                            target_d.items(),
+                            key=lambda kv: kv[1]['count'],
+                            reverse=True,
+                        )[:5]
+                        d.pii_value_samples[kind] = dict(sorted_items)
+                    # hourly
+                    target_h = h.pii_value_samples.setdefault(kind, {})
+                    for masked, meta in masked_dict.items():
+                        if masked in target_h:
+                            target_h[masked]['count'] += meta['count']
+                        else:
+                            target_h[masked] = {
+                                'count': meta['count'],
+                                'hash': meta['hash'],
+                            }
+                    if len(target_h) > 5:
+                        sorted_items_h = sorted(
+                            target_h.items(),
+                            key=lambda kv: kv[1]['count'],
+                            reverse=True,
+                        )[:5]
+                        h.pii_value_samples[kind] = dict(sorted_items_h)
+                # kind 总数截断 8
+                if len(d.pii_value_samples) > 8:
+                    sorted_kinds = sorted(
+                        d.pii_value_samples.items(),
+                        key=lambda kv: sum(v['count'] for v in kv[1].values()),
+                        reverse=True,
+                    )[:8]
+                    d.pii_value_samples = dict(sorted_kinds)
+                if len(h.pii_value_samples) > 8:
+                    sorted_kinds_h = sorted(
+                        h.pii_value_samples.items(),
+                        key=lambda kv: sum(v['count'] for v in kv[1].values()),
+                        reverse=True,
+                    )[:8]
+                    h.pii_value_samples = dict(sorted_kinds_h)
             # recent_events
             if request_id:
-                self.recent_events.append(
-                    {
-                        'ts': now,
-                        'request_id': request_id,
-                        'upstream': d_up,
-                        'model': model,
-                        'tail': tail,
-                        'status': status_s,
-                        'latency_ms': latency_ms_v,
-                        'pii_hits': pii_hits,
-                        'pii_miss': pii_miss,
-                        'pii_found': pii_found,
-                        'cred_hits': cred_hits,
-                        'cred_miss': cred_miss,
-                        'tokens': tokens_d,
-                        'verdict': verdict,
-                        'summary': summary_redacted,
-                        'client_gone': client_gone,
-                        'exception': exception,
-                    }
-                )
+                # 精简 pii_value_samples 为 {masked: count}（不存 hash，减体积）
+                simplified = {}
+                for k, inner in delta_pii_value_samples.items():
+                    simplified[k] = {mk: meta['count'] for mk, meta in inner.items()}
+                    if len(simplified) > 8:
+                        break
+                ev: dict[str, Any] = {
+                    'ts': now,
+                    'request_id': request_id,
+                    'upstream': d_up,
+                    'model': model,
+                    'tail': tail,
+                    'status': status_s,
+                    'latency_ms': latency_ms_v,
+                    'pii_hits': pii_hits,
+                    'pii_miss': pii_miss,
+                    'pii_found': pii_found,
+                    'cred_hits': cred_hits,
+                    'cred_miss': cred_miss,
+                    'tokens': tokens_d,
+                    'verdict': verdict,
+                    'summary': summary_redacted,
+                    'client_gone': client_gone,
+                    'exception': exception,
+                }
+                if simplified:
+                    ev['pii_value_samples'] = simplified
+                self.recent_events.append(ev)
 
     @staticmethod
     def _merge_tokens(
@@ -1325,6 +1584,173 @@ class MetricsCollector:
 
     # ── 窗口查询 ──
 
+    def _query_pii_1h(
+        self,
+        model_filter: str | None,
+        upstream_filter: str | None,
+    ) -> tuple[dict[str, dict[str, dict]], dict[str, bool]]:
+        """1h 现场聚合：从 recent_events 按时间/ upstream/model 过滤后 Top5。"""
+        now = _utc_now()
+        cutoff = now - 3600
+        with self._lock:
+            events_snapshot = list(self.recent_events)
+        agg_counts: dict[str, dict[str, int]] = {}
+        for e in events_snapshot:
+            if e.get('ts', 0) < cutoff:
+                continue
+            if upstream_filter is not None and e.get('upstream') != upstream_filter:
+                continue
+            if model_filter is not None and e.get('model') != model_filter:
+                continue
+            samples = e.get('pii_value_samples')
+            if not isinstance(samples, dict):
+                continue
+            for kind, inner in samples.items():
+                sk = sanitize_kind(kind)
+                if not isinstance(inner, dict):
+                    continue
+                dest = agg_counts.setdefault(sk, {})
+                for masked, cnt in inner.items():
+                    if not isinstance(masked, str):
+                        continue
+                    try:
+                        cnt_i = int(cnt)
+                    except Exception:  # noqa: S112 - 解析失败跳过脏数据
+                        continue
+                    if cnt_i <= 0:
+                        continue
+                    mk = masked[:64] if len(masked) > 64 else masked
+                    dest[mk] = dest.get(mk, 0) + cnt_i
+        # hash lookup from in-memory daily/hourly（首写 wins）
+        hash_lookup: dict[str, dict[str, str]] = {}
+        with self._lock:
+            for agg in list(self._daily.values()) + list(self._hourly.values()):
+                for kind, inner in getattr(agg, 'pii_value_samples', {}).items():
+                    hl = hash_lookup.setdefault(kind, {})
+                    for mk, meta in inner.items():
+                        if mk not in hl and isinstance(meta, dict) and meta.get('hash'):
+                            hl[mk] = str(meta['hash'])[:16]
+        pii_out: dict[str, dict[str, dict]] = {}
+        truncated: dict[str, bool] = {}
+        enabled = _is_pii_value_sample_enabled()
+        for kind, masked_counts in agg_counts.items():
+            sorted_items = sorted(
+                masked_counts.items(), key=lambda kv: kv[1], reverse=True
+            )
+            is_trunc = len(sorted_items) > 5
+            # truncated true only when ENABLED=1 && non-empty &&超 Top5
+            truncated[kind] = bool(enabled and sorted_items and is_trunc)
+            top5 = sorted_items[:5]
+            inner_out: dict[str, dict] = {}
+            for mk, cnt in top5:
+                hsh = hash_lookup.get(kind, {}).get(mk, '')
+                # 若 hash 仍空（极近期未落聚合），则用空串占位
+                inner_out[mk] = {'count': cnt, 'hash': hsh}
+            if inner_out:
+                pii_out[kind] = inner_out
+        # 对无超量但已输出的 kind 补 false
+        for k in pii_out:
+            if k not in truncated:
+                truncated[k] = False
+        return pii_out, truncated
+
+    def _query_pii_db(
+        self,
+        range_: str,
+        model_filter: str | None,
+        upstream_filter: str | None,
+    ) -> tuple[dict[str, dict[str, dict]], dict[str, bool], bool]:
+        """持久化 pii_value_agg 归并（按日，Top5 per kind，7 天滚动）。"""
+        if not _is_pii_value_sample_persist() or not _is_pii_value_sample_enabled():
+            return {}, {}, False
+        hours_map = {'24h': 24, '7d': 24 * 7, '30d': 24 * 30}
+        hours = hours_map.get(range_, 24)
+        cutoff_day = _day_key(_utc_now() - hours * 3600)
+        # 上游过滤：精确按 upstream；model 过滤近似（pii_value_agg 无 model 列，忽略）
+        try:
+            ro_conn = sqlite3.connect(
+                f'file:{urllib.parse.quote(self.db_path, safe="/")}?mode=ro',
+                uri=True,
+                timeout=5.0,
+            )
+        except sqlite3.Error:
+            return {}, {}, False
+        try:
+            # 表不存在时返回空
+            try:
+                ro_conn.execute('SELECT 1 FROM pii_value_agg LIMIT 1')
+            except sqlite3.OperationalError:
+                return {}, {}, False
+            if upstream_filter is not None:
+                rows = ro_conn.execute(
+                    'SELECT kind, hash, masked_sample, count FROM pii_value_agg WHERE day >= ? AND upstream = ?',
+                    (cutoff_day, upstream_filter),
+                ).fetchall()
+            else:
+                rows = ro_conn.execute(
+                    'SELECT kind, hash, masked_sample, count FROM pii_value_agg WHERE day >= ?',
+                    (cutoff_day,),
+                ).fetchall()
+            # 按 (kind, hash) 聚合（同掩码多天累计）
+            grouped: dict[tuple[str, str], tuple[str, int]] = {}
+            # (kind, hash) -> (masked_sample, total_count)
+            for kind, hsh, masked, cnt in rows:
+                sk = sanitize_kind(kind)
+                key = (sk, hsh)
+                try:
+                    cnt_i = int(cnt)
+                except Exception:  # noqa: S112 - 脏行跳过
+                    continue
+                if key in grouped:
+                    prev_masked, prev_cnt = grouped[key]
+                    # masked_sample 首写 wins 不更新，仅累加 count
+                    grouped[key] = (prev_masked, prev_cnt + cnt_i)
+                else:
+                    grouped[key] = (
+                        masked[:64]
+                        if isinstance(masked, str) and len(masked) > 64
+                        else masked,
+                        cnt_i,
+                    )
+            # 按 kind 分组再 Top5
+            by_kind: dict[str, list[tuple[str, str, int]]] = {}
+            for (kind, hsh), (masked, total) in grouped.items():
+                by_kind.setdefault(kind, []).append((masked, hsh, total))
+            pii_out: dict[str, dict[str, dict]] = {}
+            truncated: dict[str, bool] = {}
+            enabled = _is_pii_value_sample_enabled()
+            for kind, items in by_kind.items():
+                sorted_items = sorted(items, key=lambda x: x[2], reverse=True)
+                is_trunc = len(sorted_items) > 5
+                truncated[kind] = bool(enabled and sorted_items and is_trunc)
+                top5 = sorted_items[:5]
+                inner: dict[str, dict] = {}
+                for masked, hsh, cnt in top5:
+                    # 以 masked 为键，hash 为值（若同 masked 多 hash 碰撞，保留首见 hash 对应计数已合并）
+                    if masked in inner:
+                        inner[masked]['count'] += cnt
+                    else:
+                        inner[masked] = {
+                            'count': cnt,
+                            'hash': hsh[:16] if isinstance(hsh, str) else '',
+                        }
+                if inner:
+                    pii_out[kind] = inner
+            # is_precise：有持久化且读到数据则视为精确（7 天内）
+            is_precise = (
+                bool(pii_out) or True
+            )  # 即使空也标 True 表示已读盘（非内存近似）
+            # 若无数据但 PERSIST=1，仍算 precise（已查询持久层）
+            is_precise = True
+            return pii_out, truncated, is_precise
+        except sqlite3.Error:
+            return {}, {}, False
+        finally:
+            try:
+                ro_conn.close()
+            except Exception:
+                pass
+
     def query_range(
         self,
         range_: str,
@@ -1332,11 +1758,40 @@ class MetricsCollector:
         model_filter: str | None = None,
         upstream_filter: str | None = None,
     ) -> dict[str, Any]:
-        """?range=1h|24h|7d|30d 聚合（1h 内存 ring，其余 DB 桶 SUM）。"""
+        """?range=1h|24h|7d|30d 聚合（1h 内存 ring，其余 DB 桶 SUM）。扩展 pii_value_samples。"""
         if range_ == '1h':
-            return self._query_1h(model_filter, upstream_filter)
-        hours = 24 if range_ == '24h' else (24 * 7 if range_ == '7d' else 24 * 30)
-        return self._query_db(hours, model_filter, upstream_filter)
+            base = self._query_1h(model_filter, upstream_filter)
+        else:
+            hours = 24 if range_ == '24h' else (24 * 7 if range_ == '7d' else 24 * 30)
+            base = self._query_db(hours, model_filter, upstream_filter)
+        # ── pii_value_samples 扩展 ──
+        if not _is_pii_value_sample_enabled():
+            base['pii_value_samples'] = {}
+            base['pii_value_samples_is_precise'] = False
+            base['pii_value_samples_truncated'] = {}
+            return base
+        if range_ == '1h':
+            pii_out, truncated = self._query_pii_1h(model_filter, upstream_filter)
+            base['pii_value_samples'] = pii_out
+            # is_precise 与 ring_coverage 一致
+            ring = self.ring_stats(
+                upstream_filter=upstream_filter, model_filter=model_filter
+            )
+            base['pii_value_samples_is_precise'] = bool(ring['is_precise'])
+            base['pii_value_samples_truncated'] = truncated
+        else:
+            if not _is_pii_value_sample_persist():
+                base['pii_value_samples'] = {}
+                base['pii_value_samples_is_precise'] = False
+                base['pii_value_samples_truncated'] = {}
+                return base
+            pii_out, truncated, is_precise = self._query_pii_db(
+                range_, model_filter, upstream_filter
+            )
+            base['pii_value_samples'] = pii_out
+            base['pii_value_samples_is_precise'] = is_precise
+            base['pii_value_samples_truncated'] = truncated
+        return base
 
     def _query_1h(
         self,
@@ -2374,8 +2829,12 @@ def _req_pii_ctx() -> dict:
             'cred_hits': 0,
             'cred_miss': 0,
             'pii_by_type': {},
+            'pii_value_samples': {},
         }
         _req_pii_var.set(d)  # type: ignore[arg-type]
+    # 兼容旧 ctx（无 pii_value_samples 键时补齐）
+    if 'pii_value_samples' not in d:
+        d['pii_value_samples'] = {}
     return d
 
 
