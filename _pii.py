@@ -645,8 +645,8 @@ def _pii_value_hash(value: str) -> str:
             return _hmac.new(
                 _salt.encode('utf-8'), value.encode('utf-8'), _hl.sha256
             ).hexdigest()[:16]
-    except Exception:
-        pass
+    except Exception as _e:
+        logger.warning('pii_value_hash HMAC 失败降级 sha256: %s', _e)
     import hashlib as _hl2
 
     return _hl2.sha256(value.encode('utf-8')).hexdigest()[:16]
@@ -1126,7 +1126,7 @@ class PiiDetector:
 
                     _is_dialog = _is_chat_tail(_effective_tail)
                 except Exception:
-                    # fallback inline（与 _llm.is_chat_tail 同语义）
+                    # fallback inline（与 _llm.is_chat_tail 同语义，保持同步：tail.rstrip('/') 后 endswith chat/completions|v1/messages|v1/responses，见 _llm.py:184）
                     t = (_effective_tail or '').rstrip('/')
                     if t.endswith(('chat/completions', 'v1/messages', 'v1/responses')):
                         _is_dialog = True

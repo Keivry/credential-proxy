@@ -52,7 +52,7 @@
 
 ### Requirement: 图表与分布 hover 数值提示
 
-大盘折线图数据点与 PII 类型分布 SHALL 支持 hover 显示完整精确数值（Chart.js `tooltip` 回调或 SVG `title` 元素）：折线图数据点 hover 显示该时间桶的 `requests`/`tokens_prompt`/`tokens_completion`/`cached_read`/`p95`/`pii_requests` 精确值（`count` 经 `toLocaleString()` 精确非 `fmtNum` 缩写）；PII kind 分布（条形/饼图）hover 显示该 kind 的完整计数（不缩写）与占比，**且当 `pii_value_samples` 可用时，hover 追加该 kind 的 TopN 掩码值及次数（聚合 Top5，展示前3 `masked_sample x count`，`count` 均 `toLocaleString()`），无采样（`ENABLED=0` 或空）或 `pii_value_samples_is_precise=false` 时仅计数**。数值精确到 1，不因 K/M/B 缩写丢失精度；掩码值经 `textContent`/`title` 文本通道渲染（`rect<title>` 与 `text title` 分置不同元素，`SSE` 补 `no-store`），禁止 `innerHTML`，明文不展示；`truncated` 仅当 `pii_value_samples_truncated==true` 时显 `…长尾仅计 pii_by_type`。
+大盘折线图数据点与 PII 类型分布 SHALL 支持 hover 显示完整精确数值（Chart.js `tooltip` 回调或 SVG `title` 元素）：折线图数据点 hover 显示该时间桶的 `requests`/`tokens_prompt`/`tokens_completion`/`cached_read`/`p95`/`pii_requests` 精确值（`count` 经 `toLocaleString()` 精确非 `fmtNum` 缩写）；PII kind 分布（条形/饼图）hover 显示该 kind 的完整计数（不缩写）与占比，**且当 `pii_value_samples` 可用且 `pii_value_samples_is_precise===true` 时，hover 追加该 kind 的 TopN 掩码值及次数（聚合 Top5，展示取前3 `masked_sample x count`，`count` 均 `toLocaleString()`，独立于 `p95 is_precise` 的 `3600s+100条` 阈值；`1h` 时 `pii_value_samples_is_precise` 与 `ring_coverage is_precise` 一致，低流量 `len<100` 亦 `false` 仅计数），无采样（`ENABLED=0` 或空）或 `pii_value_samples_is_precise=false` 时仅计数**。数值精确到 1，不因 K/M/B 缩写丢失精度；掩码值经 `textContent`/`title` 文本通道渲染（`rect<title>` 与 `text title` 分置不同元素，`SSE` 补 `no-store`），禁止 `innerHTML`，明文不展示；`truncated` 仅当 `pii_value_samples_truncated==true` 时显 `…长尾仅计 pii_by_type`。
 
 #### Scenario: 折线图数据点 hover 精确值
 

@@ -52,7 +52,7 @@ See proposal.md — Why。当前大盘 PII 分布以 `pii_by_type` 的 kind 级�
 
 ### D5: 前端 hover 扩展 `afterBody` + SVG `<title>` 多行
 
-**决定：** `admin.html:renderBar('pii')` 的 Chart.js `tooltip.callbacks.label` 保持 `kind: count`（`Number(c.raw).toLocaleString()` 精确），新增 `afterBody` 返回多行数组 `Top 3: 138****8000 x5, ...`（取聚合 Top5 的前 3，`count` 均 `toLocaleString()` 精确非 `fmtNum` 缩写，需多行换行防窄屏溢出，`textContent` 文本通道不用 `innerHTML`）；SVG 降级 `rect <title>` 改为 `kind: count\n138****8000 x5\n...` 多行（`rect<title>` 与 `text title` 分置不同元素，禁止 `g` 级 `title`）；`PII SVG` 容器限宽 `Math.min(1200, ...)` 且 `overflow-x:auto`，`Top3` 换行展示；限流 `onerror fallbackTimer` 仅 `renderKpis` 已修正为 `renderKpis+renderTokens4+renderCharts` 全量刷新防陈旧；无采样时仅计数，`!is_precise` 时 `1h` 弱提示 `仅1h精确（样本不足/未持久化）`（原仅 `range!=1h` 已放宽），`truncated` 尾加 `…长尾仅计 pii_by_type`；`SSE` 的 `metrics` 快照响应头补 `Cache-Control: no-store`；PII `<rect>` 补 `tabindex/role` 与键盘可达，`prefers-reduced-motion` 禁动画 `animation:false`，`rect:focus` 2px 高亮，hint 补 `role=status aria-live=polite`。
+**决定：** `admin.html:renderBar('pii')` 的 Chart.js `tooltip.callbacks.label` 保持 `kind: count`（`Number(c.raw).toLocaleString()` 精确），新增 `afterBody` 返回多行数组 `Top 3: 138****8000 x5, ...`（取聚合 Top5 的前 3，`count` 均 `toLocaleString()` 精确非 `fmtNum` 缩写，需多行换行防窄屏溢出，`textContent` 文本通道不用 `innerHTML`）；SVG 降级 `rect <title>` 改为 `kind: count\n138****8000 x5\n...` 多行（`rect<title>` 与 `text title` 分置不同元素，禁止 `g` 级 `title`）；`PII SVG` 容器限宽 `Math.min(1200, ...)` 且 `overflow-x:auto`，`Top3` 换行展示；限流 `onerror fallbackTimer` 仅 `renderKpis` 已修正为 `renderKpis+renderTokens4+renderCharts` 全量刷新防陈旧；无采样时仅计数，`!is_precise` 时全 range 弱提示 `仅1h精确（样本不足/未持久化）`（`pii_value_samples_is_precise` 独立于 `p95 is_precise` 的 `3600s+100条`，`1h` 低流量亦 `false`，原仅 `range!=1h` 已放宽），`truncated` 尾加 `…长尾仅计 pii_by_type`；`SSE` 的 `metrics` 快照响应头补 `Cache-Control: no-store`；PII `<rect>` 补 `tabindex/role` 与键盘可达，`prefers-reduced-motion` 禁动画 `animation:false`，`rect:focus` 2px 高亮，hint 补 `role=status aria-live=polite`。
 
 **理由：** 复用现有 `Chart/SVG` 双路径，不新增依赖；`title`/`afterBody` 均为文本通道，XSS 面天然收敛。
 
@@ -80,7 +80,7 @@ See proposal.md — Why。当前大盘 PII 分布以 `pii_by_type` 的 kind 级�
 1. 代码：`_pii.py` 加 `mask_pii_value(kind, value) -> str` 与 `ContextVar` 扩展；`_metrics.py` 加 `pii_value_samples` 聚合、上游可选表、TTL 清理、开关读取；`_admin.py` 透出 `pii_value_samples`；`admin.html` 扩展 `renderBar` tooltip/SVG。
 2. 环境：新增 `PII_VALUE_SAMPLE_ENABLED` / `PII_VALUE_SAMPLE_PERSIST`（`config.yaml` / `docker-compose.yml` / `.env.example`），默认 `0`，无需重启即生效（采样开关热读）。
 3. 数据：`metrics.sqlite` 首次 `PERSIST=1` 时建 `pii_value_agg`，历史无值级数据（空 `{}`），不迁移；`7d` 滚动自动清理。
-4. 测试：新增 `tests/test_pii_value_samples.py` 与 `tests/observability_pii_value_test.py`，`ruff check/format --check` 必过。
+4. 测试：新增 `tests/pii_value_samples_test.py` 与 `tests/observability_pii_value_test.py`，`ruff check/format --check` 必过。
 5. 回滚：`PII_VALUE_SAMPLE_ENABLED=0` 即回退为仅计数的旧表现；`DROP TABLE pii_value_agg` 可选（保留亦无害）。
 
 ## Open Questions

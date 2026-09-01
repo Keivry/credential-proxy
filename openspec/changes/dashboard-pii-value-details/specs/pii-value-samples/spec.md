@@ -1,12 +1,12 @@
 ## Purpose
 
-为 PII 分布提供值级掩码采样与聚合，支撑仪表盘按 kind 下钻到具体匹配值（掩码后）及次数，默认不存明文、开关可控。
+为 PII 分布提供值级掩码采样与聚合，支撑仪表盘按 kind 下钻到具体匹配值（掩码后）及次数，默认不存明文、开关可控。按 kind 聚合 TopN=5（展示取前 3）、`recent_events` 入队精简按 kind 截前 8 不插第 9 项（防基数爆炸，`hash` 仅内部去重不进 API/事件/SSE）、双开关 `PII_VALUE_SAMPLE_ENABLED/PERSIST`（默认 0，`PERSIST=1` 隐含 `ENABLED=1`，每次热读）、`HMAC-SHA256(SALT)[:16]`（`SALT=PII_VALUE_SAMPLE_HMAC_KEY` 未设退化 `sha256[:16]` 小空间可枚举）、可选落盘 `pii_value_agg(day,upstream,kind,hash)` 7 天滚动（`0600`，含 `-wal/-shm`，仅 `PERSIST=1` 建表）。`range=1h` 内存精确（`is_precise` 与 `ring_coverage` 一致）、`24h/7d/30d` 依赖 `PERSIST` 否则空且 `is_precise=false` 不读盘。
 
 ## ADDED Requirements
 
 ### Requirement: PII 值级掩码采样与聚合
 
-系统 SHALL 在 PII 命中时产出值级掩码采样：在 `_pii.py` 命中回调内（明文作用域内，仅 `PII_VALUE_SAMPLE_ENABLED=1` 且 `is_chat_tail(tail)` 为真、`tail is None` 不采样、请求/响应侧同守门）生成 `masked_sample`（phone→`138****8000`；email→`***@***.com` 不透首字符；bank_card→`**** **** **** 6789` 仅后4；ipv4→`192.168.**.**`；ipv6/api_key→`前4****后4`（含 6-7 字符）；其他→`前3****后3` 且 `<6` 时 `前1****后1`，`masked_sample` 长度上限 64 含 `*`）与 `value_hash=_pii_value_hash(明文)`（`HMAC-SHA256(SALT,明文)[:16]` 当 `PII_VALUE_SAMPLE_HMAC_KEY` 设值，否则 `sha256[:16]`；变量名 `value_hash`，持久化键为 `hash`、落盘列 `hash` 仅内部去重不透 API），通过 `ContextVar _req_pii_var.pii_value_samples: dict[str, dict[str, dict]]`（`masked->{count, hash}`）透传到 `_metrics.py` 按 `kind` 聚合 TopN（聚合 5，展示取前 3，`recent_events` 精简为 `{masked:count}` 不含 hash 且 kind 内 ≤8 按 count 降序截断不插第 9 项），kind 总数受 `sanitize_kind` 白名单约束（≤8 kind，`incr_event` 消费后原子替换 `ctx['pii_value_samples']={}` 禁止 `.clear()` 竞态，`handler finally` 以 `Token reset` 失败回退 `set(None)`），明文不出 `_pii.py` 作用域，仅 `masked_sample+hash` 进入内部聚合/落盘，API/事件/SSE 仅 `{masked:count}`（`hash` 为 `HMAC-SHA256` 未设退化小空间可枚举，仅去重）。
+系统 SHALL 在 PII 命中时产出值级掩码采样：在 `_pii.py` 命中回调内（明文作用域内，仅 `PII_VALUE_SAMPLE_ENABLED=1` 且 `is_chat_tail(tail)` 为真、`tail is None` 不采样、请求/响应侧同守门）生成 `masked_sample`（phone→`138****8000`；email→`***@***.com` 不透首字符；bank_card→`**** **** **** 6789` 仅后4；ipv4→`192.168.**.**`；ipv6/api_key→`前4****后4`（含 6-7 字符）；其他→`前3****后3` 且 `<6` 时 `前1****后1`，`masked_sample` 长度上限 64 含 `*`）与 `value_hash=_pii_value_hash(明文)`（`HMAC-SHA256(SALT,明文)[:16]` 小写 hex ` [0-9a-f]{16}`，当 `PII_VALUE_SAMPLE_HMAC_KEY` 设值否则 `sha256[:16]`；变量名 `value_hash`，持久化键为 `hash`、落盘列 `hash` 仅内部去重不透 API，API `{masked: count}` 键为 `masked_sample`），通过 `ContextVar _req_pii_var.pii_value_samples: dict[str, dict[str, dict]]`（`masked->{count, hash}`）透传到 `_metrics.py` 按 `kind` 聚合 TopN（聚合 5，展示取前 3，`recent_events` 精简为 `{masked:count}` 不含 hash 且 kind 内 ≤8 按 count 降序截断不插第 9 项），kind 总数受 `sanitize_kind` 白名单约束（≤8 kind，`incr_event` 消费后原子替换 `ctx['pii_value_samples']={}` 禁止 `.clear()` 竞态，`handler finally` 以 `Token reset` 失败回退 `set(None)`），明文不出 `_pii.py` 作用域，仅 `masked_sample+hash` 进入内部聚合/落盘，API/事件/SSE 仅 `{masked:count}`（`hash` 为 `HMAC-SHA256` 未设退化小空间可枚举，仅去重）。
 
 #### Scenario: 掩码形态正确
 
@@ -22,6 +22,11 @@
 
 - **WHEN** `PII_VALUE_SAMPLE_ENABLED` 未设置或为 `0`
 - **THEN** 不产掩码、不聚合，`/_admin/metrics` 返回 `pii_value_samples: {}`，`_pii.py` 不增加额外开销。
+
+#### Scenario: 开关非法值与隐含启用
+
+- **WHEN** `PII_VALUE_SAMPLE_ENABLED` 或 `PII_VALUE_SAMPLE_PERSIST` 为非法值（如 `"2"`/`"yes"`）或 `PERSIST=1` 而 `ENABLED=0`
+- **THEN** 解析记 `errors` 并 `logger.warning` 回退 `0`（非法）或 `PERSIST=1` 隐含 `ENABLED=1`（`_is_pii_value_sample_enabled()` 为真），`/_admin/metrics` 按热读结果返回。
 
 #### Scenario: 明文不落盘与不进 SSE
 

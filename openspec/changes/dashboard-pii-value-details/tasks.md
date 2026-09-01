@@ -1,4 +1,4 @@
-> 依赖图：`1.1→2.1→2.2→3.1→3.2→3.3→3.4→3.5→4.1→5.1/5.2→5.3/5.4→6.x→7.x`；`6.1`在`2.1`后即跑（TDD），`1.1`首位完成再启`3.x`。
+> 依赖图：`1.1→{2.1,2.2}→3.1→3.2→{3.3,3.4,3.5}→4.1→{5.1,5.2}→{5.3,5.4}→6.x→7.x`（`6.1` 在 `2.1` 后即可 TDD 并行，`3.x` 需 `1.1` 首位完成；`5.1` 已拆为 `5.1a Chart.js afterBody` / `5.1b SVG title` 双子任务）
 
 ## 1. 配置与契约
 
@@ -14,7 +14,7 @@
 - [ ] 2.2 `ContextVar _req_pii_var` 扩展 `pii_value_samples: dict[str, dict[str, dict]]`（`masked -> {count, hash}`，`recent_events`精简为`{masked:count}` 且 kind 内 ≤8 截断不插第9项），命中回调内当场 `value_hash=_pii_value_hash(value)`（`HMAC-SHA256(SALT,明文)[:16]` 未设退化 `sha256[:16]`，键为`hash` 仅内部去重不透 API，`SALT=PII_VALUE_SAMPLE_HMAC_KEY`）+ `masked=mask_pii_value(kind,value)` 按`kind`累加`pii_value_samples[kind][masked].count+=count`（hash 首写 wins）；仅 `ENABLED=1 && is_chat_tail(tail)`（`tail is None` 不采样，请求/响应侧同守门，未传 tail 则不产）时产采样，`incr_event` 锁外拷贝`delta`后原子替换 `ctx['pii_value_samples']={}`（禁止 `.clear()` 竞态）并 `handler finally` 以 `Token reset` 失败回退 `set(None)` 防跨请求叠加
   - 验收：`PiiDetector.scan("__PII_7_6716b652__", tail="chat/completions")` 后 `_req_pii_var.get()['pii_value_samples']['phone']['138****8000']['count']==1` 且 `hash`为16 hex；`scan("__PII_7_6716b652__")` 无 tail 或非对话 `tail="v1/embeddings"` 后 `pii_value_samples` 仍空；`ENABLED=0` 时空；`asyncio.gather`双请求并发计数互不干扰且 `incr_event` 后 `ctx['pii_value_samples']=={}` 原子替换
 - [ ] 2.3 `sanitize_kind` 复用约束掩码 key，`masked_sample` 长度上限 64（含 `*`），超长截断；`value_hash` 仅 hex 16 位
-  - 验收：超长 `masked_sample` 被截断；`hash` 恒 16 hex
+  - 验收：超长 `masked_sample` 被截断；`hash` 恒小写 16 hex `[0-9a-f]{16}`
 
 ## 3. 聚合与持久化（_metrics.py）
 
@@ -31,7 +31,7 @@
 
 ## 4. 管理 API（_admin.py）
 
-- [ ] 4.1 `GET /_admin/metrics?range=&model=&upstream=` 透出 `pii_value_samples: {masked: count}`（精简不含 hash）与 `pii_value_samples_is_precise`（向后兼容缺省 `{}/false`），鉴权/限流/`no-store` 不变，未鉴权 `401` 不泄露采样，`SSE` 亦 `no-store`
+- [ ] 4.1 `GET /_admin/metrics?range=1h|24h|7d|30d&model=&upstream=` 透出 `pii_value_samples: {masked: count}`（精简不含 hash）与 `pii_value_samples_is_precise`（向后兼容缺省 `{}/false`），鉴权/限流/`no-store` 不变，未鉴权 `401` 不泄露采样，`SSE` 亦 `no-store`
   - 验收：`curl -H "X-Admin-Token: t" /_admin/metrics?range=1h` 含 `pii_value_samples` 且 `pii_value_samples[phone][masked]` 为 number 不含 hash；无 token `401` 且无该字段明文；`hash` 不在任何 API/事件/SSE 响应体
 - [ ] 4.2 `health` 补充 `pii_value_sample_enabled/persist` 标志（可选）
   - 验收：`/_admin/health` 含 `pii_value_sample_enabled` 布尔
@@ -49,7 +49,7 @@
 
 ## 6. 测试与验证
 
-- [ ] 6.1 新增 `tests/test_pii_value_samples.py`：掩码形态（各 kind）、TopN 截断（>5 截断）、开关（ENABLED/PERSIST）、hash 16hex、sanitize 边界
+- [ ] 6.1 新增 `tests/pii_value_samples_test.py`：掩码形态（各 kind）、TopN 截断（>5 截断）、开关（ENABLED/PERSIST）、hash 16hex、sanitize 边界
   - 验收：pytest 通过；`hash` 稳定；`Top5` 断言成立
 - [ ] 6.2 新增 `tests/observability_pii_value_test.py`：`query_range('1h')` 精确（含 recent_events≤8 不越界）、`query_range('24h', PERSIST=0)` 空、`pii_value_agg` 建表/滚动/0600、`metrics` API 401 不泄露且 hash 不透传、`sum(count) ≤ pii_by_type`
   - 验收：pytest 通过；`metrics.sqlite` 权限 `0600`；未鉴权/已鉴权均不含 `hash`；`sum(pii_value_samples count) ≤ pii_by_type`；跨天 23:59→00:01 TopN 独立、0 事件/空 samples、`model` 近似忽略等边界通过
