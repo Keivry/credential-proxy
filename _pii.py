@@ -149,7 +149,13 @@ def _is_detection_hardening() -> bool:
 
 # ── JSON-aware 脱敏辅助（修复纯文本替换破坏 \u 转义的 Invalid \escape）──
 async def _pii_json_walk(
-    obj, detector, credential_p2t, response_side, path: str = '$', _depth: int = 0
+    obj,
+    detector,
+    credential_p2t,
+    response_side,
+    path: str = '$',
+    _depth: int = 0,
+    tail: str | None = None,
 ):
     """递归遍历 JSON 结构，仅对字符串节点做 PII 脱敏，叶子级最小回退。
 
@@ -160,14 +166,18 @@ async def _pii_json_walk(
     if _shared_json_walk_async is not None:  # type: ignore[truthy-function]
 
         async def _leaf(s: str):  # type: ignore[no-redef]
-            return await detector.detect_and_redact(s, credential_p2t, response_side)
+            return await detector.detect_and_redact(
+                s, credential_p2t, response_side, tail=tail
+            )
 
         return await _shared_json_walk_async(
             obj, _leaf, depth_limit=5, path=path, _depth=_depth
         )  # type: ignore
     if _depth > 5:
         if isinstance(obj, str):
-            new_s = await detector.detect_and_redact(obj, credential_p2t, response_side)
+            new_s = await detector.detect_and_redact(
+                obj, credential_p2t, response_side, tail=tail
+            )
             if new_s != obj:
                 try:
                     _jdumps(new_s)
@@ -196,11 +206,14 @@ async def _pii_json_walk(
                         response_side,
                         f'{path}→$.inner',
                         _depth + 1,
+                        tail,
                     )
                     return _jdumps(walked)
             except Exception:
                 pass
-        new_s = await detector.detect_and_redact(obj, credential_p2t, response_side)
+        new_s = await detector.detect_and_redact(
+            obj, credential_p2t, response_side, tail=tail
+        )
         if new_s != obj:
             try:
                 _jdumps(new_s)
@@ -219,13 +232,13 @@ async def _pii_json_walk(
         out = {}
         for k, v in obj.items():
             out[k] = await _pii_json_walk(
-                v, detector, credential_p2t, response_side, f'{path}.{k}', _depth
+                v, detector, credential_p2t, response_side, f'{path}.{k}', _depth, tail
             )
         return out
     if isinstance(obj, list):
         return [
             await _pii_json_walk(
-                x, detector, credential_p2t, response_side, f'{path}[{i}]', _depth
+                x, detector, credential_p2t, response_side, f'{path}[{i}]', _depth, tail
             )
             for i, x in enumerate(obj)
         ]
@@ -246,9 +259,12 @@ def parse_pii_env_config() -> dict:
       流式正文行缓冲由 LINE_BUF_FLUSH=16KB / LINE_BUF_MAX_AGE=30s 控制）
     - PII_FUZZY_RESTORE（0/1，默认 0）
     - PII_DETECTION_HARDENING（0/1，默认 0，硬化特性总闸）
+    - PII_VALUE_SAMPLE_ENABLED（0/1，默认 0，1 时启用值级掩码采样）
+    - PII_VALUE_SAMPLE_PERSIST（0/1，默认 0，1 时持久化采样且隐含 ENABLED=1）
 
     返回: {'enabled', 'response_side', 'hold_max', 'fuzzy_restore',
-           'detection_hardening', 'errors': [str]}
+           'detection_hardening', 'pii_value_sample_enabled',
+           'pii_value_sample_persist', 'errors': [str]}
     """
     errors: list[str] = []
     enabled = os.environ.get('PII_REDACTION_ENABLED') in (
@@ -323,6 +339,31 @@ def parse_pii_env_config() -> dict:
                     raw_text = raw_text[:PII_PLACEHOLDER_PROMPT_MAX_LEN]
                 placeholder_prompt_text = raw_text
 
+    # PII 值级掩码采样开关（dashboard-pii-value-details 1.1）：0/1 校验，默认 0，
+    # PERSIST=1 隐含 ENABLED=1，非法值记 errors 并告警回退 0
+    pii_value_sample_enabled = False
+    pii_value_sample_persist = False
+    raw_vs_enabled = os.environ.get('PII_VALUE_SAMPLE_ENABLED', '0')
+    raw_vs_persist = os.environ.get('PII_VALUE_SAMPLE_PERSIST', '0')
+    vs_enabled_valid = raw_vs_enabled in ('0', '1')
+    vs_persist_valid = raw_vs_persist in ('0', '1')
+    if not vs_enabled_valid:
+        errors.append(f'PII_VALUE_SAMPLE_ENABLED 非法值(仅 0/1): {raw_vs_enabled!r}')
+        logger.warning(
+            'PII_VALUE_SAMPLE_ENABLED 非法值(仅 0/1): %r, 回退 0', raw_vs_enabled
+        )
+    if not vs_persist_valid:
+        errors.append(f'PII_VALUE_SAMPLE_PERSIST 非法值(仅 0/1): {raw_vs_persist!r}')
+        logger.warning(
+            'PII_VALUE_SAMPLE_PERSIST 非法值(仅 0/1): %r, 回退 0', raw_vs_persist
+        )
+    vs_enabled = (raw_vs_enabled == '1') if vs_enabled_valid else False
+    vs_persist = (raw_vs_persist == '1') if vs_persist_valid else False
+    if vs_persist:
+        vs_enabled = True
+    pii_value_sample_enabled = vs_enabled
+    pii_value_sample_persist = vs_persist
+
     return {
         'enabled': enabled,
         'response_side': response_side,
@@ -331,6 +372,8 @@ def parse_pii_env_config() -> dict:
         'detection_hardening': detection_hardening,
         'placeholder_prompt_enabled': placeholder_prompt_enabled,
         'placeholder_prompt_text': placeholder_prompt_text,
+        'pii_value_sample_enabled': pii_value_sample_enabled,
+        'pii_value_sample_persist': pii_value_sample_persist,
         'errors': errors,
     }
 
@@ -568,6 +611,118 @@ def _id_card_ok(value: str) -> bool:
 def _mask_placeholder(value: str, kind: str) -> str:
     """构造 [REDACTED:<type>] 形态（审计/审批摘要用）。"""
     return f'[REDACTED:{kind}]'
+
+
+# ── pii value sample: mask & enable guard (dashboard-pii-value-details) ──
+def _is_pii_value_sample_enabled() -> bool:
+    """值级采样开关：PII_VALUE_SAMPLE_ENABLED=1 或 PERSIST=1 时启用（热读，统一 _metrics 校验与告警）。"""
+    try:
+        from _metrics import _is_pii_value_sample_enabled as _enabled  # type: ignore
+
+        return bool(_enabled())
+    except Exception:
+        return (
+            os.environ.get('PII_VALUE_SAMPLE_ENABLED') == '1'
+            or os.environ.get('PII_VALUE_SAMPLE_PERSIST') == '1'
+        )
+
+
+def _pii_value_hash(value: str) -> str:
+    """PII 明文 hash（16 hex，64bit）— 防 1万匿名集枚举。
+
+    优先 HMAC-SHA256(SALT, value)[:16]（SALT 来自 PII_VALUE_SAMPLE_HMAC_KEY 环境变量，
+    若未设则退化为 SHA256(value)[:16] 并文档声明小空间可枚举风险；SALT 仅服务端持有，
+    HMAC 使离线枚举需先获 SALT）。兼容存量无盐 hash 的去重语义（同值同 hash 仍合并，
+    不同值同掩码已按 masked 合并，hash 首写 wins）。
+    """
+
+    try:
+        _salt = os.environ.get('PII_VALUE_SAMPLE_HMAC_KEY', '').strip()
+        if _salt:
+            import hashlib as _hl
+            import hmac as _hmac
+
+            return _hmac.new(
+                _salt.encode('utf-8'), value.encode('utf-8'), _hl.sha256
+            ).hexdigest()[:16]
+    except Exception as _e:
+        logger.warning('pii_value_hash HMAC 失败降级 sha256: %s', _e)
+    import hashlib as _hl2
+
+    return _hl2.sha256(value.encode('utf-8')).hexdigest()[:16]
+
+
+def mask_pii_value(kind: str, value: str) -> str:
+    """按 kind 掩码明文值（不含 hash，仅 masked_sample）。
+
+    - phone: 138****8000 (first3****last4)
+    - email: ***@***.com (不透 local/domain 首字符；suffix 保留，防 a***@b.com 侧信道)
+    - bank_card: **** **** **** 6789 (仅后4，BIN不保留)
+    - ipv4: 192.168.**.**
+    - ipv6/api_key: 前4****后4
+    - other: 前3****后3 且 <6 时 前1****后1
+    - empty -> ***
+    - masked 长度上限 64，超长截断
+    """
+    if not value:
+        return '***'
+    k = (kind or '').lower()
+    v = value
+    if k == 'phone':
+        if len(v) >= 7:
+            masked = f'{v[:3]}****{v[-4:]}'
+        else:
+            if len(v) < 6:
+                masked = f'{v[0]}****{v[-1]}' if len(v) >= 2 else '***'
+            else:
+                masked = f'{v[:3]}****{v[-3:]}'
+    elif k == 'email':
+        if '@' not in v:
+            if len(v) < 6:
+                masked = f'{v[0]}****{v[-1]}' if len(v) >= 2 else '***'
+            else:
+                masked = f'{v[:3]}****{v[-3:]}'
+        else:
+            _, domain = v.split('@', 1)
+            # 不透 local/domain 首字符：统一 ***@***.suffix（防 a***@b.com 侧信道，见 design D1）
+            if '.' in domain:
+                suffix = domain.rsplit('.', 1)[-1]
+                masked = f'***@***.{suffix}' if suffix else '***@***'
+            else:
+                masked = '***@***'
+    elif k == 'bank_card':
+        if len(v) >= 4:
+            masked = f'**** **** **** {v[-4:]}'
+        else:
+            masked = f'{v[0]}****{v[-1]}' if len(v) >= 2 else '***'
+    elif k == 'ipv4':
+        parts = v.split('.')
+        if len(parts) == 4:
+            masked = f'{parts[0]}.{parts[1]}.**.**'
+        else:
+            if len(v) >= 8:
+                masked = f'{v[:4]}****{v[-4:]}'
+            else:
+                masked = f'{v[0]}****{v[-1]}' if len(v) >= 2 else '***'
+    elif k in ('ipv6', 'api_key'):
+        if len(v) < 6:
+            masked = f'{v[0]}****{v[-1]}' if len(v) >= 2 else '***'
+        else:
+            if len(v) >= 8:
+                masked = f'{v[:4]}****{v[-4:]}'
+            else:
+                masked = f'{v[:3]}****{v[-3:]}'
+    else:
+        if len(v) < 6:
+            if len(v) == 0 or len(v) == 1:
+                masked = '***'
+            else:
+                masked = f'{v[0]}****{v[-1]}'
+        else:
+            masked = f'{v[:3]}****{v[-3:]}'
+    if len(masked) > 64:
+        masked = masked[:64]
+    return masked
 
 
 class PiiDetector:
@@ -894,10 +1049,12 @@ class PiiDetector:
         self,
         text: str,
         credential_p2t: dict | None = None,
+        tail: str | None = None,
     ) -> list[tuple[str, str]]:
         """检测文本中的 PII，返回 [(type, value)] 列表（不替换）。
 
         credential_p2t: 全局凭据映射（重叠值策略：凭据命中的值 PII 跳过）。
+        tail: 请求路径尾（is_chat_tail 守门，值级采样仅对话路径；None 时不采样）。
         """
         if not text:
             return []
@@ -955,6 +1112,70 @@ class PiiDetector:
         if self.dict_re:
             hits.extend(self._scan_dict(text, credential_p2t))
         self._count_detected(hits)
+        # ── 值级掩码采样（dashboard-pii-value-details 2.2）──
+        # 明文仅在命中回调作用域内可见，仅掩码+hash 进 ContextVar
+        _effective_tail = tail
+        # 严格模式：tail is None => 不采样（需调用方显式传 tail，防 ContextVar 陈旧值中毒）
+        # 请求侧已通过 handler 注入 tail 并显式透传；直调 scan 不传 tail 视为非对话不采样
+        if hits and _is_pii_value_sample_enabled() and _effective_tail is not None:
+            try:
+                # lazy is_chat_tail guard（防 _pii↔_llm 循环）
+                _is_dialog = False
+                try:
+                    from _llm import is_chat_tail as _is_chat_tail  # type: ignore
+
+                    _is_dialog = _is_chat_tail(_effective_tail)
+                except Exception:
+                    # fallback inline（与 _llm.is_chat_tail 同语义，保持同步：tail.rstrip('/') 后 endswith chat/completions|v1/messages|v1/responses，见 _llm.py:184）
+                    t = (_effective_tail or '').rstrip('/')
+                    if t.endswith(('chat/completions', 'v1/messages', 'v1/responses')):
+                        _is_dialog = True
+                    else:
+                        for _known in (
+                            'chat/completions',
+                            'v1/messages',
+                            'v1/responses',
+                        ):
+                            _marker = '/' + _known + '/'
+                            _idx = t.rfind(_marker)
+                            if _idx != -1:
+                                _suffix = t[_idx + len(_marker) :]
+                                if _suffix and '/' not in _suffix:
+                                    _is_dialog = True
+                                    break
+                if _is_dialog:
+                    # lazy anti-cycle: ContextVar + sanitize_kind from _metrics
+                    try:
+                        from _metrics import _req_pii_var as _pii_var  # type: ignore
+                        from _metrics import (
+                            sanitize_kind as _sanitize_kind,  # type: ignore
+                        )
+
+                        _ctx = _pii_var.get()
+                        if _ctx is not None:
+                            _pvs = _ctx.setdefault('pii_value_samples', {})  # type: ignore[attr-defined]
+                            for _k, _v in hits:
+                                try:
+                                    try:
+                                        _sk = _sanitize_kind(_k, self.custom_names)
+                                    except TypeError:
+                                        _sk = _sanitize_kind(_k)  # type: ignore
+                                except Exception:
+                                    _sk = 'custom_other'
+                                _masked = mask_pii_value(_sk, _v)
+                                if len(_masked) > 64:
+                                    _masked = _masked[:64]
+                                _h = _pii_value_hash(_v)
+                                _bucket = _pvs.setdefault(_sk, {})  # type: ignore
+                                _ent = _bucket.get(_masked)
+                                if _ent is None:
+                                    _bucket[_masked] = {'count': 1, 'hash': _h}
+                                else:
+                                    _ent['count'] += 1
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         return hits
 
     def _count_detected(self, hits: list[tuple[str, str]]) -> None:
@@ -975,11 +1196,12 @@ class PiiDetector:
         text: str,
         credential_p2t: dict | None = None,
         response_side: bool = False,
+        tail: str | None = None,
     ) -> str:
         """检测并替换 PII 为占位符（注册到请求级映射）。"""
         if not text:
             return text
-        hits = await self.scan(text, credential_p2t)
+        hits = await self.scan(text, credential_p2t, tail=tail)
         if not hits:
             return text
         # 去重 + 替换（长值优先防子串碰撞）
@@ -1133,14 +1355,18 @@ class PiiMixin:
             with contextlib.suppress(Exception):
                 scope._malformed_counts.clear()
 
-    async def pii_scan(self, text: str) -> list[tuple[str, str]]:
+    async def pii_scan(
+        self, text: str, tail: str | None = None
+    ) -> list[tuple[str, str]]:
         """检测 PII（供 _llm.py 调用）。"""
         if not self.pii_enabled or not text:
             return []
         cred_p2t = getattr(self, 'pwd_to_token', None)
-        return await self._pii_detector.scan(text, cred_p2t)
+        return await self._pii_detector.scan(text, cred_p2t, tail=tail)
 
-    async def pii_redact(self, text: str, response_side: bool = False) -> str:
+    async def pii_redact(
+        self, text: str, response_side: bool = False, tail: str | None = None
+    ) -> str:
         """检测并替换 PII（注册到请求级映射）。"""
         if not self.pii_enabled or not text:
             return text
@@ -1149,10 +1375,11 @@ class PiiMixin:
             text,
             credential_p2t=cred_p2t,
             response_side=response_side,
+            tail=tail,
         )
 
     async def pii_redact_json_aware(
-        self, text: str, response_side: bool = False
+        self, text: str, response_side: bool = False, tail: str | None = None
     ) -> str:
         """JSON 感知的 PII 脱敏：仅对字符串节点做替换，避免破坏 \\u 转义。
 
@@ -1165,21 +1392,21 @@ class PiiMixin:
             return text
         stripped = text.lstrip('\ufeff').lstrip()
         if not (stripped.startswith(('{', '['))):
-            return await self.pii_redact(text, response_side)
+            return await self.pii_redact(text, response_side, tail=tail)
         try:
             obj = _jloads(text.lstrip('\ufeff'))
         except Exception:
-            return await self.pii_redact(text, response_side)
+            return await self.pii_redact(text, response_side, tail=tail)
         cred_p2t = getattr(self, 'pwd_to_token', None)
         try:
             redacted = await _pii_json_walk(
-                obj, self._pii_detector, cred_p2t, response_side, path='$'
+                obj, self._pii_detector, cred_p2t, response_side, path='$', tail=tail
             )
             out = _jdumps(redacted)
             return _pii_validate_json_roundtrip(text, out, 'pii_redact_json_aware')
         except Exception:
             logger.debug('pii_redact_json_aware 回退到纯文本路径', exc_info=True)
-            return await self.pii_redact(text, response_side)
+            return await self.pii_redact(text, response_side, tail=tail)
 
     # ── 占位符说明提示词注入（pii-placeholder-prompt）──
 

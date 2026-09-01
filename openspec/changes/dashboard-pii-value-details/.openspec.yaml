@@ -1,0 +1,3 @@
+schema: spec-driven
+created: 2026-09-01
+goal: 在PII分布图表hover时可查看各kind下具体匹配字符串（掩码脱敏后）及出现次数，默认不持久化明文，提供内存采样与可选掩码持久化两种路径

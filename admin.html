@@ -98,6 +98,11 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); display: inline-block; }
   .dot.off { background: var(--dim); }
   svg text { fill: var(--dim); font-size: 10px; }
+  /* keyboard focus for PII rect (SVG) */
+  svg rect[tabindex=\"0\"]:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+  }
   .tokens4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin-bottom: 10px; }
   .tok { background: var(--panel2); border-radius: 8px; padding: 8px 10px; }
   .tok .l { color: var(--dim); font-size: 11px; }
@@ -176,6 +181,7 @@
 (function () {
   'use strict';
   var state = { range: '1h', token: '', live: true, ev: [], model: '', upstream: '',
+    lastMetrics: null,
     // 累积全量集合（只增不减）：下拉选项永不随过滤收缩，保证任意维度可切换
     allModels: {}, allUpstreams:{} };
 
@@ -368,8 +374,8 @@
   var chartInstances = {};
 
   function renderCharts(metrics) {
+    state.lastMetrics = metrics;
     var piiData = metrics.pii_by_type || {};
-    var hasChart = typeof Chart !== 'undefined';
     renderBar('pii', piiData, 'PII kind');
     // 上游分布稍后由 events 数据填充（renderUpstream 调用 renderBar('upstream', ...)）
   }
@@ -381,6 +387,29 @@
       document.getElementById(id + '-svg').innerHTML = '<span style="color:var(--dim)">暂无数据</span>';
       return;
     }
+    var isPii = id === 'pii';
+    var piiSamples = null, piiTruncated = null, piiPrecise = false;
+    if (isPii) {
+      var __m = state.lastMetrics || {};
+      piiSamples = __m.pii_value_samples || {};
+      piiTruncated = __m.pii_value_samples_truncated || {};
+      piiPrecise = __m.pii_value_samples_is_precise === true;
+    }
+    function top3ForKind(kind) {
+      if (!isPii || !piiPrecise) return [];
+      var bucket = piiSamples ? piiSamples[kind] : null;
+      if (!bucket || typeof bucket !== 'object') return [];
+      var entries = Object.keys(bucket).map(function(mk) {
+        var v = bucket[mk];
+        var cnt = 0;
+        if (v != null && typeof v === 'object') cnt = v.count != null ? Number(v.count) : Number(v);
+        else cnt = Number(v);
+        if (!isFinite(cnt)) cnt = 0;
+        return [mk, cnt];
+      });
+      entries.sort(function(a,b){ return b[1]-a[1]; });
+      return entries.slice(0, 3);
+    }
     var hasChart = typeof Chart !== 'undefined';
     var svgEl = document.getElementById(id + '-svg');
     if (hasChart) {
@@ -390,22 +419,39 @@
         ctx.innerHTML = '<canvas id="' + id + '-canvas"></canvas>';
         var canvas = document.getElementById(id + '-canvas');
         var datasets = [{ label: label, data: keys.map(function (k) { return data[k]; }), backgroundColor: '#4cc2ff55', borderColor: '#4cc2ff', borderWidth: 1 }];
+        var tooltipCbs = {
+          label: function (c) { return ' ' + c.label + ': ' + Number(c.raw).toLocaleString('en-US'); }
+        };
+        if (isPii) {
+          tooltipCbs.afterBody = function(items) {
+            if (!items || !items.length) return [];
+            var kind = items[0].label;
+            var top3 = top3ForKind(kind);
+            if (!top3.length) return [];
+            // multi-line: first line header, rest one per masked to avoid long single line overflow on narrow viewport
+            var out = ['Top 3:'];
+            top3.forEach(function(p){
+              var cnt = Number(p[1]);
+              out.push(p[0] + ' x' + (isFinite(cnt) ? cnt.toLocaleString('en-US') : p[1]));
+            });
+            if (piiTruncated && piiTruncated[kind] === true) out.push('\u2026\u957f\u5c3e\u4ec5\u8ba1 pii_by_type');
+            return out;
+          };
+        }
+        // respects prefers-reduced-motion
+        var prefersReduced = typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
         if (!chartInstances[id]) {
           chartInstances[id] = new Chart(canvas, {
             type: 'bar',
             data: { labels: keys, datasets: datasets },
             options: {
+              animation: prefersReduced ? false : undefined,
               plugins: {
                 legend: { display: false },
-                tooltip: {
-                  callbacks: {
-                    label: function (c) { return ' ' + c.label + ': ' + Number(c.raw).toLocaleString('en-US'); }
-                  }
-                }
+                tooltip: { callbacks: tooltipCbs }
               },
               scales: {
                 y: { beginAtZero: true, ticks: { callback: function (v) { return fmtNum(v); } } },
-                // X 轴类别标签：长标签自动旋转 45° 防重叠截断（完整值 hover 见 tooltip）
                 x: { ticks: { maxRotation: 45, minRotation: 0, autoSkip: true, maxTicksLimit: 20 } }
               }
             }
@@ -414,33 +460,149 @@
           var ch = chartInstances[id];
           ch.data.labels = keys;
           ch.data.datasets = datasets;
+          if (isPii) ch.options.plugins.tooltip.callbacks = tooltipCbs;
+          else ch.options.plugins.tooltip.callbacks.label = tooltipCbs.label;
           ch.update();
+        }
+        if (isPii && !piiPrecise) {
+          var hintId = 'pii-precise-hint';
+          var old = document.getElementById(hintId);
+          if (old) old.remove();
+          var hint = document.createElement('div');
+          hint.id = hintId;
+          hint.textContent = 'PII \u91c7\u6837\u672a\u542f\u7528\u6216\u6570\u636e\u4e0d\u7cbe\u786e\uff0c\u4ec51h\u7cbe\u786e\uff0c24h/7d\u9700\u5f00\u542f\u6301\u4e45\u5316\uff08PII_VALUE_SAMPLE_PERSIST=1\uff09';
+          hint.setAttribute('style', 'color:var(--dim);font-size:11px;margin-top:6px');
+          hint.setAttribute('role', 'status');
+          hint.setAttribute('aria-live', 'polite');
+          svgEl.parentElement.appendChild(hint);
+        } else if (isPii) {
+          var old2 = document.getElementById('pii-precise-hint');
+          if (old2) old2.remove();
         }
         return;
       } catch (e) {
-        // Chart 初始化失败 → 降级 SVG
       }
     }
-    // SVG 降级（bar 加 <title> 精确值 hover）
-    var max = Math.max.apply(null, keys.map(function (k) { return data[k]; }));
-    var w = 480, h = 160, bw = 40;
-    var bars = keys.map(function (k, i) {
-      // 最高柱 bh = h-36（留 16px 顶部空间给数值文字），柱顶文字不越界
-      var bh = Math.max(2, (data[k] / max) * (h - 36));
-      var valY = h - bh - 26;
-      // 最高柱文字若贴顶（<8）则移入柱内顶部显示，避免被裁
-      if (valY < 8) valY = Math.min(h - bh + 12, h - 8);
-      // X 轴类别标签：短标签直接显示，长标签截断 + title 完整值（hover 可见）
-      var label = String(k).slice(0, 10);
-      var labelFull = esc(String(k));
-      var labelTd = labelFull !== esc(label) ? ' title="' + labelFull + '"' : '';
-      return '<g><rect x="' + (i * (bw + 8) + 8) + '" y="' + (h - bh - 20) + '" width="' + bw + '" height="' + bh + '" fill="#4cc2ff66" stroke="#4cc2ff"><title>' +
-        esc(k) + ': ' + Number(data[k]).toLocaleString('en-US') + '</title></rect>' +
-        '<text x="' + (i * (bw + 8) + 8 + bw / 2) + '" y="' + valY + '" text-anchor="middle">' + fmtNum(data[k]) + '</text>' +
-        '<text x="' + (i * (bw + 8) + 8 + bw / 2) + '" y="' + (h - 6) + '" text-anchor="middle"' + labelTd + '>' + esc(label) + '</text></g>';
-    }).join('');
-    document.getElementById(id + '-chart').innerHTML = '';
-    svgEl.innerHTML = '<svg width="' + Math.max(w, keys.length * (bw + 8)) + '" height="' + h + '">' + bars + '</svg>';
+    if (isPii) {
+      var oldHint = document.getElementById('pii-precise-hint');
+      if (oldHint) oldHint.remove();
+      svgEl.textContent = '';
+      document.getElementById(id + '-chart').textContent = '';
+      var NS = 'http://www.w3.org/2000/svg';
+      var max = Math.max.apply(null, keys.map(function (k) { return data[k]; }));
+      var w = 480, h = 160, bw = 40;
+      var svg = document.createElementNS(NS, 'svg');
+      // limit width to 1200 to prevent overflow on high cardinality (e.g. 8 kinds)
+      svg.setAttribute('width', String(Math.min(1200, Math.max(w, keys.length * (bw + 8)))));
+      svg.setAttribute('height', String(h));
+      svg.setAttribute('style', 'max-width:100%;overflow-x:auto');
+      keys.forEach(function(k, i) {
+        var cnt = data[k];
+        var bh = Math.max(2, (cnt / max) * (h - 36));
+        var valY = h - bh - 26;
+        if (valY < 8) valY = Math.min(h - bh + 12, h - 8);
+        var g = document.createElementNS(NS, 'g');
+        var rect = document.createElementNS(NS, 'rect');
+        rect.setAttribute('x', String(i * (bw + 8) + 8));
+        rect.setAttribute('y', String(h - bh - 20));
+        rect.setAttribute('width', String(bw));
+        rect.setAttribute('height', String(bh));
+        rect.setAttribute('fill', '#4cc2ff66');
+        rect.setAttribute('stroke', '#4cc2ff');
+        // keyboard accessible: focus shows title tooltip
+        rect.setAttribute('tabindex', '0');
+        rect.setAttribute('role', 'img');
+        rect.setAttribute('aria-label', String(k) + ':' + String(cnt));
+        var rTitle = document.createElementNS(NS, 'title');
+        var t = k + ': ' + Number(cnt).toLocaleString('en-US');
+        var top3 = top3ForKind(k);
+        if (top3.length) {
+          t += '\n' + top3.map(function(p){ return p[0] + ' x' + Number(p[1]).toLocaleString('en-US'); }).join('\n');
+          if (piiTruncated && piiTruncated[k] === true) t += '\n\u2026\u957f\u5c3e\u4ec5\u8ba1 pii_by_type';
+        }
+        rTitle.textContent = t;
+        rect.appendChild(rTitle);
+        var tVal = document.createElementNS(NS, 'text');
+        tVal.setAttribute('x', String(i * (bw + 8) + 8 + bw / 2));
+        tVal.setAttribute('y', String(valY));
+        tVal.setAttribute('text-anchor', 'middle');
+        tVal.textContent = fmtNum(cnt);
+        var tLab = document.createElementNS(NS, 'text');
+        tLab.setAttribute('x', String(i * (bw + 8) + 8 + bw / 2));
+        tLab.setAttribute('y', String(h - 6));
+        tLab.setAttribute('text-anchor', 'middle');
+        var labShort = String(k).slice(0, 10);
+        tLab.textContent = labShort;
+        if (String(k).length > 10) {
+          var labTitle = document.createElementNS(NS, 'title');
+          labTitle.textContent = String(k);
+          tLab.appendChild(labTitle);
+        }
+        g.appendChild(rect);
+        g.appendChild(tVal);
+        g.appendChild(tLab);
+        svg.appendChild(g);
+      });
+      svgEl.appendChild(svg);
+      if (!piiPrecise) {
+        var h2 = document.createElement('div');
+        h2.id = 'pii-precise-hint';
+        h2.textContent = 'PII \u91c7\u6837\u672a\u542f\u7528\u6216\u6570\u636e\u4e0d\u7cbe\u786e\uff0c\u4ec51h\u7cbe\u786e\uff0c24h/7d\u9700\u5f00\u542f\u6301\u4e45\u5316\uff08PII_VALUE_SAMPLE_PERSIST=1\uff09';
+        h2.setAttribute('style', 'color:var(--dim);font-size:11px;margin-top:6px');
+        h2.setAttribute('role', 'status');
+        h2.setAttribute('aria-live', 'polite');
+        svgEl.parentElement.appendChild(h2);
+      }
+      return;
+    }
+    var max2 = Math.max.apply(null, keys.map(function (k) { return data[k]; }));
+    var w2 = 480, h2 = 160, bw2 = 40;
+    // 非PII降级亦用 DOM+textContent 统一范式（与PII分支一致，消 esc 遗漏风险）
+    var NS2 = 'http://www.w3.org/2000/svg';
+    var svg2 = document.createElementNS(NS2, 'svg');
+    svg2.setAttribute('width', String(Math.min(1200, Math.max(w2, keys.length * (bw2 + 8)))));
+  svg2.setAttribute('style', 'max-width:100%;overflow-x:auto');
+    svg2.setAttribute('height', String(h2));
+    keys.forEach(function(k, i) {
+      var cnt = data[k];
+      var bh = Math.max(2, (cnt / max2) * (h2 - 36));
+      var valY = h2 - bh - 26;
+      if (valY < 8) valY = Math.min(h2 - bh + 12, h2 - 8);
+      var g2 = document.createElementNS(NS2, 'g');
+      var rect2 = document.createElementNS(NS2, 'rect');
+      rect2.setAttribute('x', String(i * (bw2 + 8) + 8));
+      rect2.setAttribute('y', String(h2 - bh - 20));
+      rect2.setAttribute('width', String(bw2));
+      rect2.setAttribute('height', String(bh));
+      rect2.setAttribute('fill', '#4cc2ff66');
+      rect2.setAttribute('stroke', '#4cc2ff');
+      var t2 = document.createElementNS(NS2, 'title');
+      t2.textContent = String(k) + ': ' + Number(cnt).toLocaleString('en-US');
+      rect2.appendChild(t2);
+      var tVal2 = document.createElementNS(NS2, 'text');
+      tVal2.setAttribute('x', String(i * (bw2 + 8) + 8 + bw2 / 2));
+      tVal2.setAttribute('y', String(valY));
+      tVal2.setAttribute('text-anchor', 'middle');
+      tVal2.textContent = fmtNum(cnt);
+      var tLab2 = document.createElementNS(NS2, 'text');
+      tLab2.setAttribute('x', String(i * (bw2 + 8) + 8 + bw2 / 2));
+      tLab2.setAttribute('y', String(h2 - 6));
+      tLab2.setAttribute('text-anchor', 'middle');
+      var labShort2 = String(k).slice(0, 10);
+      tLab2.textContent = labShort2;
+      if (String(k).length > 10) {
+        var labTitle2 = document.createElementNS(NS2, 'title');
+        labTitle2.textContent = String(k);
+        tLab2.appendChild(labTitle2);
+      }
+      g2.appendChild(rect2);
+      g2.appendChild(tVal2);
+      g2.appendChild(tLab2);
+      svg2.appendChild(g2);
+    });
+    document.getElementById(id + '-chart').textContent = '';
+    svgEl.textContent = '';
+    svgEl.appendChild(svg2);
   }
 
   function renderTrend(seriesData) {
@@ -819,13 +981,15 @@
       es.onerror = function () {
         document.getElementById('live-dot').className = 'dot off';
         es.close();
-        // 断开回退：15s 轮询刷新 KPI（SSE 恢复时清除）
+        // 断开回退：15s 轮询全量刷新（SSE 恢复时清除，防 PII 柱陈旧）
         if (!fallbackTimer) {
           fallbackTimer = setInterval(function () {
             var q = '?range=' + state.range;
             if (state.model) q += '&model=' + encodeURIComponent(state.model);
             if (state.upstream) q += '&upstream=' + encodeURIComponent(state.upstream);
-            api('/_admin/metrics' + q).then(renderKpis).catch(function () {});
+            api('/_admin/metrics' + q).then(function(m){
+              renderKpis(m); renderTokens4(m); renderCharts(m);
+            }).catch(function () {});
           }, 15000);
         }
         setTimeout(connect, 3000);

@@ -1027,10 +1027,20 @@ class LlmMixin(AuditMixin):
             return text
         if pii_scope is None:
             return text
-        # 检测（跳过还原产物区间）
+        # 检测（跳过还原产物区间）—— 响应侧同走 is_chat_tail 守门，需透传 tail
+        _tail_for_sample = None
+        try:
+            from _metrics import _req_pii_var as _rpv2  # type: ignore
+
+            _ctx2 = _rpv2.get()
+            if isinstance(_ctx2, dict):
+                _tail_for_sample = _ctx2.get('tail')
+        except Exception:
+            pass
         hits = await self._pii_detector.scan(
             text,
             credential_p2t=getattr(self, 'pwd_to_token', None),
+            tail=_tail_for_sample,
         )
         if not hits:
             return text
@@ -2259,10 +2269,11 @@ class LlmMixin(AuditMixin):
             # 请求级 ContextVar 隔离（D2）：捕获 Token 以便 finally reset
             # _pii_scope 全局持久化：set(get()) 仅捕获 Token 供 reset，值保持全局单例（D1）
             _cv_pii_scope_tok = _pii_scope_var.set(_pii_scope_var.get())
-            # per-request PII/cred 计数 ctx（_metrics.py 定义，事件详情 hit/miss 数据源）
-            from _metrics import _req_pii_ctx
+            # per-request PII/cred 计数 ctx（_metrics.py 定义，事件详情 hit/miss 数据源）— Token 隔离防跨请求泄露
+            from _metrics import _req_pii_ctx, _req_pii_var
 
-            _req_pii_ctx()  # 初始化当前请求计数
+            _cv_req_pii_tok = _req_pii_var.set(_req_pii_var.get())
+            _req_pii_ctx()  # 初始化当前请求计数（若 None 则新建 dict，已在 Token 隔离上下文内）
             _cv_audit_hold_active_tok = _audit_hold_active_var.set(False)
             _cv_audit_hold_buf_tok = _audit_hold_buf_var.set([])  # type: ignore[arg-type]
             _cv_audit_hold_bytes_tok = _audit_hold_bytes_var.set(0)
@@ -2271,6 +2282,11 @@ class LlmMixin(AuditMixin):
             _cv_audit_created_ids_tok = _audit_created_ids_var.set([])
             tail = request.match_info['tail']
             is_dialog_tail = is_chat_tail(tail)
+            try:
+                _ctx_tail = _req_pii_ctx()
+                _ctx_tail['tail'] = tail
+            except Exception:
+                pass
             target_url = f'{upstream.rstrip("/")}/{tail}'
             if request.query_string:
                 target_url += '?' + request.query_string
@@ -2356,9 +2372,11 @@ class LlmMixin(AuditMixin):
                 if is_dialog_tail and getattr(self, 'pii_enabled', False):
                     self._pii_request_scope()
                     if hasattr(self, 'pii_redact_json_aware'):
-                        body_text = await self.pii_redact_json_aware(body_text)
+                        body_text = await self.pii_redact_json_aware(
+                            body_text, tail=tail
+                        )
                     else:
-                        body_text = await self.pii_redact(body_text)
+                        body_text = await self.pii_redact(body_text, tail=tail)
                 if is_dialog_tail and hasattr(self, '_redact_json_aware'):
                     out_body = self._redact_json_aware(body_text, snapshot_p2t).encode(
                         'utf-8'
@@ -5792,9 +5810,33 @@ class LlmMixin(AuditMixin):
                                 # 保守策略：不全局 clear，逐条判断
                                 pass
                         # 不全局 clear，仅由上面的 _created_ids 分支清理
-                # D2 reset：按 token 恢复，避免跨请求/子任务泄露
-                with contextlib.suppress(LookupError, ValueError):
+                # D2 reset：按 token 恢复，避免跨请求/子任务泄露（失败显式清理防污染）
+                try:
                     _pii_scope_var.reset(_cv_pii_scope_tok)
+                except (LookupError, ValueError):
+                    with contextlib.suppress(Exception):
+                        _pii_scope_var.set(None)
+                try:
+                    from _metrics import _req_pii_var as _rpv
+
+                    try:
+                        _rpv.reset(_cv_req_pii_tok)
+                    except (LookupError, ValueError):
+                        with contextlib.suppress(Exception):
+                            from _metrics import reset_req_pii_ctx
+
+                            reset_req_pii_ctx()
+                        with contextlib.suppress(Exception):
+                            _rpv.set(None)  # type: ignore
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        from _metrics import reset_req_pii_ctx
+
+                        reset_req_pii_ctx()
+                    with contextlib.suppress(Exception):
+                        from _metrics import _req_pii_var as _rpv3  # type: ignore
+
+                        _rpv3.set(None)  # type: ignore
                 with contextlib.suppress(LookupError, ValueError):
                     _audit_hold_active_var.reset(_cv_audit_hold_active_tok)
                 with contextlib.suppress(LookupError, ValueError):
@@ -5807,11 +5849,6 @@ class LlmMixin(AuditMixin):
                     _last_responses_tool_name_var.reset(_cv_last_responses_tok)
                 with contextlib.suppress(LookupError, ValueError):
                     _audit_created_ids_var.reset(_cv_audit_created_ids_tok)
-                # 清理 per-request PII/cred 计数 ctx
-                with contextlib.suppress(Exception):
-                    from _metrics import reset_req_pii_ctx
-
-                    reset_req_pii_ctx()
 
         app = web.Application()
         # 可观测性：先注册 /_admin/* 长路由（防通配 * 吞路由）

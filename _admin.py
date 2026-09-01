@@ -397,6 +397,7 @@ async def _handle_metrics(request: web.Request, collector) -> web.Response:
     """GET /_admin/metrics?range=1h|24h|7d|30d。
 
     查询在 executor 中执行（_query_db 有 SQLite 建连 + JSON 解析，同步执行会阻塞 event loop）。
+    透出 pii_value_samples 三字段（向后兼容缺省 {}/false/{}）。
     """
     range_ = request.query.get('range', '1h')
     if range_ not in ('1h', '24h', '7d', '30d'):
@@ -414,6 +415,14 @@ async def _handle_metrics(request: web.Request, collector) -> web.Response:
     except Exception as e:  # pragma: no cover — 防御
         logger.warning('metrics 查询异常: %s', e)
         data = {'error': 'metrics_unavailable', 'range': range_}
+    # 向后兼容：collector 未升级时缺省该三字段，显式补齐（鉴权后才透出，401 不泄露）
+    if isinstance(data, dict):
+        if 'pii_value_samples' not in data:
+            data['pii_value_samples'] = {}
+        if 'pii_value_samples_is_precise' not in data:
+            data['pii_value_samples_is_precise'] = False
+        if 'pii_value_samples_truncated' not in data:
+            data['pii_value_samples_truncated'] = {}
     resp = web.json_response(data, dumps=json.dumps)
     for k, v in _NO_STORE_HEADERS.items():
         resp.headers[k] = v
@@ -470,12 +479,20 @@ def _handle_events(request: web.Request, collector) -> web.Response:
 
 
 def _handle_health(request: web.Request, collector) -> web.Response:
-    """GET /_admin/health。"""
+    """GET /_admin/health。补充 pii_value_sample_enabled/persist 标志。"""
     try:
         data = collector.health()
     except Exception as e:  # pragma: no cover — 防御
         logger.warning('health 查询异常: %s', e)
         data = {'error': 'health_unavailable'}
+    if isinstance(data, dict):
+        # 热读 env：PERSIST=1 隐含 ENABLED=1
+        _persist = os.environ.get('PII_VALUE_SAMPLE_PERSIST') == '1'
+        _enabled = os.environ.get('PII_VALUE_SAMPLE_ENABLED') == '1' or _persist
+        if 'pii_value_sample_enabled' not in data:
+            data['pii_value_sample_enabled'] = bool(_enabled)
+        if 'pii_value_sample_persist' not in data:
+            data['pii_value_sample_persist'] = bool(_persist)
     resp = web.json_response(data, dumps=json.dumps)
     for k, v in _NO_STORE_HEADERS.items():
         resp.headers[k] = v
