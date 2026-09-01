@@ -457,7 +457,7 @@
           if (old) old.remove();
           var hint = document.createElement('div');
           hint.id = hintId;
-          hint.textContent = '\u4ec51h\u7cbe\u786e\uff0c24h/7d\u9700\u5f00\u542f\u6301\u4e45\u5316';
+          hint.textContent = 'PII \u91c7\u6837\u672a\u542f\u7528\u6216\u4ec51h\u7cbe\u786e\uff0c24h/7d\u9700\u5f00\u542f\u6301\u4e45\u5316\uff08PII_VALUE_SAMPLE_PERSIST=1\uff09';
           hint.setAttribute('style', 'color:var(--dim);font-size:11px;margin-top:6px');
           svgEl.parentElement.appendChild(hint);
         } else if (isPii) {
@@ -526,7 +526,7 @@
       if (!piiPrecise && state.range !== '1h') {
         var h2 = document.createElement('div');
         h2.id = 'pii-precise-hint';
-        h2.textContent = '\u4ec51h\u7cbe\u786e\uff0c24h/7d\u9700\u5f00\u542f\u6301\u4e45\u5316';
+        h2.textContent = 'PII \u91c7\u6837\u672a\u542f\u7528\u6216\u4ec51h\u7cbe\u786e\uff0c24h/7d\u9700\u5f00\u542f\u6301\u4e45\u5316\uff08PII_VALUE_SAMPLE_PERSIST=1\uff09';
         h2.setAttribute('style', 'color:var(--dim);font-size:11px;margin-top:6px');
         svgEl.parentElement.appendChild(h2);
       }
@@ -534,20 +534,51 @@
     }
     var max2 = Math.max.apply(null, keys.map(function (k) { return data[k]; }));
     var w2 = 480, h2 = 160, bw2 = 40;
-    var bars = keys.map(function (k, i) {
-      var bh = Math.max(2, (data[k] / max2) * (h2 - 36));
+    // 非PII降级亦用 DOM+textContent 统一范式（与PII分支一致，消 esc 遗漏风险）
+    var NS2 = 'http://www.w3.org/2000/svg';
+    var svg2 = document.createElementNS(NS2, 'svg');
+    svg2.setAttribute('width', String(Math.max(w2, keys.length * (bw2 + 8))));
+    svg2.setAttribute('height', String(h2));
+    keys.forEach(function(k, i) {
+      var cnt = data[k];
+      var bh = Math.max(2, (cnt / max2) * (h2 - 36));
       var valY = h2 - bh - 26;
       if (valY < 8) valY = Math.min(h2 - bh + 12, h2 - 8);
-      var label = String(k).slice(0, 10);
-      var labelFull = esc(String(k));
-      var labelTd = labelFull !== esc(label) ? ' title="' + labelFull + '"' : '';
-      return '<g><rect x="' + (i * (bw2 + 8) + 8) + '" y="' + (h2 - bh - 20) + '" width="' + bw2 + '" height="' + bh + '" fill="#4cc2ff66" stroke="#4cc2ff"><title>' +
-        esc(k) + ': ' + Number(data[k]).toLocaleString('en-US') + '</title></rect>' +
-        '<text x="' + (i * (bw2 + 8) + 8 + bw2 / 2) + '" y="' + valY + '" text-anchor="middle">' + fmtNum(data[k]) + '</text>' +
-        '<text x="' + (i * (bw2 + 8) + 8 + bw2 / 2) + '" y="' + (h2 - 6) + '" text-anchor="middle"' + labelTd + '>' + esc(label) + '</text></g>';
-    }).join('');
-    document.getElementById(id + '-chart').innerHTML = '';
-    svgEl.innerHTML = '<svg width="' + Math.max(w2, keys.length * (bw2 + 8)) + '" height="' + h2 + '">' + bars + '</svg>';
+      var g2 = document.createElementNS(NS2, 'g');
+      var rect2 = document.createElementNS(NS2, 'rect');
+      rect2.setAttribute('x', String(i * (bw2 + 8) + 8));
+      rect2.setAttribute('y', String(h2 - bh - 20));
+      rect2.setAttribute('width', String(bw2));
+      rect2.setAttribute('height', String(bh));
+      rect2.setAttribute('fill', '#4cc2ff66');
+      rect2.setAttribute('stroke', '#4cc2ff');
+      var t2 = document.createElementNS(NS2, 'title');
+      t2.textContent = String(k) + ': ' + Number(cnt).toLocaleString('en-US');
+      rect2.appendChild(t2);
+      var tVal2 = document.createElementNS(NS2, 'text');
+      tVal2.setAttribute('x', String(i * (bw2 + 8) + 8 + bw2 / 2));
+      tVal2.setAttribute('y', String(valY));
+      tVal2.setAttribute('text-anchor', 'middle');
+      tVal2.textContent = fmtNum(cnt);
+      var tLab2 = document.createElementNS(NS2, 'text');
+      tLab2.setAttribute('x', String(i * (bw2 + 8) + 8 + bw2 / 2));
+      tLab2.setAttribute('y', String(h2 - 6));
+      tLab2.setAttribute('text-anchor', 'middle');
+      var labShort2 = String(k).slice(0, 10);
+      tLab2.textContent = labShort2;
+      if (String(k).length > 10) {
+        var labTitle2 = document.createElementNS(NS2, 'title');
+        labTitle2.textContent = String(k);
+        tLab2.appendChild(labTitle2);
+      }
+      g2.appendChild(rect2);
+      g2.appendChild(tVal2);
+      g2.appendChild(tLab2);
+      svg2.appendChild(g2);
+    });
+    document.getElementById(id + '-chart').textContent = '';
+    svgEl.textContent = '';
+    svgEl.appendChild(svg2);
   }
 
   function renderTrend(seriesData) {

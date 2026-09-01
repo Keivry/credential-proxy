@@ -615,11 +615,16 @@ def _mask_placeholder(value: str, kind: str) -> str:
 
 # ── pii value sample: mask & enable guard (dashboard-pii-value-details) ──
 def _is_pii_value_sample_enabled() -> bool:
-    """值级采样开关：PII_VALUE_SAMPLE_ENABLED=1 或 PERSIST=1 时启用（热读，lazy import safe）。"""
-    return (
-        os.environ.get('PII_VALUE_SAMPLE_ENABLED') == '1'
-        or os.environ.get('PII_VALUE_SAMPLE_PERSIST') == '1'
-    )
+    """值级采样开关：PII_VALUE_SAMPLE_ENABLED=1 或 PERSIST=1 时启用（热读，统一 _metrics 校验与告警）。"""
+    try:
+        from _metrics import _is_pii_value_sample_enabled as _enabled  # type: ignore
+
+        return bool(_enabled())
+    except Exception:
+        return (
+            os.environ.get('PII_VALUE_SAMPLE_ENABLED') == '1'
+            or os.environ.get('PII_VALUE_SAMPLE_PERSIST') == '1'
+        )
 
 
 def mask_pii_value(kind: str, value: str) -> str:
@@ -1087,15 +1092,8 @@ class PiiDetector:
         # ── 值级掩码采样（dashboard-pii-value-details 2.2）──
         # 明文仅在命中回调作用域内可见，仅掩码+hash 进 ContextVar
         _effective_tail = tail
-        if _effective_tail is None:
-            try:
-                from _metrics import _req_pii_var as _tail_var  # type: ignore
-
-                _tail_ctx = _tail_var.get()
-                if _tail_ctx is not None:
-                    _effective_tail = _tail_ctx.get('tail')
-            except Exception:
-                _effective_tail = None
+        # 严格模式：tail is None => 不采样（需调用方显式传 tail，防 ContextVar 陈旧值中毒）
+        # 请求侧已通过 handler 注入 tail 并显式透传；直调 scan 不传 tail 视为非对话不采样
         if hits and _is_pii_value_sample_enabled() and _effective_tail is not None:
             try:
                 # lazy is_chat_tail guard（防 _pii↔_llm 循环）

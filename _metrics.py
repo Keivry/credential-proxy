@@ -1167,11 +1167,14 @@ class MetricsCollector:
                                     exist[mk] = meta
                         else:
                             delta_pii_value_samples[sk] = copied_inner
-                # clear after copy（防跨请求叠加）
+                # 原子替换防同请求多 scan 竞态（.clear() 会影响并发引用的同一 dict）
                 try:
-                    raw_samples.clear()
+                    _ctx2['pii_value_samples'] = {}
                 except Exception:
-                    pass
+                    try:
+                        raw_samples.clear()
+                    except Exception:
+                        pass
         if not _is_pii_value_sample_enabled():
             delta_pii_value_samples = {}
         else:
@@ -1621,10 +1624,23 @@ class MetricsCollector:
                         continue
                     mk = masked[:64] if len(masked) > 64 else masked
                     dest[mk] = dest.get(mk, 0) + cnt_i
-        # hash lookup from in-memory daily/hourly（首写 wins）
+        # hash lookup from in-memory daily/hourly（首写 wins，1h 需按 upstream 过滤避免跨上游串 hash）
         hash_lookup: dict[str, dict[str, str]] = {}
         with self._lock:
-            for agg in list(self._daily.values()) + list(self._hourly.values()):
+            # _daily/_hourly key 为 (day|hour, upstream)，上游过滤时仅取匹配分片
+            daily_items = list(self._daily.items())
+            hourly_items = list(self._hourly.items())
+            for (dk, up), agg in daily_items:
+                if upstream_filter is not None and up != upstream_filter:
+                    continue
+                for kind, inner in getattr(agg, 'pii_value_samples', {}).items():
+                    hl = hash_lookup.setdefault(kind, {})
+                    for mk, meta in inner.items():
+                        if mk not in hl and isinstance(meta, dict) and meta.get('hash'):
+                            hl[mk] = str(meta['hash'])[:16]
+            for (hk, up), agg in hourly_items:
+                if upstream_filter is not None and up != upstream_filter:
+                    continue
                 for kind, inner in getattr(agg, 'pii_value_samples', {}).items():
                     hl = hash_lookup.setdefault(kind, {})
                     for mk, meta in inner.items():
@@ -1736,11 +1752,7 @@ class MetricsCollector:
                         }
                 if inner:
                     pii_out[kind] = inner
-            # is_precise：有持久化且读到数据则视为精确（7 天内）
-            is_precise = (
-                bool(pii_out) or True
-            )  # 即使空也标 True 表示已读盘（非内存近似）
-            # 若无数据但 PERSIST=1，仍算 precise（已查询持久层）
+            # is_precise：PERSIST=1 已走 DB 即精确（与空无关，内存近似走 1h 路径）
             is_precise = True
             return pii_out, truncated, is_precise
         except sqlite3.Error:
