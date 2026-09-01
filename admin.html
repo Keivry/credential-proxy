@@ -98,6 +98,11 @@
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); display: inline-block; }
   .dot.off { background: var(--dim); }
   svg text { fill: var(--dim); font-size: 10px; }
+  /* keyboard focus for PII rect (SVG) */
+  svg rect[tabindex=\"0\"]:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) {
+    * { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+  }
   .tokens4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; margin-bottom: 10px; }
   .tok { background: var(--panel2); border-radius: 8px; padding: 8px 10px; }
   .tok .l { color: var(--dim); font-size: 11px; }
@@ -433,11 +438,14 @@
             return out;
           };
         }
+        // respects prefers-reduced-motion
+        var prefersReduced = typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
         if (!chartInstances[id]) {
           chartInstances[id] = new Chart(canvas, {
             type: 'bar',
             data: { labels: keys, datasets: datasets },
             options: {
+              animation: prefersReduced ? false : undefined,
               plugins: {
                 legend: { display: false },
                 tooltip: { callbacks: tooltipCbs }
@@ -464,6 +472,8 @@
           hint.id = hintId;
           hint.textContent = 'PII \u91c7\u6837\u672a\u542f\u7528\u6216\u6570\u636e\u4e0d\u7cbe\u786e\uff0c\u4ec51h\u7cbe\u786e\uff0c24h/7d\u9700\u5f00\u542f\u6301\u4e45\u5316\uff08PII_VALUE_SAMPLE_PERSIST=1\uff09';
           hint.setAttribute('style', 'color:var(--dim);font-size:11px;margin-top:6px');
+          hint.setAttribute('role', 'status');
+          hint.setAttribute('aria-live', 'polite');
           svgEl.parentElement.appendChild(hint);
         } else if (isPii) {
           var old2 = document.getElementById('pii-precise-hint');
@@ -539,6 +549,8 @@
         h2.id = 'pii-precise-hint';
         h2.textContent = 'PII \u91c7\u6837\u672a\u542f\u7528\u6216\u6570\u636e\u4e0d\u7cbe\u786e\uff0c\u4ec51h\u7cbe\u786e\uff0c24h/7d\u9700\u5f00\u542f\u6301\u4e45\u5316\uff08PII_VALUE_SAMPLE_PERSIST=1\uff09';
         h2.setAttribute('style', 'color:var(--dim);font-size:11px;margin-top:6px');
+        h2.setAttribute('role', 'status');
+        h2.setAttribute('aria-live', 'polite');
         svgEl.parentElement.appendChild(h2);
       }
       return;

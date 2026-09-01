@@ -43,10 +43,11 @@ services:
       # - PII_HOLD_MAX=64
       # ── PII 值级掩码采样（dashboard-pii-value-details，默认关闭，仅掩码不存明文）──
       # 默认仅计数；PII_VALUE_SAMPLE_ENABLED=1 时 PII 分布 hover 展示 TopN 掩码值及次数（Top5 聚合展示前3），
-      # hash 为 sha256(明文)[:16] 16hex 仅去重，masked_sample 形如 138****8000 / a***@b.com / **** **** **** 6789 / 192.168.**.** / 前4****后4，
+      # hash 为 HMAC-SHA256(SALT,明文)[:16]（SALT=PII_VALUE_SAMPLE_HMAC_KEY，未设退化 sha256 小空间可枚举），masked_sample 形如 138****8000 / ***@***.com / **** **** **** 6789 / 192.168.**.** / 前4****后4，
       # 掩码长度上限64，超长截断。PII_VALUE_SAMPLE_PERSIST=1 时持久化到 metrics.sqlite:pii_value_agg 按日聚合，7 天滚动，0600 权限；默认 0 仅内存环精确 1h。
       # - PII_VALUE_SAMPLE_ENABLED=0  # 0=仅计数，1=掩码采样（仅对话端点 is_chat_tail 触发）
       # - PII_VALUE_SAMPLE_PERSIST=0  # 0=内存-only（重启清空），1=日级持久化（隐含 ENABLED=1）
+      # - PII_VALUE_SAMPLE_HMAC_KEY=  # 可选 HMAC 盐：设后 hash=HMAC-SHA256(SALT,明文)[:16] 防 phone 1万枚举；未设退化 sha256
 
       # ── 输出审计（默认关闭，启用需显式设置）──
       # block = 自动拦截危险 tool call；approve = Matrix 人工审批（需 APPROVAL_WHITELIST）

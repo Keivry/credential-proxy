@@ -9,9 +9,9 @@
 
 ## 2. 掩码生成（_pii.py）
 
-- [ ] 2.1 新增 `mask_pii_value(kind: str, value: str) -> str`（phone→`138****8000`、email→`a***@b.com`（`***@***.com`消歧可选）、bank_card→`**** **** **** 6789` 仅后4（BIN不保留）、ipv4→`192.168.**.**`、ipv6/api_key→`前4****后4`、其他→`前3****后3` 且 `<6` 时 `前1****后1`；`masked_sample` 长度上限64超长截断，`value_hash`落盘键为`hash` 16 hex）
-  - 验收：`mask_pii_value('phone','__PII_7_6716b652__')=='138****8000'`；`mask_pii_value('email','__PII_10_fbfda189__')=='a***@b.com'`；单测覆盖各 kind
-- [ ] 2.2 `ContextVar _req_pii_var` 扩展 `pii_value_samples: dict[str, dict[str, dict]]`（`masked -> {count, hash}`，`recent_events`精简为`{masked:count}` 且 kind 内 ≤8 截断不插第9项），命中回调内当场 `value_hash=sha256(value).hexdigest()[:16]`（键为`hash` 仅内部去重不透 API）+ `masked=mask_pii_value(kind,value)` 按`kind`累加`pii_value_samples[kind][masked].count+=count`（hash 首写 wins）；仅 `ENABLED=1 && is_chat_tail(tail)`（`tail is None` 不采样，请求/响应侧同守门，未传 tail 则不产）时产采样，`incr_event` 锁外拷贝`delta`后原子替换 `ctx['pii_value_samples']={}`（禁止 `.clear()` 竞态）并 `handler finally` 以 `Token reset` 失败回退 `set(None)` 防跨请求叠加
+- [ ] 2.1 新增 `mask_pii_value(kind: str, value: str) -> str`（phone→`138****8000`、email→`***@***.com` 不透首字符、bank_card→`**** **** **** 6789` 仅后4（BIN不保留）、ipv4→`192.168.**.**`、ipv6/api_key→`前4****后4`、其他→`前3****后3` 且 `<6` 时 `前1****后1`；`masked_sample` 长度上限64超长截断，`value_hash=HMAC-SHA256(SALT,明文)[:16]` 未设退化 `sha256[:16]` 16 hex，`SALT=PII_VALUE_SAMPLE_HMAC_KEY`）
+  - 验收：`mask_pii_value('phone','__PII_7_6716b652__')=='138****8000'`；`mask_pii_value('email','__PII_10_fbfda189__@example.com')=='***@***.com'`；单测覆盖各 kind 及 HMAC 哈希（设 SALT 时 HMAC≠sha256）
+- [ ] 2.2 `ContextVar _req_pii_var` 扩展 `pii_value_samples: dict[str, dict[str, dict]]`（`masked -> {count, hash}`，`recent_events`精简为`{masked:count}` 且 kind 内 ≤8 截断不插第9项），命中回调内当场 `value_hash=_pii_value_hash(value)`（`HMAC-SHA256(SALT,明文)[:16]` 未设退化 `sha256[:16]`，键为`hash` 仅内部去重不透 API，`SALT=PII_VALUE_SAMPLE_HMAC_KEY`）+ `masked=mask_pii_value(kind,value)` 按`kind`累加`pii_value_samples[kind][masked].count+=count`（hash 首写 wins）；仅 `ENABLED=1 && is_chat_tail(tail)`（`tail is None` 不采样，请求/响应侧同守门，未传 tail 则不产）时产采样，`incr_event` 锁外拷贝`delta`后原子替换 `ctx['pii_value_samples']={}`（禁止 `.clear()` 竞态）并 `handler finally` 以 `Token reset` 失败回退 `set(None)` 防跨请求叠加
   - 验收：`PiiDetector.scan("__PII_7_6716b652__", tail="chat/completions")` 后 `_req_pii_var.get()['pii_value_samples']['phone']['138****8000']['count']==1` 且 `hash`为16 hex；`scan("__PII_7_6716b652__")` 无 tail 或非对话 `tail="v1/embeddings"` 后 `pii_value_samples` 仍空；`ENABLED=0` 时空；`asyncio.gather`双请求并发计数互不干扰且 `incr_event` 后 `ctx['pii_value_samples']=={}` 原子替换
 - [ ] 2.3 `sanitize_kind` 复用约束掩码 key，`masked_sample` 长度上限 64（含 `*`），超长截断；`value_hash` 仅 hex 16 位
   - 验收：超长 `masked_sample` 被截断；`hash` 恒 16 hex
@@ -42,7 +42,7 @@
   - 验收：悬停 `phone` 柱时 tooltip 含 `138****8000 x5`（精确，多行不溢出）；`ENABLED=0`或 `is_precise==false` 时仅`phone: 12,345` 且 1h 显示弱提示；`fallbackTimer` 触发后 PII 柱亦刷新；SVG降级`<rect><title>`含掩码多行且容器限宽
 - [ ] 5.2 SVG 降级 `<title>` 扩展：`kind: count\nmasked x count\n...` 多行，数值与 Chart.js 一致
   - 验收：禁用 Chart.js 后悬停 `<rect>` 的 `<title>` 含掩码行
-- [ ] 5.3 全部渲染经 `textContent`/`title` 文本通道（pii分支`textContent/title` 0 innerHTML，PII `<rect>` 补 `tabindex/role` 键盘可达可选），`masked_sample` 含 `* @ .` 原样保留；`_handle_sse` 与 `/_admin/metrics` 均补 `Cache-Control: no-store`
+- [ ] 5.3 全部渲染经 `textContent`/`title` 文本通道（pii分支`textContent/title` 0 innerHTML，PII `<rect>` 补 `tabindex/role` 键盘可达、`rect:focus` 高亮、`prefers-reduced-motion` 禁动画，hint 补 `role=status aria-live=polite`），`masked_sample` 含 `* @ .` 原样保留；`_handle_sse` 与 `/_admin/metrics` 均补 `Cache-Control: no-store`
   - 验收：`grep -n innerHTML admin.html` 在`renderBar('pii') afterBody/<title>`分支0命中（全量`innerHTML`仍2处KPI且均经`esc()`）；`masked_sample='<img onerror=alert(1)>'` 经`textContent`原样透传；SSE响应头含`no-store`
 - [ ] 5.4 无采样/截断态 UI：`pii_value_samples_truncated[kind]==true` 且 `ENABLED=1 && 非空 && 超Top5` 时 tooltip 尾加 `…长尾仅计 pii_by_type`，否则不提示；`!is_precise` 时全 range 弱提示 `仅1h精确（样本不足/未持久化）`（含 1h）
   - 验收：`truncated=true`时显示 `…`；`pii_value_samples:{}`或`ENABLED=0`时无掩码行亦无`…`；`pii_value_samples_truncated`键名全量一致

@@ -627,11 +627,36 @@ def _is_pii_value_sample_enabled() -> bool:
         )
 
 
+def _pii_value_hash(value: str) -> str:
+    """PII 明文 hash（16 hex，64bit）— 防 1万匿名集枚举。
+
+    优先 HMAC-SHA256(SALT, value)[:16]（SALT 来自 PII_VALUE_SAMPLE_HMAC_KEY 环境变量，
+    若未设则退化为 SHA256(value)[:16] 并文档声明小空间可枚举风险；SALT 仅服务端持有，
+    HMAC 使离线枚举需先获 SALT）。兼容存量无盐 hash 的去重语义（同值同 hash 仍合并，
+    不同值同掩码已按 masked 合并，hash 首写 wins）。
+    """
+
+    try:
+        _salt = os.environ.get('PII_VALUE_SAMPLE_HMAC_KEY', '').strip()
+        if _salt:
+            import hashlib as _hl
+            import hmac as _hmac
+
+            return _hmac.new(
+                _salt.encode('utf-8'), value.encode('utf-8'), _hl.sha256
+            ).hexdigest()[:16]
+    except Exception:
+        pass
+    import hashlib as _hl2
+
+    return _hl2.sha256(value.encode('utf-8')).hexdigest()[:16]
+
+
 def mask_pii_value(kind: str, value: str) -> str:
     """按 kind 掩码明文值（不含 hash，仅 masked_sample）。
 
     - phone: 138****8000 (first3****last4)
-    - email: a***@b.com (local首字符***@domain首字符.suffix)
+    - email: ***@***.com (不透 local/domain 首字符；suffix 保留，防 a***@b.com 侧信道)
     - bank_card: **** **** **** 6789 (仅后4，BIN不保留)
     - ipv4: 192.168.**.**
     - ipv6/api_key: 前4****后4
@@ -658,15 +683,13 @@ def mask_pii_value(kind: str, value: str) -> str:
             else:
                 masked = f'{v[:3]}****{v[-3:]}'
         else:
-            local, domain = v.split('@', 1)
-            local_first = local[0] if local else '*'
+            _, domain = v.split('@', 1)
+            # 不透 local/domain 首字符：统一 ***@***.suffix（防 a***@b.com 侧信道，见 design D1）
             if '.' in domain:
                 suffix = domain.rsplit('.', 1)[-1]
-                domain_first = domain[0] if domain else '*'
-                masked = f'{local_first}***@{domain_first}.{suffix}'
+                masked = f'***@***.{suffix}' if suffix else '***@***'
             else:
-                domain_first = domain[0] if domain else '*'
-                masked = f'{local_first}***@{domain_first}***'
+                masked = '***@***'
     elif k == 'bank_card':
         if len(v) >= 4:
             masked = f'**** **** **** {v[-4:]}'
@@ -1123,8 +1146,6 @@ class PiiDetector:
                 if _is_dialog:
                     # lazy anti-cycle: ContextVar + sanitize_kind from _metrics
                     try:
-                        import hashlib as _hashlib
-
                         from _metrics import _req_pii_var as _pii_var  # type: ignore
                         from _metrics import (
                             sanitize_kind as _sanitize_kind,  # type: ignore
@@ -1144,9 +1165,7 @@ class PiiDetector:
                                 _masked = mask_pii_value(_sk, _v)
                                 if len(_masked) > 64:
                                     _masked = _masked[:64]
-                                _h = _hashlib.sha256(_v.encode('utf-8')).hexdigest()[
-                                    :16
-                                ]
+                                _h = _pii_value_hash(_v)
                                 _bucket = _pvs.setdefault(_sk, {})  # type: ignore
                                 _ent = _bucket.get(_masked)
                                 if _ent is None:

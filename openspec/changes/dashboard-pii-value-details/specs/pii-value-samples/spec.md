@@ -6,12 +6,12 @@
 
 ### Requirement: PII 值级掩码采样与聚合
 
-系统 SHALL 在 PII 命中时产出值级掩码采样：在 `_pii.py` 命中回调内（明文作用域内，仅 `PII_VALUE_SAMPLE_ENABLED=1` 且 `is_chat_tail(tail)` 为真、`tail is None` 不采样、请求/响应侧同守门）生成 `masked_sample`（phone→`138****8000`；email→`a***@b.com`；bank_card→`**** **** **** 6789` 仅后4；ipv4→`192.168.**.**`；ipv6/api_key→`前4****后4`（含 6-7 字符）；其他→`前3****后3` 且 `<6` 时 `前1****后1`，`masked_sample` 长度上限 64 含 `*`）与 `value_hash=sha256(明文).hexdigest()[:16]`（变量名 `value_hash`，持久化键为 `hash`、落盘列 `hash` 仅内部去重不透 API），通过 `ContextVar _req_pii_var.pii_value_samples: dict[str, dict[str, dict]]`（`masked->{count, hash}`）透传到 `_metrics.py` 按 `kind` 聚合 TopN（聚合 5，展示取前 3，`recent_events` 精简为 `{masked:count}` 不含 hash 且 kind 内 ≤8 按 count 降序截断不插第 9 项），kind 总数受 `sanitize_kind` 白名单约束（≤8 kind，`incr_event` 消费后原子替换 `ctx['pii_value_samples']={}` 禁止 `.clear()` 竞态，`handler finally` 以 `Token reset` 失败回退 `set(None)`），明文不出 `_pii.py` 作用域，仅 `masked_sample+hash` 进入内部聚合/落盘，API/事件/SSE 仅 `{masked:count}`（`hash` 小空间仍可枚举仅去重，文档声明侧信道）。
+系统 SHALL 在 PII 命中时产出值级掩码采样：在 `_pii.py` 命中回调内（明文作用域内，仅 `PII_VALUE_SAMPLE_ENABLED=1` 且 `is_chat_tail(tail)` 为真、`tail is None` 不采样、请求/响应侧同守门）生成 `masked_sample`（phone→`138****8000`；email→`***@***.com` 不透首字符；bank_card→`**** **** **** 6789` 仅后4；ipv4→`192.168.**.**`；ipv6/api_key→`前4****后4`（含 6-7 字符）；其他→`前3****后3` 且 `<6` 时 `前1****后1`，`masked_sample` 长度上限 64 含 `*`）与 `value_hash=_pii_value_hash(明文)`（`HMAC-SHA256(SALT,明文)[:16]` 当 `PII_VALUE_SAMPLE_HMAC_KEY` 设值，否则 `sha256[:16]`；变量名 `value_hash`，持久化键为 `hash`、落盘列 `hash` 仅内部去重不透 API），通过 `ContextVar _req_pii_var.pii_value_samples: dict[str, dict[str, dict]]`（`masked->{count, hash}`）透传到 `_metrics.py` 按 `kind` 聚合 TopN（聚合 5，展示取前 3，`recent_events` 精简为 `{masked:count}` 不含 hash 且 kind 内 ≤8 按 count 降序截断不插第 9 项），kind 总数受 `sanitize_kind` 白名单约束（≤8 kind，`incr_event` 消费后原子替换 `ctx['pii_value_samples']={}` 禁止 `.clear()` 竞态，`handler finally` 以 `Token reset` 失败回退 `set(None)`），明文不出 `_pii.py` 作用域，仅 `masked_sample+hash` 进入内部聚合/落盘，API/事件/SSE 仅 `{masked:count}`（`hash` 为 `HMAC-SHA256` 未设退化小空间可枚举，仅去重）。
 
 #### Scenario: 掩码形态正确
 
 - **WHEN** 命中 `phone=__PII_7_6716b652__`、`email=__PII_9_ac454d8d__`、`bank_card=6225880123456789`
-- **THEN** 聚合中 `masked_sample` 分别为 `138****8000`、`a***@b.com`、`**** **** **** 6789`，且 `hash` 为 `sha256(明文)[:16]` 的 16 hex，不含明文；`hash` 截断小空间仍可枚举仅去重。
+- **THEN** 聚合中 `masked_sample` 分别为 `138****8000`、`***@***.com`、`**** **** **** 6789`，且 `hash` 为 `HMAC-SHA256(SALT,明文)[:16]` 未设退化 `sha256[:16]` 的 16 hex，不含明文；未设 SALT 时 hash 小空间仍可枚举仅去重。
 
 #### Scenario: TopN 截断
 

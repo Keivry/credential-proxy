@@ -20,7 +20,7 @@ See proposal.md — Why。当前大盘 PII 分布以 `pii_by_type` 的 kind 级�
 
 ### D1: 掩码生成点选在 `_pii.py` 命中回调内（明文不出作用域）
 
-**决定：** 在 `_pii.py` 的联合正则命中回调（`_id_card_ok/_luhn_ok/_is_reserved_ip` 校验后）当场生成 `masked_sample`（phone: `138****8000`；email: `a***@b.com`；bank_card: `**** **** **** 6789`（仅后4，BIN 不保留）；ipv4: `192.168.**.**`；ipv6/api_key: `前4****后4`；其他: `前3****后3` 且 `<6` 时 `前1****后1`）与 `value_hash=sha256(明文).hexdigest()[:16]`（变量名 `value_hash`，持久化键为 `hash`、落盘列 `hash`）一并通过 `ContextVar _req_pii_var` 的 `pii_value_samples: dict[str, dict[str, dict]]`（`masked -> {count, hash}`）传给 `_metrics.py`，明文不跨模块。仅当 `PII_VALUE_SAMPLE_ENABLED=1` 且为对话请求（`is_chat_tail(tail)` 为真，`tail is None` 不采样）时才产采样；请求与响应侧均走同一守门（`scan(tail, is_chat_tail)`，未传 `tail` 则不产采样）；`incr_event` 锁外拷贝 `delta` 后原子替换 `ctx['pii_value_samples']={}`（禁止 `.clear()` 竞态，异常路径回退 `clear()` 仅兜底），`handler` 以 `Token` 隔离并 `finally` 逐个 `reset(tok)`（`reset` 失败显式 `set(None)` 防污染）防跨请求叠加。`masked_sample` 长度上限 64（含 `*`），超长截断。
+**决定：** 在 `_pii.py` 的联合正则命中回调（`_id_card_ok/_luhn_ok/_is_reserved_ip` 校验后）当场生成 `masked_sample`（phone: `138****8000`；email: `***@***.com` 不透首字符（防 `a***@b.com` 侧信道）；bank_card: `**** **** **** 6789`（仅后4，BIN 不保留）；ipv4: `192.168.**.**`；ipv6/api_key: `前4****后4`；其他: `前3****后3` 且 `<6` 时 `前1****后1`）与 `value_hash=_pii_value_hash(明文)`（`HMAC-SHA256(SALT,明文)[:16]` 当 `PII_VALUE_SAMPLE_HMAC_KEY` 设值，否则 `sha256[:16]`；变量名 `value_hash`，持久化键为 `hash`、落盘列 `hash`）一并通过 `ContextVar _req_pii_var` 的 `pii_value_samples: dict[str, dict[str, dict]]`（`masked -> {count, hash}`）传给 `_metrics.py`，明文不跨模块。仅当 `PII_VALUE_SAMPLE_ENABLED=1` 且为对话请求（`is_chat_tail(tail)` 为真，`tail is None` 不采样）时才产采样；请求与响应侧均走同一守门（`scan(tail, is_chat_tail)`，未传 `tail` 则不产采样）；`incr_event` 锁外拷贝 `delta` 后原子替换 `ctx['pii_value_samples']={}`（禁止 `.clear()` 竞态，异常路径回退 `clear()` 仅兜底），`handler` 以 `Token` 隔离并 `finally` 逐个 `reset(tok)`（`reset` 失败显式 `set(None)` 防污染）防跨请求叠加。`masked_sample` 长度上限 64（含 `*`），超长截断。
 
 **理由：** 明文生命周期最短，仅在检测作用域内可见；掩码形态与校验回调强绑定，避免二次正则误伤。`_pii.py` 写 `_req_pii_var` 需函数内延迟导入 `from _metrics import _req_pii_ctx` 防 ` _pii↔_metrics` 循环，或下沉 ContextVar 到 `_ctx.py`。
 
@@ -52,7 +52,7 @@ See proposal.md — Why。当前大盘 PII 分布以 `pii_by_type` 的 kind 级�
 
 ### D5: 前端 hover 扩展 `afterBody` + SVG `<title>` 多行
 
-**决定：** `admin.html:renderBar('pii')` 的 Chart.js `tooltip.callbacks.label` 保持 `kind: count`（`Number(c.raw).toLocaleString()` 精确），新增 `afterBody` 返回多行数组 `Top 3: 138****8000 x5, ...`（取聚合 Top5 的前 3，`count` 均 `toLocaleString()` 精确非 `fmtNum` 缩写，需多行换行防窄屏溢出，`textContent` 文本通道不用 `innerHTML`）；SVG 降级 `rect <title>` 改为 `kind: count\n138****8000 x5\n...` 多行（`rect<title>` 与 `text title` 分置不同元素，禁止 `g` 级 `title`）；`PII SVG` 容器限宽 `Math.min(1200, ...)` 且 `overflow-x:auto`，`Top3` 换行展示；限流 `onerror fallbackTimer` 仅 `renderKpis` 已修正为 `renderKpis+renderTokens4+renderCharts` 全量刷新防陈旧；无采样时仅计数，`!is_precise` 时 `1h` 弱提示 `仅1h精确（样本不足/未持久化）`（原仅 `range!=1h` 已放宽），`truncated` 尾加 `…长尾仅计 pii_by_type`；`SSE` 的 `metrics` 快照响应头补 `Cache-Control: no-store`；PII `<rect>` 补 `tabindex/role` 与键盘可达（可选）。
+**决定：** `admin.html:renderBar('pii')` 的 Chart.js `tooltip.callbacks.label` 保持 `kind: count`（`Number(c.raw).toLocaleString()` 精确），新增 `afterBody` 返回多行数组 `Top 3: 138****8000 x5, ...`（取聚合 Top5 的前 3，`count` 均 `toLocaleString()` 精确非 `fmtNum` 缩写，需多行换行防窄屏溢出，`textContent` 文本通道不用 `innerHTML`）；SVG 降级 `rect <title>` 改为 `kind: count\n138****8000 x5\n...` 多行（`rect<title>` 与 `text title` 分置不同元素，禁止 `g` 级 `title`）；`PII SVG` 容器限宽 `Math.min(1200, ...)` 且 `overflow-x:auto`，`Top3` 换行展示；限流 `onerror fallbackTimer` 仅 `renderKpis` 已修正为 `renderKpis+renderTokens4+renderCharts` 全量刷新防陈旧；无采样时仅计数，`!is_precise` 时 `1h` 弱提示 `仅1h精确（样本不足/未持久化）`（原仅 `range!=1h` 已放宽），`truncated` 尾加 `…长尾仅计 pii_by_type`；`SSE` 的 `metrics` 快照响应头补 `Cache-Control: no-store`；PII `<rect>` 补 `tabindex/role` 与键盘可达，`prefers-reduced-motion` 禁动画 `animation:false`，`rect:focus` 2px 高亮，hint 补 `role=status aria-live=polite`。
 
 **理由：** 复用现有 `Chart/SVG` 双路径，不新增依赖；`title`/`afterBody` 均为文本通道，XSS 面天然收敛。
 
@@ -66,7 +66,7 @@ See proposal.md — Why。当前大盘 PII 分布以 `pii_by_type` 的 kind 级�
 
 ## Risks / Trade-offs
 
-- [掩码仍可侧信道推断] → 聚合 Top5/展示 Top3，不透传 `hash` 到 API/事件/SSE，仅内部去重；开关默认关；`hash` 截断小空间仍可枚举，文档声明侧信道（phone 7 位暴露 1 万匿名集、email 首字符泄漏）可选 HMAC/每日盐；响应侧同守门防非对话样本泄露。
+- [掩码仍可侧信道推断] → 聚合 Top5/展示 Top3，不透传 `hash` 到 API/事件/SSE，仅内部去重；开关默认关；`hash` 为 `HMAC-SHA256(SALT,明文)[:16]` 未设退化 `sha256[:16]`，设 `PII_VALUE_SAMPLE_HMAC_KEY` 后 phone 1万匿名集需先获 SALT 才可枚举；`email` 已改为 `***@***.com` 不透首字符；响应侧同守门防非对话样本泄露；`prefers-reduced-motion` 无动画。
 - [高基数截断导致长尾不可见] → 聚合 Top5（展示前3）截断文档化，`recent_events` 亦按 kind ≤8 截断（不插第 9 项）；API 顶层 `pii_value_samples_truncated: {kind: bool}` 且 `truncated:true` 仅当 `ENABLED=1 && 非空 && 超 Top5` 时置位；长尾仍在 `pii_by_type` 总数中，前端显示 `…长尾仅计 pii_by_type`。
 - [内存环 1h 窗口外不可见] → `24h/7d` 需 `PERSIST=1` 才有值级，否则 hover 仅计数；前端据 `pii_value_samples_is_precise === true` 弱提示（1h 亦提示样本不足）。
 - [掩码碰撞（不同明文同掩码）] → 以 `hash` 去重、`masked_sample` 展示，碰撞时计数合并但 hash 首写 wins（按 `masked_sample` 聚合不按 hash，碰撞低概率可接受）。
@@ -86,4 +86,4 @@ See proposal.md — Why。当前大盘 PII 分布以 `pii_by_type` 的 kind 级�
 ## Open Questions
 
 - 掩码形态是否需按 kind 可配置（当前固定形态，首版够用，后续可加 `PII_MASK_TEMPLATE`）。
-- `bank_card` 已定仅后4 `**** **** **** 6789`（BIN 不保留，合规）；`email` 形态当前 `a***@b.com` 已知首字符侧信道（本 change 保留以兼容存量掩码，后续迭代可改为 `***@***.com` 并重算掩码）；`ipv6/api_key` 6-7 字符归入 `前4****后4` 已在代码实现，与 `其他 <6 → 前1****后1` 分支文档对齐。
+- `bank_card` 已定仅后4 `**** **** **** 6789`（BIN 不保留，合规）；`email` 已改为 `***@***.com` 不透首字符（`***@***.suffix`，后缀保留）；`ipv6/api_key` 6-7 字符归入 `前4****后4` 已在代码实现，与 `其他 <6 → 前1****后1` 分支文档对齐；`phone` 1万枚举已由 `PII_VALUE_SAMPLE_HMAC_KEY` 的 HMAC 加固（未设退化 sha256 仍需声明风险）。

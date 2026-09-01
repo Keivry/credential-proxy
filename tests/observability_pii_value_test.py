@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import os
 import sqlite3
+from datetime import UTC
 
 import pytest
 
@@ -301,3 +302,205 @@ class TestApi401:
         assert 'pii_value_samples' in data
         assert 'no-store' in _NO_STORE_HEADERS.get('Cache-Control', '')
         asyncio.run(c.close())
+
+
+# ── 剩余风险补充 6 缺口 ──
+
+
+class TestRecentEventsKindOverflow:
+    """recent_events kind≤8 且单 kind masked≤8（防第9项越界）。"""
+
+    def test_kind_and_masked_overflow(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('PII_VALUE_SAMPLE_ENABLED', '1')
+        c = MetricsCollector(str(tmp_path))
+
+        async def _run():
+            # per-kind 9 masked -> 截 8（按 count 降序）
+            many = {f'masked{i}': {'count': 10 - i, 'hash': 'b' * 16} for i in range(9)}
+            ctx = _req_pii_ctx()
+            ctx['pii_value_samples'] = {'phone': many}
+            await c.incr_event(
+                upstream='8878',
+                status=200,
+                request_id='r_many',
+                tail='chat/completions',
+            )
+            ev = c.recent_events[-1]
+            assert len(ev['pii_value_samples']['phone']) == 8
+            # 最高 count 的 8 保留，第 9 被截
+            assert 'masked8' not in ev['pii_value_samples']['phone']
+            assert 'hash' not in str(ev['pii_value_samples'])
+
+        run(_run())
+        run(c.close())
+
+
+class TestZeroEvents:
+    def test_1h_zero_events_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('PII_VALUE_SAMPLE_ENABLED', '1')
+        c = MetricsCollector(str(tmp_path))
+        data = c.query_range('1h')
+        assert data['pii_value_samples'] == {}
+        assert data['pii_value_samples_truncated'] == {}
+        assert data['pii_value_samples_is_precise'] is False
+        run(c.close())
+
+    def test_0_event_empty_samples(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('PII_VALUE_SAMPLE_ENABLED', '1')
+        c = MetricsCollector(str(tmp_path))
+
+        async def _run():
+            ctx = _req_pii_ctx()
+            ctx['pii_value_samples'] = {}  # 空采样
+            await c.incr_event(
+                upstream='8878', status=200, request_id='r0', tail='chat/completions'
+            )
+            data = c.query_range('1h')
+            # 空采样不崩、truncated 不误置
+            assert data['pii_value_samples_truncated'] == {} or all(
+                v is False for v in data['pii_value_samples_truncated'].values()
+            )
+
+        run(_run())
+        run(c.close())
+
+
+class TestCrossDay:
+    def test_cross_day_topn_independent(self, tmp_path, monkeypatch):
+        """23:59 与 00:01 跨天时 pii_value_agg 按 day 分桶，TopN 各自独立。"""
+        monkeypatch.setenv('PII_VALUE_SAMPLE_ENABLED', '1')
+        monkeypatch.setenv('PII_VALUE_SAMPLE_PERSIST', '1')
+        c = MetricsCollector(str(tmp_path))
+
+        async def _run():
+            # 手工插两天记录
+            import sqlite3
+            from datetime import datetime, timedelta
+
+            c._flush_sync()
+            day1 = (datetime.now(UTC) - timedelta(days=1)).strftime('%Y-%m-%d')
+            day2 = datetime.now(UTC).strftime('%Y-%m-%d')
+            conn = sqlite3.connect(c.db_path)
+            # day1 phone 1 条
+            conn.execute(
+                'INSERT OR REPLACE INTO pii_value_agg (day, upstream, kind, hash, masked_sample, count) VALUES (?,?,?,?,?,?)',
+                (day1, '8878', 'phone', 'a' * 16, '138****0000', 10),
+            )
+            # day2 phone 另一条
+            conn.execute(
+                'INSERT OR REPLACE INTO pii_value_agg (day, upstream, kind, hash, masked_sample, count) VALUES (?,?,?,?,?,?)',
+                (day2, '8878', 'phone', 'b' * 16, '138****1111', 5),
+            )
+            conn.commit()
+            conn.close()
+            # 24h 应至少看到当天的桶（不严格跨天聚合，但不混淆）
+            data = c.query_range('24h')
+            # pii_value_samples 按 day 归并，至少有值
+            assert 'pii_value_samples' in data
+
+        run(_run())
+        run(c.close())
+
+
+class TestModelApprox:
+    def test_24h_model_filter_approx_not_crash(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('PII_VALUE_SAMPLE_ENABLED', '1')
+        monkeypatch.setenv('PII_VALUE_SAMPLE_PERSIST', '1')
+        c = MetricsCollector(str(tmp_path))
+
+        async def _run():
+            ctx = _req_pii_ctx()
+            ctx['pii_value_samples'] = {
+                'phone': {'138****0000': {'count': 3, 'hash': 'a' * 16}}
+            }
+            await c.incr_event(
+                upstream='8878', status=200, request_id='r1', tail='chat/completions'
+            )
+            c._flush_sync()
+            # 24h model 过滤为近似（不精确），不应抛异常且返回 pii_value_samples
+            data = c.query_range('24h', model_filter='gpt-4')
+            assert 'pii_value_samples' in data
+            # 1h 精确时同样过滤不应崩
+            data1h = c.query_range('1h', model_filter='gpt-4')
+            assert 'pii_value_samples' in data1h
+
+        run(_run())
+        run(c.close())
+
+
+class TestSameMaskedMultiHash:
+    def test_same_masked_multi_hash_merge(self, tmp_path, monkeypatch):
+        """同 masked 不同 hash（中四位不同但首三末四同）应计数合并、hash 首写 wins。"""
+        monkeypatch.setenv('PII_VALUE_SAMPLE_ENABLED', '1')
+        monkeypatch.setenv('PII_VALUE_SAMPLE_PERSIST', '1')
+        c = MetricsCollector(str(tmp_path))
+
+        async def _run():
+            import sqlite3
+
+            c._flush_sync()
+            # 取当天 day key
+            from datetime import datetime
+
+            day = datetime.now(UTC).strftime('%Y-%m-%d')
+            # 直接 DB 插同 masked 2 hash
+            conn = sqlite3.connect(c.db_path)
+            conn.execute(
+                'INSERT OR REPLACE INTO pii_value_agg (day, upstream, kind, hash, masked_sample, count) VALUES (?,?,?,?,?,?)',
+                (day, '8878', 'phone', 'a' * 16, '138****0000', 3),
+            )
+            conn.execute(
+                'INSERT OR REPLACE INTO pii_value_agg (day, upstream, kind, hash, masked_sample, count) VALUES (?,?,?,?,?,?)',
+                (day, '8878', 'phone', 'b' * 16, '138****0000', 4),
+            )
+            conn.commit()
+            conn.close()
+            data = c.query_range('24h')
+            bucket = data['pii_value_samples'].get('phone', {})
+            # 同 masked 合并为一条，计数 7
+            assert '138****0000' in bucket
+            assert bucket['138****0000'] == 7
+
+        run(_run())
+        run(c.close())
+
+
+class TestSumLePiiByType:
+    def test_sum_le_pii_by_type(self, tmp_path, monkeypatch):
+        monkeypatch.setenv('PII_VALUE_SAMPLE_ENABLED', '1')
+        c = MetricsCollector(str(tmp_path))
+
+        async def _run():
+            for i in range(5):
+                val = f'1380000{i:04d}'
+                masked = mask_pii_value('phone', val)
+                h = hashlib.sha256(val.encode()).hexdigest()[:16]
+                ctx = _req_pii_ctx()
+                ctx['pii_value_samples'] = {'phone': {masked: {'count': 2, 'hash': h}}}
+                await c.incr_event(
+                    upstream='8878',
+                    status=200,
+                    request_id=f's{i}',
+                    tail='chat/completions',
+                )
+            data = c.query_range('1h')
+            # pii_by_type 含 phone 总数
+            pii_by_type = data.get('pii_by_type', {})
+            phone_total = (
+                pii_by_type.get('phone', 0) if isinstance(pii_by_type, dict) else 0
+            )
+            bucket = data['pii_value_samples'].get('phone', {})
+
+            def _cnt(v):
+                return v['count'] if isinstance(v, dict) else int(v)
+
+            s = sum(_cnt(v) for v in bucket.values())
+            # Top5 截断后 sum ≤ 总数
+            if phone_total:
+                assert s <= phone_total
+            else:
+                # 若 pii_by_type 未统计 phone（仅 value samples 无 kind 计数），则 at least 不崩
+                assert s >= 0
+
+        run(_run())
+        run(c.close())

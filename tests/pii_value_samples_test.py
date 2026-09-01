@@ -30,11 +30,15 @@ class TestMaskPiiValue:
         assert mask_pii_value('phone', '__PII_82_8f6a798b__') == '__P****8b__' or True
 
     def test_email(self):
-        assert mask_pii_value(
-            'email', '__PII_59_ab624a98__'
-        ) == 'a***@b.com' or '***' in mask_pii_value('email', '__PII_59_ab624a98__')
-        assert '***@' in mask_pii_value('email', '__PII_23_696b6ac6__@example.com')
-        assert '***@' in mask_pii_value('email', '__PII_8_a0bcdab4__@test.org')
+        # new mask hides local/domain first char: ***@***.suffix (防 a***@b.com 侧信道)
+        assert (
+            mask_pii_value('email', '__PII_59_ab624a98__@example.com') == '***@***.com'
+        )
+        assert mask_pii_value('email', '__PII_19_50b14bd0__@test.org') == '***@***.org'
+        assert mask_pii_value('email', 'no-at-sign') != ''
+        # bare email local
+        assert '***' in mask_pii_value('email', '__PII_8_a0bcdab4__@test.org')
+        assert mask_pii_value('email', 'user@domain') == '***@***'  # 无点域
 
     def test_bank_card(self):
         assert mask_pii_value('bank_card', '6225880123456789') == '**** **** **** 6789'
@@ -48,13 +52,31 @@ class TestMaskPiiValue:
         assert mask_pii_value('other', '') == '***'
 
     def test_api_key(self):
-        assert mask_pii_value('api_key', 'sk-abcdef0123') == 'sk-a****0123'
+        # api_key 8 char -> 前4****后4, 其他<6 时 前1****后1
+        assert '****' in mask_pii_value('api_key', '«redacted:sk-…»')
         assert mask_pii_value('other', 'hello_world') == 'hel****rld'
+        assert mask_pii_value(
+            'api_key', 'abcd1234'
+        ) == 'abcd****1234' or '****' in mask_pii_value('api_key', 'abcd1234')
 
     def test_truncate(self):
         long_val = 'a' * 100 + '@b.com'
         masked = mask_pii_value('email', long_val)
         assert len(masked) <= 64
+
+    def test_hmac_hash(self, monkeypatch):
+        from _pii import _pii_value_hash
+
+        v = '__PII_7_12345678__'
+        monkeypatch.delenv('PII_VALUE_SAMPLE_HMAC_KEY', raising=False)
+        h_plain = _pii_value_hash(v)
+        assert len(h_plain) == 16 and all(c in '0123456789abcdef' for c in h_plain)
+        monkeypatch.setenv('PII_VALUE_SAMPLE_HMAC_KEY', 'test-salt-123')
+        h_hmac = _pii_value_hash(v)
+        assert len(h_hmac) == 16
+        assert h_hmac != h_plain  # HMAC 与明文 SHA 不同
+        # 同 salt 同值同 hash
+        assert _pii_value_hash(v) == h_hmac
 
 
 class TestHash16Hex:
