@@ -8,14 +8,16 @@
 无法验证正则命中）。
 """
 
-from _pii import _COMBINED_RE, _is_reserved_ip
+from _pii import _COMBINED_RE, _is_reserved_ip, _is_valid_ipv6
 
 
 def _ipv6_hits(text: str) -> list[str]:
     return [
         m.group(0)
         for m in _COMBINED_RE.finditer(text)
-        if m.lastgroup == 'ipv6' and not _is_reserved_ip(m.group(0), 'ipv6')
+        if m.lastgroup == 'ipv6'
+        and _is_valid_ipv6(m.group(0))
+        and not _is_reserved_ip(m.group(0), 'ipv6')
     ]
 
 

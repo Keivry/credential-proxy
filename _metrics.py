@@ -280,6 +280,7 @@ def _redact_extra_pii(out: str) -> str:
             _URL_QUERY_PARAM_RE,
             _id_card_ok,
             _is_reserved_ip,
+            _is_valid_ipv6,
             _luhn_ok,
         )
 
@@ -312,6 +313,8 @@ def _redact_extra_pii(out: str) -> str:
             if kind == 'id_card' and not _id_card_ok(value):
                 continue
             if kind == 'bank_card' and not _luhn_ok(value):
+                continue
+            if kind == 'ipv6' and not _is_valid_ipv6(value):
                 continue
             if kind in ('ipv4', 'ipv6') and _is_reserved_ip(value, kind):
                 continue

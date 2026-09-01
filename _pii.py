@@ -421,32 +421,12 @@ _BUILTIN_PATTERNS: list[tuple[str, str]] = [
         'ipv4',
         r'(?P<ipv4>(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.]))',
     ),
-    # IPv6（正则粗筛，精确解析两级判定）
-    # 🔴 只有压缩形态（含 ::）才允许段数 < 8（RFC 4291）：
-    #   - 无 :: 时必须是完整 8 组 1-4 hex
-    #   - 含 :: 时按「:: 前 k 段 + :: + 后 m 段，k+m ≤ 6」枚举
-    #   - 时间戳 HH:MM:SS（3 段无 ::）永不可能合法 → 不匹配
-    # ⚠️ 交替必须整体包在 (?:...) 内，否则前后负向环视只作用于首/末分支
+    # IPv6（正则粗筛 + 标准库精确校验）
+    # 粗筛：含至少 2 个冒号的十六进制/冒号/点串，边界用负向环视防粘连；
+    # 精确校验走 ipaddress.ip_address (version==6) 二次判定，明显非 IPv6 的串不再误脱敏。
     (
         'ipv6',
-        (
-            r'(?P<ipv6>(?<![0-9A-Za-z:])(?:'
-            # 完整 8 段（无 ::）：(?:hex:){7}hex
-            r'(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}'
-            # 尾部 ::（1-7 段 + ::）：fe80:: 形态
-            r'|(?:[0-9a-fA-F]{1,4}:){1,7}:'
-            # :: 中间（k 段 + :: + m 段，k+m ≤ 6，枚举 k=1..6, m=1..6）
-            r'|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}'
-            r'|(?:[0-9a-fA-F]{1,4}:){1,5}(?::[0-9a-fA-F]{1,4}){1,2}'
-            r'|(?:[0-9a-fA-F]{1,4}:){1,4}(?::[0-9a-fA-F]{1,4}){1,3}'
-            r'|(?:[0-9a-fA-F]{1,4}:){1,3}(?::[0-9a-fA-F]{1,4}){1,4}'
-            r'|(?:[0-9a-fA-F]{1,4}:){1,2}(?::[0-9a-fA-F]{1,4}){1,5}'
-            r'|[0-9a-fA-F]{1,4}:(?::[0-9a-fA-F]{1,4}){1,6}'
-            # 前导 ::（1-7 段）：::1 形态
-            r'|:(?::[0-9a-fA-F]{1,4}){1,7}'
-            r'|::'
-            r')(?![0-9A-Za-z:]))'
-        ),
+        r'(?P<ipv6>(?<![0-9A-Za-z:.])(?:[0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:.]*)(?![0-9A-Za-z:.])',
     ),
     # API key（sk- / sk-ant- / ghp_ / gho_ / AKIA 前缀 + 最小 16 字符）
     (
@@ -579,6 +559,19 @@ def _is_reserved_ip(value: str, kind: str) -> bool:
     except ValueError:
         return False
     return any(addr in net for net in _RESERVED_IPV6_NETWORKS)
+
+
+def _is_valid_ipv6(value: str) -> bool:
+    """正则粗筛后的标准库精确校验：仅合法 IPv6 视为命中。
+
+    粗筛正则仅保证含至少 2 个冒号的十六进制/冒号/点串，边界已做负向环视；
+    此处用标准库 ipaddress.ip_address 做精确判定，version==6 才视为 IPv6。
+    显式拒绝 IPv4（version==4）及非法格式，避免明显非 IPv6 的串被误脱敏。
+    """
+    try:
+        return _ipaddress.ip_address(value).version == 6
+    except ValueError:
+        return False
 
 
 def _luhn_ok(digits: str) -> bool:
@@ -1089,6 +1082,9 @@ class PiiDetector:
             kind = m.lastgroup
             value = m.group(0)
             if kind is None:
+                continue
+            # IPv6：正则粗筛后用标准库二次校验（用户要求：粗筛→标准库）
+            if kind == 'ipv6' and not _is_valid_ipv6(value):
                 continue
             # URL 上下文防误报：?id= 等参数长数字不判银行卡
             if kind == 'bank_card' and _URL_QUERY_PARAM_RE.search(value):
