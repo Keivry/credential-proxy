@@ -56,7 +56,12 @@ class TestQuery1hPrecise:
             phone_bucket = data['pii_value_samples'].get('phone', {})
             assert len(phone_bucket) == 5
             assert data['pii_value_samples_truncated'].get('phone') is True
-            counts = [v['count'] for v in phone_bucket.values()]
+
+            # API now {masked: int} (hash stripped); compat with old {count,hash}
+            def _cnt(v):
+                return v['count'] if isinstance(v, dict) else int(v)
+
+            counts = [_cnt(v) for v in phone_bucket.values()]
             assert counts == sorted(counts, reverse=True)
 
         run(_run())

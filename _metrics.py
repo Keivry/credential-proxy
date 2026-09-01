@@ -1303,12 +1303,27 @@ class MetricsCollector:
                     h.pii_value_samples = dict(sorted_kinds_h)
             # recent_events
             if request_id:
-                # 精简 pii_value_samples 为 {masked: count}（不存 hash，减体积）
-                simplified = {}
-                for k, inner in delta_pii_value_samples.items():
-                    simplified[k] = {mk: meta['count'] for mk, meta in inner.items()}
-                    if len(simplified) > 8:
-                        break
+                # 精简 pii_value_samples 为 {masked: count}（不存 hash，减体积；kind≤8且单kind内≤8，按count降序截断）
+                simplified: dict[str, dict[str, int]] = {}
+                # kind 按总 count 降序截前 8（delta 已截 8，此处防未来增量越界）
+                _sorted_kinds = sorted(
+                    delta_pii_value_samples.items(),
+                    key=lambda kv: sum(v.get('count', 0) for v in kv[1].values()),
+                    reverse=True,
+                )[:8]
+                for k, inner in _sorted_kinds:
+                    if not isinstance(inner, dict) or not inner:
+                        continue
+                    _sorted_items = sorted(
+                        inner.items(),
+                        key=lambda kv: kv[1].get('count', 0),
+                        reverse=True,
+                    )[:8]
+                    simplified[k] = {
+                        mk: int(meta.get('count', 0))
+                        for mk, meta in _sorted_items
+                        if int(meta.get('count', 0)) > 0
+                    }
                 ev: dict[str, Any] = {
                     'ts': now,
                     'request_id': request_id,
@@ -1657,11 +1672,9 @@ class MetricsCollector:
             # truncated true only when ENABLED=1 && non-empty &&超 Top5
             truncated[kind] = bool(enabled and sorted_items and is_trunc)
             top5 = sorted_items[:5]
-            inner_out: dict[str, dict] = {}
+            inner_out: dict[str, int] = {}
             for mk, cnt in top5:
-                hsh = hash_lookup.get(kind, {}).get(mk, '')
-                # 若 hash 仍空（极近期未落聚合），则用空串占位
-                inner_out[mk] = {'count': cnt, 'hash': hsh}
+                inner_out[mk] = cnt
             if inner_out:
                 pii_out[kind] = inner_out
         # 对无超量但已输出的 kind 补 false
@@ -1742,14 +1755,11 @@ class MetricsCollector:
                 top5 = sorted_items[:5]
                 inner: dict[str, dict] = {}
                 for masked, hsh, cnt in top5:
-                    # 以 masked 为键，hash 为值（若同 masked 多 hash 碰撞，保留首见 hash 对应计数已合并）
+                    # 以 masked 为键，hash 仅内部去重，API 仅透 count（同 masked 多 hash 碰撞时计数合并）
                     if masked in inner:
-                        inner[masked]['count'] += cnt
+                        inner[masked] += cnt
                     else:
-                        inner[masked] = {
-                            'count': cnt,
-                            'hash': hsh[:16] if isinstance(hsh, str) else '',
-                        }
+                        inner[masked] = cnt
                 if inner:
                     pii_out[kind] = inner
             # is_precise：PERSIST=1 已走 DB 即精确（与空无关，内存近似走 1h 路径）

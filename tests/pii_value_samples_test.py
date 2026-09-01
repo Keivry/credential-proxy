@@ -85,6 +85,7 @@ class TestTop5:
         data = c.query_range('1h')
         bucket = data['pii_value_samples'].get('phone', {})
         assert len(bucket) == 5
+        # count may be int (new) or {count,hash} (old) - handle both
         assert data['pii_value_samples_truncated'].get('phone') is True
         await c.close()
 

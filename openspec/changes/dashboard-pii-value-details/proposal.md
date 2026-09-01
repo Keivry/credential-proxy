@@ -4,11 +4,11 @@ credential-proxy 仪表盘的 PII 分布仅展示 `pii_by_type: {kind: count}` �
 
 ## What Changes
 
-- **值级采样采集**：`_pii.py` 命中时同步产出 `masked_sample`（掩码后示例，如 `138****8000 / a***@b.com / 192.168.**.**`，当场生成不存明文）与 `value_hash=sha256(明文)[:16]`（`value_hash` 为变量名，落盘/API 键为 `hash`），`_metrics.py` 聚合 `pii_value_samples: {kind: {masked_sample: {count, hash}}}` TopN 聚合默认 5/kind（hover 展示取前 3），按 kind 上限 8 截断防基数爆炸。
+- **值级采样采集**：`_pii.py` 命中时同步产出 `masked_sample`（掩码后示例，如 `138****8000 / a***@b.com / 192.168.**.**`，当场生成不存明文）与 `value_hash=sha256(明文)[:16]`（`value_hash` 为变量名，持久化键为 `hash`、落盘列 `hash`），`_metrics.py` 内部聚合 `pii_value_samples: {kind: {masked_sample: {count, hash}}}` TopN 聚合默认 5/kind（hover 展示取前 3），按 kind 上限 8 截断防基数爆炸；`recent_events` 入队精简为 `{masked: count}`（不存 hash，kind 内 ≤8 按 count 降序截断），对外 API 仅透出 `{masked: count}` 不含 hash。
 - **内存为主、可选落盘**：默认仅内存 `recent_events` + `_daily` 内存聚合（`deque 10000` 现场聚合，`range=1h` 精确，重启清空）；`PII_VALUE_SAMPLE_PERSIST=1` 时才落盘到 `pii_value_agg` 轻量表（`hash+masked_sample+count`，不存明文，7 天滚动），默认关闭。
 - **仪表盘 hover 下钻**：`admin.html` PII 分布 `renderBar('pii')` 的 Chart.js `tooltip.callbacks.afterBody` 与 SVG `<title>` 扩展为 `kind: count` 下的 `TopN 掩码值 x 次数` 列表（如 `phone: 123 (138****8000 x5, 139****1111 x2)`），无采样时仅显示计数（向后兼容）。
-- **API 透出**：`/_admin/metrics?range=` 返回新增 `pii_value_samples`（`range=1h` 内存精确 `pii_value_samples_is_precise=true`，其余 `PERSIST` 依赖，空时 `false` 不读盘）与 `pii_value_samples_truncated`（超 Top5 时 `true`），`/_admin/series` 不新增值级序列；鉴权、限流、`no-store` 头与现有 `/_admin/*` 一致，`SSE` 亦补 `no-store`。
-- **安全与开关**：新增 `PII_VALUE_SAMPLE_ENABLED`（默认 0）与 `PII_VALUE_SAMPLE_PERSIST`（默认 0）双开关；掩码生成在 `_pii.py` 检测回调内、明文不出 `_pii.py` 作用域（`hash` 仅去重，小空间 PII 仍可枚举）；`metrics.sqlite` 新增表含 `-wal/-shm 0600`。
+- **API 透出**：`/_admin/metrics?range=` 返回新增 `pii_value_samples: {kind: {masked: count}}`（精简不含 hash，`range=1h` 内存精确 `pii_value_samples_is_precise=true`，其余 `PERSIST` 依赖，空时 `false` 不读盘）与 `pii_value_samples_truncated`（仅 `ENABLED=1 && 非空 && 超 Top5` 时 `true`），`/_admin/series` 不新增值级序列；鉴权、限流、`no-store` 头与现有 `/_admin/*` 一致，`SSE` 亦补 `no-store`（含按请求限流后回退全量刷新不残留旧数据）。
+- **安全与开关**：新增 `PII_VALUE_SAMPLE_ENABLED`（默认 0）与 `PII_VALUE_SAMPLE_PERSIST`（默认 0）双开关；掩码生成在 `_pii.py` 检测回调内、明文不出 `_pii.py` 作用域（`hash` 仅去重，小空间 PII 仍可枚举）；API/事件/SSE 均不透传 hash，仅 `masked->count`；`metrics.sqlite` 新增表含 `-wal/-shm 0600`；响应侧与请求侧同走 `is_chat_tail(tail)` 守门，`tail is None` 不采样。
 
 ## Capabilities
 
@@ -24,7 +24,7 @@ credential-proxy 仪表盘的 PII 分布仅展示 `pii_by_type: {kind: count}` �
 ## Impact
 
 - **代码**：`_pii.py`（掩码生成）、`_metrics.py`（`pii_value_samples` 聚合、内存 TopN、上游可选 `pii_value_agg` 表、TTL 清理）、`_admin.py`（`/_admin/metrics` 透出 `pii_value_samples`）、`admin.html`（`renderBar` tooltip/SVG title 扩展）。
-- **API**：`GET /_admin/metrics?range=&model=&upstream=` 新增 `pii_value_samples` 字段（向后兼容，缺省 ` {}`）；`series/events/health` 不变；鉴权/限流/`no-store` 不变。
+- **API**：`GET /_admin/metrics?range=&model=&upstream=` 新增 `pii_value_samples: {kind: {masked: count}}`（精简不含 hash，向后兼容缺省 `{}`，`recent_events` 精简同形）；`series/events/health` 不变；鉴权/限流/`no-store` 不变；`hash` 仅内部/落盘去重不进 API/事件/SSE。
 - **数据**：默认不新增持久化（重启清空）；开启 `PII_VALUE_SAMPLE_PERSIST=1` 时新增 `pii_value_agg(day TEXT, upstream TEXT, kind TEXT, hash TEXT, masked_sample TEXT, count INT, PRIMARY KEY(day, upstream, kind, hash))`（`day=%Y-%m-%d UTC`，聚合 Top5 展示 Top3）7 天滚动，文件 `0600`（含 `-wal/-shm`）。
-- **安全**：明文不出 `_pii.py` → `_metrics.py` 仅传 `masked_sample+hash`；`hash` 为 `sha256` 截断；掩码写入/展示均经 `textContent`/`title` 防 XSS；默认关闭需显式开启。
+- **安全**：明文不出 `_pii.py` → `_metrics.py` 仅传 `masked_sample+hash`；`hash` 为 `sha256` 截断仅内部去重不透传前端；`recent_events`/`events`/`SSE` 均 `{masked:count}` 不含 hash；掩码写入/展示均经 `textContent`/`title` 防 XSS；默认关闭需显式开启；响应侧同守门防中毒。
 - **测试**：新增值级采样单测（掩码形态、TopN 截断、开关、hash 一致性）、dashboard hover 单测（Chart.js/SVG title 含掩码）、ruff 必过。

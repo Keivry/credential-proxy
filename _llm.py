@@ -1027,10 +1027,20 @@ class LlmMixin(AuditMixin):
             return text
         if pii_scope is None:
             return text
-        # 检测（跳过还原产物区间）
+        # 检测（跳过还原产物区间）—— 响应侧同走 is_chat_tail 守门，需透传 tail
+        _tail_for_sample = None
+        try:
+            from _metrics import _req_pii_var as _rpv2  # type: ignore
+
+            _ctx2 = _rpv2.get()
+            if isinstance(_ctx2, dict):
+                _tail_for_sample = _ctx2.get('tail')
+        except Exception:
+            pass
         hits = await self._pii_detector.scan(
             text,
             credential_p2t=getattr(self, 'pwd_to_token', None),
+            tail=_tail_for_sample,
         )
         if not hits:
             return text
@@ -5800,19 +5810,33 @@ class LlmMixin(AuditMixin):
                                 # 保守策略：不全局 clear，逐条判断
                                 pass
                         # 不全局 clear，仅由上面的 _created_ids 分支清理
-                # D2 reset：按 token 恢复，避免跨请求/子任务泄露
-                with contextlib.suppress(LookupError, ValueError):
+                # D2 reset：按 token 恢复，避免跨请求/子任务泄露（失败显式清理防污染）
+                try:
                     _pii_scope_var.reset(_cv_pii_scope_tok)
-                with contextlib.suppress(LookupError, ValueError):
-                    try:
-                        from _metrics import _req_pii_var as _rpv
+                except (LookupError, ValueError):
+                    with contextlib.suppress(Exception):
+                        _pii_scope_var.set(None)
+                try:
+                    from _metrics import _req_pii_var as _rpv
 
+                    try:
                         _rpv.reset(_cv_req_pii_tok)
-                    except Exception:
+                    except (LookupError, ValueError):
                         with contextlib.suppress(Exception):
                             from _metrics import reset_req_pii_ctx
 
                             reset_req_pii_ctx()
+                        with contextlib.suppress(Exception):
+                            _rpv.set(None)  # type: ignore
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        from _metrics import reset_req_pii_ctx
+
+                        reset_req_pii_ctx()
+                    with contextlib.suppress(Exception):
+                        from _metrics import _req_pii_var as _rpv3  # type: ignore
+
+                        _rpv3.set(None)  # type: ignore
                 with contextlib.suppress(LookupError, ValueError):
                     _audit_hold_active_var.reset(_cv_audit_hold_active_tok)
                 with contextlib.suppress(LookupError, ValueError):
