@@ -347,14 +347,18 @@ from _pii import PiiDetector
 from _token import RequestScopedTokens
 
 detector = PiiDetector(request_tokens=RequestScopedTokens())
-detector.load_custom_patterns([
-    ('emp_no', r'(?P<emp_no>工号\d{6})'),
-    ('proj_code', r'(?P<proj_code>PRJ-[A-Z]{2}-\d{4})'),
-])
-detector.load_dict([
-    ('张三', 'name'),
-    ('db-prod-01', 'hostname'),
-])
+detector.load_custom_patterns(
+    [
+        ('emp_no', r'(?P<emp_no>工号\d{6})'),
+        ('proj_code', r'(?P<proj_code>PRJ-[A-Z]{2}-\d{4})'),
+    ]
+)
+detector.load_dict(
+    [
+        ('张三', 'name'),
+        ('db-prod-01', 'hostname'),
+    ]
+)
 hits = await detector.scan('我的工号123456，联系张三，域名 db.corp.local')
 # hits == [('emp_no','工号123456'), ('name','张三'), ('inner_domain','db.corp.local')]
 out = await detector.detect_and_redact('工号123456')  # → '__PII_0_a1b2c3d4__'
