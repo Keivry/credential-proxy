@@ -2,7 +2,7 @@
 
 架构（design D1）：
 - 内置强模式合并为单条联合正则（命名捕获组区分类型）
-- IPv4/IPv6 保留地址豁免（前缀字符串匹配，不构造 ipaddress 对象）
+- IPv4/IPv6 保留地址豁免（标准库 ipaddress 判定：is_global/is_private/is_multicast/is_reserved）
 - 可配置自定义正则（ReDoS 防护：to_thread + wait_for 100ms 预算 + 独立线程池）
 - 可配置敏感名称名单（字典型 recognizer，独立扫描不并入联合正则）
 - URL 上下文防误报（?id= 等查询参数长数字不判银行卡）
@@ -774,101 +774,57 @@ def _clear_analyzer_cache():
         _get_combined_re_cached.cache_clear()
     except Exception:
         pass
-
-
-# ── 保留地址豁免（design D1 硬性：前缀必须含尾点/冒号，IPv6 先 lower）──
-_RESERVED_IPV4_PREFIXES = (
-    '10.',
-    '127.',
-    '169.254.',
-    '192.168.',
-    '192.0.2.',
-    '198.51.100.',
-    '203.0.113.',
-    '0.',
-    # 172.16.0.0/12 = 172.16–172.31（16 条全枚举）
-    *[f'172.{i}.' for i in range(16, 32)],
-    # 224.0.0.0/4 = 224–239（组播）
-    *[f'{i}.' for i in range(224, 240)],
-    # 240.0.0.0/4 = 240–255（保留）
-    *[f'{i}.' for i in range(240, 256)],
-    # 100.64.0.0/10 = 100.64–100.127（CGNAT，64 条）
-    *[f'100.{i}.' for i in range(64, 128)],
-)
-_RESERVED_IPV6_PREFIXES = (
-    '::1',
-    'fc',
-    'fd',  # fc00::/7 ULA（fc00–fdff）— 裸前缀仅 coarse 筛选，fcfake 精确排除由 _is_reserved_ip 专项处理
-    'fe8',
-    'fe9',
-    'fea',
-    'feb',  # fe80::/10 链路本地（fe80–febf）
-    'ff',  # ff00::/8 组播
-    '2001:db8:',  # 文档段必须带冒号（裸 2001:db8 误豁免 2001:db80::）
-)
-# 兜底精确判定（对粗筛后段内边界值走 ipaddress 精确 in-network）
-_RESERVED_NETWORKS = [
-    _ipaddress.ip_network('10.0.0.0/8'),
-    _ipaddress.ip_network('172.16.0.0/12'),
-    _ipaddress.ip_network('192.168.0.0/16'),
-    _ipaddress.ip_network('127.0.0.0/8'),
-    _ipaddress.ip_network('169.254.0.0/16'),
-    _ipaddress.ip_network('224.0.0.0/4'),
-    _ipaddress.ip_network('240.0.0.0/4'),
-    _ipaddress.ip_network('0.0.0.0/8'),
-    _ipaddress.ip_network('100.64.0.0/10'),
-    _ipaddress.ip_network('192.0.2.0/24'),
-    _ipaddress.ip_network('198.51.100.0/24'),
-    _ipaddress.ip_network('203.0.113.0/24'),
-]
-_RESERVED_IPV6_NETWORKS = [
-    _ipaddress.ip_network('::1/128'),
-    _ipaddress.ip_network('fc00::/7'),
-    _ipaddress.ip_network('fe80::/10'),
-    _ipaddress.ip_network('ff00::/8'),
-    _ipaddress.ip_network('2001:db8::/32'),
-]
-
-
-def _is_reserved_ip(value: str, kind: str) -> bool:
-    """判定 IP 是否保留段（前缀匹配 + 精确兜底）。
-
-    硬化闸：PII_DETECTION_HARDENING=1 时启用精确前缀（含尾点/冒号）+ lower + ip_network 兜底；
-    默认 0 时仅基础前缀豁免仍生效，跳过 ip_network 兜底以保持既有用例全绿，
-    但仍保证 10./192.168. 等基础段豁免（枚举已覆盖 172.16-31/100.64-127/224-255 等）。
-    fc/fd 仅 fc:/fd: 形态豁免（当前前缀表已含尾点/冒号语义，fcfake 不误豁免）。
-    """
-    if kind == 'ipv4':
-        if any(value.startswith(p) for p in _RESERVED_IPV4_PREFIXES):
-            return True
-        # 硬化增强：段内边界值精确 in-network 兜底仅 hardening=1 时启用
-        if not _is_detection_hardening():
-            return False
-        try:
-            addr = _ipaddress.ip_address(value)
-        except ValueError:
-            return False
-        return any(addr in net for net in _RESERVED_NETWORKS)
-    # IPv6：先 lower 再判定（hardening 时精确 lower+冒号前缀）
-    low = value.lower()
-    if low == '::1':
-        return True
-    # fc/fd 仅 hex 形态豁免（fcfake/fdfake 不豁免）：裸 coarse 后加 hex 校验
-    if low.startswith(('fc', 'fd')):
-        # 取首段直到 ':'，要求全 hex 且长度 2-4（fc/fc00/fd12 等），否则视为 fcfake
-        head = low.split(':', 1)[0]
-        if head and all(c in '0123456789abcdef' for c in head) and 2 <= len(head) <= 4:
-            return True
-        # fcfake 等非 hex 形态不按 fc/fd 豁免，继续走其他前缀/精确校验
-    if any(low.startswith(p) for p in _RESERVED_IPV6_PREFIXES if p not in ('fc', 'fd')):
-        return True
-    if not _is_detection_hardening():
-        return False
     try:
-        addr = _ipaddress.ip_address(low)
+        _is_reserved_ip.cache_clear()
+    except Exception:
+        pass
+
+
+# ── 保留地址豁免（标准库 ipaddress 判定，替代前缀表）──
+# 仅公网全局可路由地址视为 PII（需脱敏），其余均豁免。标准库已含 IANA 全表，
+# 无需硬编码前缀，Python 升级自动跟进（198.18/15、192.0.0.0/24、64:ff9b::/96 等）。
+@lru_cache(maxsize=4096)
+def _is_reserved_ip(value: str, kind: str) -> bool:
+    """判定 IP 是否保留/私有段（标准库）。
+
+    Returns True  豁免（不脱敏）：私有/保留/回环/链路本地/组播/CGNAT/文档/未指定等
+            False 公网（需脱敏）：全局可路由地址
+
+    判定： not is_global → 私有/保留/CGNAT 100.64/10/document 等（is_private+is_global 已含 IANA 全表）
+           is_multicast/is_reserved/is_unspecified/is_site_local → 组播/保留/NAT64/未指定等
+           仍 is_global=True 的特殊段（Python 3.13 实测：224.0.0.1、ff02::1、64:ff9b::1 均为 global=True）
+    性能：单次 ip_address 解析 ~5-15µs，lru_cache 命中 ~0.3µs，scan 链路每 IP 一次可忽略。
+    兼容：value 可能含句末标点（scan 侧已 rstrip，但 _metrics.redact_summary 直调未剥离），此处统一剥离。
+    """
+    try:
+        # IPv6 需剥句末标点并 lower（与 scan 侧 core=rstrip 逻辑一致，防 2001:db8::1. 误判）
+        v = value.rstrip('.,;)]}') if kind == 'ipv6' else value
+        if kind == 'ipv6':
+            v = v.lower()
+            if not v:
+                return False
+        ip = _ipaddress.ip_address(v)
     except ValueError:
+        # 非法格式（如 999.999.999.999）不视为保留，避免误豁免；上层正则已控，此处防御
         return False
-    return any(addr in net for net in _RESERVED_IPV6_NETWORKS)
+    # 非全局即保留（已含 0.0.0.0/8, 10/8, 172.16/12, 192.168/16, 100.64/10, 192.0.2/24,
+    # 198.51.100/24, fe80::/10, fc00::/7, 2001:db8::/32, ::1 等）
+    if not ip.is_global:
+        return True
+    # 标准库中以下类型仍 is_global=True，需显式豁免
+    if ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+        return True
+    if getattr(ip, 'is_site_local', False):
+        return True
+    # 兜底：loopback/link_local/private 已被 not is_global 覆盖，此处仅防御性补充
+    return ip.is_loopback or ip.is_link_local or ip.is_private
+
+
+# 兼容别名：旧前缀常量已由标准库替代，保留空元组防外部导入报错
+_RESERVED_IPV4_PREFIXES: tuple = ()  # deprecated: 由 ipaddress 替代
+_RESERVED_IPV6_PREFIXES: tuple = ()  # deprecated
+_RESERVED_NETWORKS: list = []  # deprecated
+_RESERVED_IPV6_NETWORKS: list = []  # deprecated
 
 
 def _is_valid_ipv6(value: str) -> bool:
