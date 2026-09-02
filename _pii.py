@@ -711,20 +711,20 @@ _BUILTIN_PATTERNS: list[tuple[str, str]] = [
         'email',
         r'(?P<email>(?<![0-9A-Za-z_.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![0-9A-Za-z_.-]))',
     ),
-    # 手机号（前缀段验证 13x-19x）
+    # 手机号（前缀段验证 13x-19x，兼容 +86 国际冠码）
     (
         'phone',
-        r'(?P<phone>(?<![\d])(?:86[\- ]?)?1[3-9]\d{9}(?!\d))',
+        r'(?P<phone>(?<![\d])(?:\+?86[\- ]?)?1[3-9]\d{9}(?!\d))',
     ),
     # 身份证（18 位，校验位验证由回调完成）
     (
         'id_card',
         r'(?P<id_card>(?<![\d])\d{17}[\dXx](?!\d))',
     ),
-    # 银行卡（13-19 位，Luhn 校验由回调完成；防 URL 参数误报）
+    # 银行卡（13-19 位，Luhn 校验由回调完成；防 URL 参数误报，长度按 BIN 分支精确：62/60/34/37→13-19，4/5→13-19）
     (
         'bank_card',
-        r'(?P<bank_card>(?<![\d])(?:62|60|4|5|3[47])\d{12,18}(?!\d))',
+        r'(?P<bank_card>(?<![\d])(?:(?:62|60|3[47])\d{11,17}|[45]\d{12,18})(?!\d))',
     ),
     # IPv4（保留段豁免由回调完成）
     (
@@ -738,11 +738,11 @@ _BUILTIN_PATTERNS: list[tuple[str, str]] = [
         'ipv6',
         r'(?P<ipv6>(?<![0-9A-Za-z:.])(?:[0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:.]*)(?![0-9A-Za-z:.])',
     ),
-    # API key（sk- / sk-ant- / ghp_ / gho_ / AKIA 前缀 + 最小 16 字符）
+    # API key（sk- / sk-proj- / sk-ant- / ghp_ / gho_ / AKIA 前缀 + 最小 16 字符）
     (
         'api_key',
         (
-            r'(?P<api_key>(?<![0-9A-Za-z-])(?:sk-(?:ant-)?[A-Za-z0-9_-]{16,}|'
+            r'(?P<api_key>(?<![0-9A-Za-z-])(?:sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}|'
             r'gh[pous]_[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16})(?![0-9A-Za-z-]))'
         ),
     ),
@@ -774,10 +774,19 @@ def _clear_analyzer_cache():
         _get_combined_re_cached.cache_clear()
     except Exception:
         pass
-    try:
-        _is_reserved_ip.cache_clear()
-    except Exception:
-        pass
+    for _name in (
+        '_is_reserved_ip',
+        '_is_valid_ipv4',
+        '_is_valid_ipv6',
+        '_luhn_ok',
+        '_id_card_ok',
+    ):
+        try:
+            _fn = globals().get(_name)  # type: ignore[assignment]
+            if _fn is not None and hasattr(_fn, 'cache_clear'):
+                _fn.cache_clear()  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
 
 # ── 保留地址豁免（标准库 ipaddress 判定，替代前缀表）──
@@ -827,6 +836,21 @@ _RESERVED_NETWORKS: list = []  # deprecated
 _RESERVED_IPV6_NETWORKS: list = []  # deprecated
 
 
+@lru_cache(maxsize=4096)
+def _is_valid_ipv4(value: str) -> bool:
+    """正则粗筛后的标准库精确校验：仅合法 IPv4 视为命中（0-255 逐段）。
+
+    粗筛正则仅保证 `\\d{1,3}.` 重复，`999.999.999.999` 等非法段会误命中；
+    此处用 ipaddress 精确判定，version==4 才视为 IPv4。带 lru_cache 复用。
+    """
+
+    try:
+        return _ipaddress.ip_address(value).version == 4
+    except ValueError:
+        return False
+
+
+@lru_cache(maxsize=4096)
 def _is_valid_ipv6(value: str) -> bool:
     """正则粗筛后的标准库精确校验：仅合法 IPv6 视为命中。
 
@@ -840,8 +864,9 @@ def _is_valid_ipv6(value: str) -> bool:
         return False
 
 
+@lru_cache(maxsize=4096)
 def _luhn_ok(digits: str) -> bool:
-    """Luhn 校验（银行卡）。"""
+    """Luhn 校验（银行卡）。带 lru_cache 复用，重复卡号命中 ~0.1µs。"""
     total = 0
     for i, ch in enumerate(reversed(digits)):
         d = ord(ch) - 48
@@ -857,8 +882,9 @@ _ID_WEIGHTS = [7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2]
 _ID_CHECKS = '10X98765432'
 
 
+@lru_cache(maxsize=4096)
 def _id_card_ok(value: str) -> bool:
-    """大陆身份证校验位验证（GB 11643-1999）。"""
+    """大陆身份证校验位验证（GB 11643-1999）。带 lru_cache 复用。"""
     if len(value) != 18:
         return False
     if not value[:17].isdigit():
@@ -1369,6 +1395,9 @@ class PiiDetector:
                     value = core
                 elif not _is_valid_ipv6(value):
                     continue
+            # IPv4：正则粗筛后用标准库二次校验（0-255 逐段），防 999.999.999.999 误脱敏
+            if kind == 'ipv4' and not _is_valid_ipv4(value):
+                continue
             # URL 上下文防误报：?id= 等参数长数字不判银行卡
             if kind == 'bank_card' and _URL_QUERY_PARAM_RE.search(value):
                 continue
