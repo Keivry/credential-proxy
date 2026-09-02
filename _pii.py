@@ -726,10 +726,11 @@ _BUILTIN_PATTERNS: list[tuple[str, str]] = [
         'bank_card',
         r'(?P<bank_card>(?<![\d])(?:(?:62|60|3[47])\d{11,17}|[45]\d{12,18})(?!\d))',
     ),
-    # IPv4（保留段豁免由回调完成）
+    # IPv4（保留段豁免由回调完成；前瞻仅禁数字不禁止尾随句号，句末句号场景
+    # 由二次校验 rstrip 处理——与 IPv6 core 剥离对称，防 `Visit 1.2.3.4.` 漏脱敏）
     (
         'ipv4',
-        r'(?P<ipv4>(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.]))',
+        r'(?P<ipv4>(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d]))',
     ),
     # IPv6（正则粗筛 + 标准库精确校验）
     # 粗筛：含至少 2 个冒号的十六进制/冒号/点串，边界用负向环视防粘连；
@@ -803,7 +804,8 @@ def _is_reserved_ip(value: str, kind: str) -> bool:
            is_multicast/is_reserved/is_unspecified/is_site_local → 组播/保留/NAT64/未指定等
            仍 is_global=True 的特殊段（Python 3.13 实测：224.0.0.1、ff02::1、64:ff9b::1 均为 global=True）
     性能：单次 ip_address 解析 ~5-15µs，lru_cache 命中 ~0.3µs，scan 链路每 IP 一次可忽略。
-    兼容：value 可能含句末标点（scan 侧已 rstrip，但 _metrics.redact_summary 直调未剥离），此处统一剥离。
+    兼容：value 可能含句末标点（scan/_metrics 双路径均先 rstrip 剥离），此处统一防御剥离。
+    前导零：ipv4 分支先归一化（_normalize_ipv4_leading_zeros），与 _is_valid_ipv4 保持一致。
     """
     try:
         # IPv6 需剥句末标点并 lower（与 scan 侧 core=rstrip 逻辑一致，防 2001:db8::1. 误判）
@@ -812,6 +814,10 @@ def _is_reserved_ip(value: str, kind: str) -> bool:
             v = v.lower()
             if not v:
                 return False
+        elif kind == 'ipv4':
+            # 前导零兼容：ipaddress 严格拒绝前导零（ValueError→False→误判公网），
+            # 与 _is_valid_ipv4 同归一化，避免前导零私有/保留段被过度脱敏
+            v = _normalize_ipv4_leading_zeros(v)
         ip = _ipaddress.ip_address(v)
     except ValueError:
         # 非法格式（如 999.999.999.999）不视为保留，避免误豁免；上层正则已控，此处防御
@@ -840,14 +846,31 @@ _RESERVED_IPV6_NETWORKS: list = []  # deprecated
 def _is_valid_ipv4(value: str) -> bool:
     """正则粗筛后的标准库精确校验：仅合法 IPv4 视为命中（0-255 逐段）。
 
-    粗筛正则仅保证 `\\d{1,3}.` 重复，`999.999.999.999` 等非法段会误命中；
+    粗筛正则仅保证 `\\d{1,3}.` 重复，`__PII_26_1336ed19__` 等非法段会误命中；
     此处用 ipaddress 精确判定，version==4 才视为 IPv4。带 lru_cache 复用。
+
+    前导零兼容：`192.168.001.001` 是合法且常见的 IPv4 表示法（旧前缀表时代即脱敏），
+    而 ipaddress.ip_address 严格拒绝前导零（ValueError）；此处先归一化前导零
+    （192.168.001.001 -> 192.168.1.1）再判定，保持旧版脱敏行为。
+    注意：`value` 仅用于判定，scan 的 hits/replace 始终使用原始文本。
     """
 
     try:
-        return _ipaddress.ip_address(value).version == 4
+        _v = _normalize_ipv4_leading_zeros(value)
+        return _ipaddress.ip_address(_v).version == 4
     except ValueError:
         return False
+
+
+def _normalize_ipv4_leading_zeros(value: str) -> str:
+    """归一化 IPv4 前导零：192.168.001.001 -> 192.168.1.1（ipaddress 严格拒绝前导零）。"""
+    parts = value.split('.')
+    if len(parts) != 4:
+        return value
+    try:
+        return '.'.join(str(int(p)) for p in parts)
+    except ValueError:
+        return value
 
 
 @lru_cache(maxsize=4096)
@@ -1396,11 +1419,20 @@ class PiiDetector:
                 elif not _is_valid_ipv6(value):
                     continue
             # IPv4：正则粗筛后用标准库二次校验（0-255 逐段），防 999.999.999.999 误脱敏
-            if kind == 'ipv4' and not _is_valid_ipv4(value):
-                continue
-            # URL 上下文防误报：?id= 等参数长数字不判银行卡
-            if kind == 'bank_card' and _URL_QUERY_PARAM_RE.search(value):
-                continue
+            if kind == 'ipv4':
+                core = value.rstrip('.,;)]}')
+                if core and _is_valid_ipv4(core):
+                    value = core
+                elif not _is_valid_ipv4(value):
+                    continue
+            # URL 上下文防误报：?id= 等参数长数字不判银行卡。
+            # `_URL_QUERY_PARAM_RE.search(value)` 对纯数字卡号恒 False（死码）——
+            # 须检查 match 前后的 URL 参数上下文（与 _metrics.redact_summary Y-13b 同法）
+            if kind == 'bank_card':
+                ctx_start = max(0, m.start() - 64)
+                ctx_end = min(len(text), m.end() + 16)
+                if _URL_QUERY_PARAM_RE.search(text[ctx_start:ctx_end]):
+                    continue
             # 校验位/上下文强化
             if kind == 'id_card' and not _id_card_ok(value):
                 continue

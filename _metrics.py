@@ -280,6 +280,7 @@ def _redact_extra_pii(out: str) -> str:
             _URL_QUERY_PARAM_RE,
             _id_card_ok,
             _is_reserved_ip,
+            _is_valid_ipv4,
             _is_valid_ipv6,
             _luhn_ok,
         )
@@ -314,8 +315,21 @@ def _redact_extra_pii(out: str) -> str:
                 continue
             if kind == 'bank_card' and not _luhn_ok(value):
                 continue
-            if kind == 'ipv6' and not _is_valid_ipv6(value):
-                continue
+            # IPv4/IPv6：与 scan 对称的 core 剥离 + 标准库二次校验。
+            # 粗筛正则尾部贪婪可能粘连句末标点（`...1.`），剥掉后校验，防合法
+            # 公网 IP 因粘连标点被误判非法而漏脱敏；前导零由 _is_valid_ipv4 归一化
+            if kind == 'ipv6':
+                core = value.rstrip('.,;)]}')
+                if core and _is_valid_ipv6(core):
+                    value = core
+                elif not _is_valid_ipv6(value):
+                    continue
+            if kind == 'ipv4':
+                core = value.rstrip('.,;)]}')
+                if core and _is_valid_ipv4(core):
+                    value = core
+                elif not _is_valid_ipv4(value):
+                    continue
             if kind in ('ipv4', 'ipv6') and _is_reserved_ip(value, kind):
                 continue
             out = out.replace(value, f'[REDACTED:{kind}]')
