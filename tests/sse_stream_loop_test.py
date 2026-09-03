@@ -76,6 +76,31 @@ async def make_upstream():
                 b'"delta":{"type":"text_delta","text":"hi"}}\n\n'
             )
             await resp.write(b'data: [DONE]\n\n')
+        elif case == 'whatwg_framing':
+            # 3.2 分帧语义对齐：注释透传 / retry 仅 ASCII 数字 /
+            # data 冒号后单空格剥离（快链与慢链同口径）
+            await resp.write(b': keepalive-marker-32xyz\n\n')
+            await resp.write(b'retry: 250\n\n')
+            await resp.write(b'retry: abc\n\n')
+            await resp.write('retry: ２５０\n\n'.encode())
+            await resp.write(b'data:{"type":"message_stop"}\n\n')
+            await resp.write(
+                b'data:  {"type":"content_block_delta","index":0,'
+                b'"delta":{"type":"text_delta","text":"spaced"}}\n\n'
+            )
+            await resp.write(b'data: {"type":"message_stop"}\n\n')
+        elif case == 'whatwg_cr':
+            # 3.2 CR-only 分隔流：\r 与 \n 同为行分隔符
+            # （每事件 data 行后跟 \r 空行分隔，与 LF 流等价）
+            await resp.write(
+                b'data: {"type":"content_block_delta","index":0,'
+                b'"delta":{"type":"text_delta","text":"cr-one"}}\r\r'
+            )
+            await resp.write(
+                b'data: {"type":"content_block_delta","index":0,'
+                b'"delta":{"type":"text_delta","text":"cr-two"}}\r\r'
+            )
+            await resp.write(b'data: {"type":"message_stop"}\r\r')
         await resp.write_eof()
         return resp
 
@@ -166,6 +191,42 @@ async def test_done_marker_passthrough():
             raw = await r.text()
             assert 'data: [DONE]' in raw
             assert '"text":"hi"' in raw
+
+
+@pytest.mark.asyncio
+async def test_fast_whatwg_framing_parity():
+    """3.2 分帧语义对齐：快链与慢链同款 WHATWG 三语义（三个独立 assert）。"""
+    async with env(), ClientSession() as s:
+        body = json.dumps({'case': 'whatwg_framing'})
+        async with s.post(BASE, headers=HEADERS, data=body) as r:
+            assert r.status == 200
+            raw = await r.text()
+    assert ': keepalive-marker-32xyz' in raw
+    assert 'retry: 250' in raw
+    assert 'retry: abc' not in raw
+    assert '２５０' not in raw
+    data_lines = [ln for ln in raw.splitlines() if ln.startswith('data:')]
+    assert len(data_lines) >= 3
+    for ln in data_lines:
+        json.loads(ln[5:].lstrip())
+    assert '"text":"spaced"' in raw
+    assert 'data: {"type":"message_stop"}' in raw
+
+
+@pytest.mark.asyncio
+async def test_fast_cr_split_parity():
+    """3.2 回车分隔流快慢一致：CR-only 行按行切分且每行可解析。"""
+    async with env(), ClientSession() as s:
+        body = json.dumps({'case': 'whatwg_cr'})
+        async with s.post(BASE, headers=HEADERS, data=body) as r:
+            assert r.status == 200
+            raw = await r.text()
+    assert '"text":"cr-one"' in raw
+    assert '"text":"cr-two"' in raw
+    data_lines = [ln for ln in raw.splitlines() if ln.startswith('data:')]
+    assert len(data_lines) >= 3
+    for ln in data_lines:
+        json.loads(ln[5:].lstrip())
 
 
 @pytest.mark.asyncio

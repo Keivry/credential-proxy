@@ -1033,6 +1033,35 @@ def mask_pii_value(kind: str, value: str) -> str:
     return masked
 
 
+def _custom_literal_run(src: str, min_len: int = 2) -> str:
+    """提取自定义正则字面前缀 run（best-effort，永不抛）。
+
+    跳过 `(?P<name>` 样板后收集连续字面字符（字母/数字/CJK/`-_./` 等），
+    遇正则元字符即停：`工号\\d{6}`→`工号`，`PRJ-[A-Z]{2}`→`PRJ-`；
+    纯 lookaround 开头（如 `(?<![0-9…`）返回 ''（无字面头，调用方按未命中计）。
+    """
+    try:
+        if not isinstance(src, str) or not src:
+            return ''
+        text = src
+        m = _re.search(r'\(\?P<[^>]+>', text)
+        if m:
+            text = text[m.end() :]
+        else:
+            text = _re.sub(r'^(?:\(\?[a-zA-Z-]*\)|\^)+', '', text)
+        run: list[str] = []
+        for ch in text:
+            if ch in '\\[()?*+{|^$.' or ch == ')':
+                break
+            run.append(ch)
+            if len(run) >= 32:
+                break
+        out = ''.join(run)
+        return out if len(out) >= min_len else ''
+    except Exception:
+        return ''
+
+
 class PiiDetector:
     """PII 检测器：内置 + 自定义正则 + 字典型 recognizer。
 
@@ -1161,6 +1190,64 @@ class PiiDetector:
         except _re.error as exc:
             logger.warning('自定义正则合并失败: %s', exc)
             self.custom_combined_re = None
+
+    def partial_prefix_hints(self, tail: str | None = None) -> list[str]:
+        """自定义规则 best-effort 前缀提示（D5/3.1 流式持有等待用）。
+
+        来源：已加载自定义正则的字面 run + 字典名单全名，合计 cap64 去重。
+        `tail` 给出时仅返回与尾部窗口命中的子集；未命中返回 []（调用方透传
+        并计 custom_other，不阻塞主链）。永不抛异常（异常→返回 []）。
+        """
+        try:
+            hints: list[str] = []
+            seen: set[str] = set()
+
+            def _add(_h: str) -> None:
+                if not isinstance(_h, str) or not _h or len(hints) >= 64:
+                    return
+                _h = _h[:64]
+                if _h and _h not in seen:
+                    seen.add(_h)
+                    hints.append(_h)
+
+            for _name, _compiled, _src in self.custom_patterns or []:
+                try:
+                    if isinstance(_src, str):
+                        _run = _custom_literal_run(_src)
+                        if _run:
+                            _add(_run)
+                except Exception:
+                    logger.debug('partial_prefix_hints 正则提示跳过', exc_info=True)
+                    continue
+            for _nm, _typ in self.dict_entries or []:
+                try:
+                    if isinstance(_nm, str) and _nm:
+                        _add(_nm)
+                except Exception:
+                    logger.debug('partial_prefix_hints 名单提示跳过', exc_info=True)
+                    continue
+            if tail is None:
+                return hints
+            if not isinstance(tail, str) or not tail:
+                return []
+            window = tail[-64:] if len(tail) > 64 else tail
+            matched: list[str] = []
+            for _h in hints:
+                try:
+                    if _h in window:
+                        matched.append(_h)
+                        continue
+                    _n = min(len(_h), len(window))
+                    for _k in range(_n, 0, -1):
+                        if window.endswith(_h[:_k]):
+                            matched.append(_h)
+                            break
+                except Exception:
+                    logger.debug('partial_prefix_hints 尾部匹配跳过', exc_info=True)
+                    continue
+            return matched
+        except Exception:
+            return []
 
     async def _scan_custom(
         self,
