@@ -20,7 +20,7 @@
 
 ### Requirement: 候选感知覆盖全类型
 
-系统 SHALL 对无换行超长持有按 PII 前缀候选感知强制切分，内置全类型（`email/phone/id_card/bank_card/ipv4/ipv6/api_key`）+ `__VG_CRED__/__PII__` 保留前缀全覆盖；自定义规则仅 best-effort（命中其已加载正则前缀族即持有，未命中允许透传，不阻塞主链）。
+系统 SHALL 对无换行超长持有按 PII 前缀候选感知强制切分，内置全类型（`email/phone/id_card/bank_card/ipv4/ipv6/api_key`）+ `__VG_CRED__/__PII__` 保留前缀全覆盖；自定义规则按其已加载正则字面前缀族持有等待：命中前缀即持有，未命中则透传该分片并计 `custom_other` 候选未命中，主链不得为等待自定义前缀而无限持有。
 
 #### Scenario: 邮箱跨片不泄漏
 
@@ -32,10 +32,10 @@
 - **WHEN** 同一短分片流分别经 fast 链与 slow 链处理
 - **THEN** 两者行缓冲语义一致，不得一链直接透传而另一链持有合并
 
-#### Scenario: 自定义规则 best-effort 不阻塞
+#### Scenario: 自定义规则未命中前缀透传并计数
 
 - **WHEN** 自定义正则前缀未被候选感知覆盖且分片无换行超长持有
-- **THEN** 系统允许透传该分片并计 `custom_other` 候选未命中（计数位置：`_metrics.py sanitize_kind` 归一后的 `pii_by_type["custom_other"]` 指标桶，与 `/_admin/metrics` 的 `pii_by_type` 同口径；仅计数不阻塞），主链不为等待自定义前缀而无限持有
+- **THEN** 系统透传该分片并计 `custom_other` 候选未命中（计数位置：`_metrics.py sanitize_kind` 归一后的 `pii_by_type["custom_other"]` 指标桶，与 `/_admin/metrics` 的 `pii_by_type` 同口径），主链不得为等待自定义前缀而无限持有（持有超过 `LINE_BUF_FLUSH=16KB` 或 `LINE_BUF_MAX_AGE=30s` 即强制切分输出）
 
 #### Scenario: refusal 通道同缓冲
 

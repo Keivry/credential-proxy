@@ -501,6 +501,7 @@ def _rebuild_chat_chunk(
     reasoning_by_index: dict | None = None,
     finish_by_index: dict | None = None,
     tool_calls_by_index: dict | None = None,
+    refusal_by_index: dict | None = None,
 ) -> str:
     """D1 结构保留重建：deepcopy 原解析对象，按 `choices[i].index` 逐路替换 delta 字段。
 
@@ -560,6 +561,13 @@ def _rebuild_chat_chunk(
                     _delta = {}
                     _ch['delta'] = _delta
                 _delta['tool_calls'] = _v
+            if refusal_by_index and _idx in refusal_by_index:
+                _v = refusal_by_index[_idx]
+                if isinstance(_v, str):
+                    if not isinstance(_delta, dict):
+                        _delta = {}
+                        _ch['delta'] = _delta
+                    _delta['refusal'] = _v
             if finish_by_index and _idx in finish_by_index:
                 _v = finish_by_index[_idx]
                 if _v is not None:
@@ -581,6 +589,8 @@ def _mk_sse_event(
     content_by_index: dict | None = None,
     reasoning_by_index: dict | None = None,
     finish_by_index: dict | None = None,
+    refusal: str = '',
+    refusal_by_index: dict | None = None,
 ) -> str:
     """Build OpenAI-compatible SSE data event JSON.
 
@@ -601,6 +611,7 @@ def _mk_sse_event(
         _cbi = dict(content_by_index) if content_by_index else {}
         _rbi = dict(reasoning_by_index) if reasoning_by_index else {}
         _fbi = dict(finish_by_index) if finish_by_index else {}
+        _fbi_ref = dict(refusal_by_index) if refusal_by_index else {}
         try:
             _choices = parsed.get('choices')
         except AttributeError:
@@ -638,12 +649,25 @@ def _mk_sse_event(
                         continue
                     if _ch.get('finish_reason') is None:
                         _fbi[_chat_choice_index(_ch, _pos)] = finish_reason
-        return f'data: {_rebuild_chat_chunk(parsed, _cbi or None, _rbi or None, _fbi or None)}\n\n'
+            if refusal and not _fbi_ref:
+                if len(_idxs) == 1:
+                    _fbi_ref[_idxs[0]] = refusal
+                else:
+                    for _pos, _ch in enumerate(_choices):
+                        if not isinstance(_ch, dict):
+                            continue
+                        _d = _ch.get('delta')
+                        if isinstance(_d, dict) and isinstance(_d.get('refusal'), str):
+                            _fbi_ref[_chat_choice_index(_ch, _pos)] = refusal
+                            break
+        return f'data: {_rebuild_chat_chunk(parsed, _cbi or None, _rbi or None, _fbi or None, None, _fbi_ref or None)}\n\n'
     delta = {}
     if content:
         delta['content'] = content
     if reasoning_content:
         delta['reasoning_content'] = reasoning_content
+    if refusal:
+        delta['refusal'] = refusal
     # 10.11.4 (F-QUAL-01): 统一走 _jdumps（ensure_ascii=False +
     # separators=(',',':')），与共享 json_walk 口径一致（原裸
     # dumps 空格分隔与 _jdumps 输出形态不一致）
@@ -656,7 +680,7 @@ def _mk_sse_event(
     return f'data: {event}\n\n'
 
 
-def _fast_rebuild_chunk(parsed, content, reasoning=None) -> str:
+def _fast_rebuild_chunk(parsed, content, reasoning=None, refusal=None) -> str:
     """10.14 (API-SPEC): 快链重建 chat.completion.chunk JSON。
 
     D1 结构保留：deepcopy 原 chunk，按 `choices[i].index` 逐路替换
@@ -666,6 +690,9 @@ def _fast_rebuild_chunk(parsed, content, reasoning=None) -> str:
 
     3.1 (D5)：`reasoning` 为 `dict[int, str]` 时同等按路替换
     `delta.reasoning_content`（与 content 共用重建入口，不另设阈值）。
+
+    5.4 (D6.3)：`refusal` 为 `dict[int, str]` 时按路替换
+    `delta.refusal` 独立字段，不并入 content。
 
     `content` 为 str 时为兼容形态：仅替换原含 str content 的路
     （内部调用方一律用 dict 形态，禁止跨路广播）。
@@ -699,10 +726,16 @@ def _fast_rebuild_chunk(parsed, content, reasoning=None) -> str:
                 _rmap = {
                     k: v for k, v in reasoning.items() if isinstance(v, str)
                 } or None
+            _fmap = None
+            if isinstance(refusal, dict):
+                _fmap = {k: v for k, v in refusal.items() if isinstance(v, str)} or None
             return _rebuild_chat_chunk(
                 parsed,
                 {k: v for k, v in content.items() if isinstance(v, str)} or None,
                 _rmap,
+                None,
+                None,
+                _fmap,
             )
         if isinstance(content, str):
             return _rebuild_chat_chunk(parsed, _as_map(content))
@@ -3097,11 +3130,15 @@ class LlmMixin(AuditMixin):
                             # ── JSON-aware 流式 token 还原（广义 Plan C） ──
                             content_buf = ''  # 累积 delta.content 片段（每事件经 safe/pending 分割重置为小字符串，摊还 O(1)）
                             reasoning_buf = ''  # 累积 delta.reasoning_content 片段
+                            refusal_buf = (
+                                ''  # 5.4 独立累积 delta.refusal 片段（同阈值不同实例）
+                            )
                             # D1 发射映射：joint 缓冲文本的来源路索引（精确单路时
                             # 按 index 重建，含多路时回退原最小事件；见
                             # _single_mapped_index）
                             content_buf_src: set[int] = set()
                             reasoning_buf_src: set[int] = set()
+                            refusal_buf_src: set[int] = set()
                             # D1 流末合成重建用：最近一次 chat chunk 解析对象
                             slow_last_chat_parsed = None
                             arg_buf = ''  # 累积 responses function_call_arguments / anthropic partial_json 片段
@@ -3131,10 +3168,15 @@ class LlmMixin(AuditMixin):
                             bom_seen = False  # 流首 BOM 单次剥离
                             line_buf_ts = _time.monotonic()  # 6.3/6.5 行缓冲时间戳
                             reasoning_buf_ts = _time.monotonic()
+                            refusal_buf_ts = _time.monotonic()
                             keepalive_task: asyncio.Task | None = None
 
                             def _reset_keepalive():
-                                nonlocal keepalive_task, line_buf_ts, reasoning_buf_ts
+                                nonlocal \
+                                    keepalive_task, \
+                                    line_buf_ts, \
+                                    reasoning_buf_ts, \
+                                    refusal_buf_ts
                                 if keepalive_task is not None:
                                     try:
                                         keepalive_task.cancel()
@@ -3144,6 +3186,7 @@ class LlmMixin(AuditMixin):
                                 if (
                                     content_buf
                                     or reasoning_buf
+                                    or refusal_buf
                                     or arg_buf
                                     or data_buffer
                                     # 10.7.1 (F-07): 审计审批挂起期（最长 90s
@@ -3159,6 +3202,7 @@ class LlmMixin(AuditMixin):
                                 ):
                                     line_buf_ts = _time.monotonic()
                                     reasoning_buf_ts = _time.monotonic()
+                                    refusal_buf_ts = _time.monotonic()
 
                                     async def _ka():
                                         while True:
@@ -3177,6 +3221,7 @@ class LlmMixin(AuditMixin):
                                                 if (
                                                     content_buf
                                                     or reasoning_buf
+                                                    or refusal_buf
                                                     or arg_buf
                                                     or data_buffer
                                                     or _ap_pending
@@ -3228,45 +3273,12 @@ class LlmMixin(AuditMixin):
                             # 审计启用时缓冲 tool_calls SSE 行（design D4：未出 verdict 不流出）
                             tool_calls_pending_events: list[str] = []
 
-                            # 1.3 (D3) 缓冲事件单次还原 helper：
-                            # 三处放行点（[DONE]兜底/finish触发/流末）统一经此单次
-                            # `_pii_process_sse_line` 还原；还原后 `json.loads`
-                            # 校验，失败走 `_strip_partials` 清理不回退原串
-                            # （防未还原占位符泄漏）；返回不带帧尾的 SSE 行，
-                            # 校验后无内容返回 None（调用方跳过写出）。
-                            async def _release_pending_once(
-                                ev: str, _t2p: dict
-                            ) -> str | None:
-                                restored = await self._pii_process_sse_line(ev, _t2p)
-                                try:
-                                    _lines = (
-                                        restored.split('\n')
-                                        if '\n' in restored
-                                        else [restored]
-                                    )
-                                    for _ln in _lines:
-                                        _s = _ln.strip()
-                                        if not _s or not _s.startswith('data:'):
-                                            continue
-                                        _pl = _s.split(':', 1)[1].lstrip(' \t').strip()
-                                        if (
-                                            not _pl
-                                            or _pl == '[DONE]'
-                                            or not _pl.startswith(('{', '['))
-                                        ):
-                                            continue
-                                        json.loads(_pl)
-                                except Exception as exc:
-                                    logger.warning(
-                                        '缓冲 tool_calls 事件还原后校验失败走残缺清理: error=%s ev_preview=%r restored_preview=%r',
-                                        exc,
-                                        ev[:200],
-                                        restored[:200],
-                                    )
-                                    restored = _strip_partials(restored)
-                                    if not restored.strip():
-                                        return None
-                                return restored
+                            # 1.3 (D3) 缓冲事件单次还原说明：
+                            # 三处放行点（[DONE]兜底/finish触发/流末）统一经
+                            # `_single_flush_openai_tool_calls` 对 tool_calls_buf
+                            # 整段单次还原后重建输出；`tool_calls_pending_events`
+                            # 仅作挂起标记与截断计数，放行/拒绝时直接 clear，
+                            # 不得重放原始行（防与重建输出双发）。
 
                             async def _single_flush_openai_tool_calls(
                                 _parsed_tpl,
@@ -3383,6 +3395,8 @@ class LlmMixin(AuditMixin):
                                 content_by_index: dict | None = None,
                                 reasoning_by_index: dict | None = None,
                                 finish_by_index: dict | None = None,
+                                rf: str = '',
+                                refusal_by_index: dict | None = None,
                             ):
                                 """flush 内容作为 SSE 事件并清空缓冲区。
 
@@ -3394,8 +3408,8 @@ class LlmMixin(AuditMixin):
                                 text/thinking，responses → 对应 delta 事件，
                                 chat → 原 _mk_sse_event。
                                 """
-                                nonlocal content_buf, reasoning_buf
-                                if c or rc or fr:
+                                nonlocal content_buf, reasoning_buf, refusal_buf
+                                if c or rc or fr or rf or refusal_by_index:
                                     if is_anthropic_stream:
                                         # 残留按 anthropic delta 类型输出
                                         _dummy = {
@@ -3464,6 +3478,11 @@ class LlmMixin(AuditMixin):
                                                 rc, active_t2p
                                             )
                                             rc = _strip_partials(rc)
+                                        if rf:
+                                            rf = await self._pii_response_process(
+                                                rf, active_t2p
+                                            )
+                                            rf = _strip_partials(rf)
                                         await _tracked_write(
                                             _mk_sse_event(
                                                 content=c,
@@ -3477,12 +3496,16 @@ class LlmMixin(AuditMixin):
                                                 content_by_index=content_by_index,
                                                 reasoning_by_index=reasoning_by_index,
                                                 finish_by_index=finish_by_index,
+                                                refusal=rf,
+                                                refusal_by_index=refusal_by_index,
                                             ).encode(),
                                         )
                                 content_buf = ''
                                 reasoning_buf = ''
+                                refusal_buf = ''
                                 content_buf_src.clear()
                                 reasoning_buf_src.clear()
+                                refusal_buf_src.clear()
 
                             try:
                                 async for chunk in upstream_resp.content.iter_chunked(
@@ -3536,8 +3559,156 @@ class LlmMixin(AuditMixin):
                                         )
                                         if line == '':
                                             if data_buffer:
-                                                payload = '\n'.join(data_buffer)
+                                                # 5.5 (D6.4): 多 data 行逐条独立 loads/还原/输出 ——
+                                                # 禁止 '\n' 拼接后整体 loads（拼接块整体 loads 失败会跌入
+                                                # 续行重建并吞掉后续事件行）。单条走原单事件路径；
+                                                # 多条每条独立解析还原按原序输出，单条失败隔离不污染整块。
+                                                _entries = list(data_buffer)
                                                 data_buffer.clear()
+                                                if len(_entries) > 1:
+                                                    for _entry in _entries:
+                                                        if not _entry.strip():
+                                                            continue
+                                                        sse_event_count += 1
+                                                        # 可观测性：捕获 usage（慢链多行逐条）
+                                                        _capture_usage_ctx(
+                                                            _entry,
+                                                            _metrics_ctx,
+                                                            'anthropic'
+                                                            if is_anthropic_stream
+                                                            else (
+                                                                'responses'
+                                                                if is_responses_stream
+                                                                else 'openai'
+                                                            ),
+                                                        )
+                                                        if _debug_save_eligible:
+                                                            try:
+                                                                await _debug_append_line(
+                                                                    req_id,
+                                                                    'response_original.jsonl',
+                                                                    _entry,
+                                                                )
+                                                            except Exception as exc:
+                                                                logger.debug(
+                                                                    '保存上游原版日志失败: %s',
+                                                                    exc,
+                                                                )
+                                                        if _entry.strip() == '[DONE]':
+                                                            seen_terminal = True
+                                                            seen_global_terminal = True
+                                                            _done_sent = True
+                                                            await _tracked_write(
+                                                                b'data: [DONE]\n\n',
+                                                            )
+                                                            continue
+                                                        try:
+                                                            _e_parsed = json.loads(
+                                                                _entry
+                                                            )
+                                                        except Exception:
+                                                            # 单条失败隔离：透传原行继续下一条
+                                                            await _tracked_write(
+                                                                (
+                                                                    await self._pii_process_sse_line(
+                                                                        'data: '
+                                                                        + _entry,
+                                                                        active_t2p,
+                                                                    )
+                                                                    + '\n\n'
+                                                                ).encode('utf-8'),
+                                                            )
+                                                            continue
+                                                        if not isinstance(
+                                                            _e_parsed, dict
+                                                        ):
+                                                            await _tracked_write(
+                                                                (
+                                                                    await self._pii_process_sse_line(
+                                                                        'data: '
+                                                                        + _entry,
+                                                                        active_t2p,
+                                                                        parsed_obj=_e_parsed,
+                                                                    )
+                                                                    + '\n\n'
+                                                                ).encode('utf-8'),
+                                                            )
+                                                            continue
+                                                        # 协议/终止识别（与 CR 收尾同口径，不进续行重建）
+                                                        _e_t = _e_parsed.get('type')
+                                                        if _e_t and isinstance(
+                                                            _e_t, str
+                                                        ):
+                                                            if _e_t.startswith(
+                                                                'response.'
+                                                            ):
+                                                                is_responses_stream = (
+                                                                    True
+                                                                )
+                                                            if _e_t in (
+                                                                'response.completed',
+                                                                'response.failed',
+                                                                'response.incomplete',
+                                                                'response.error',
+                                                                'message_stop',
+                                                                'error',
+                                                            ):
+                                                                seen_terminal = True
+                                                                seen_global_terminal = (
+                                                                    True
+                                                                )
+                                                            if _e_t in (
+                                                                'message_start',
+                                                                'content_block_start',
+                                                                'content_block_delta',
+                                                                'content_block_stop',
+                                                                'message_delta',
+                                                                'message_stop',
+                                                                'error',
+                                                                'ping',
+                                                            ):
+                                                                is_anthropic_stream = (
+                                                                    True
+                                                                )
+                                                        for _c in (
+                                                            _e_parsed.get('choices', [])
+                                                            or []
+                                                        ):
+                                                            if (
+                                                                isinstance(_c, dict)
+                                                                and _c.get(
+                                                                    'finish_reason'
+                                                                )
+                                                                is not None
+                                                            ):
+                                                                seen_terminal = True
+                                                                seen_global_terminal = (
+                                                                    True
+                                                                )
+                                                                break
+                                                        # event:/id: 暂存行 FIFO 配对拼入同块
+                                                        _e_block = ''
+                                                        if slow_event_pending:
+                                                            _e_block = (
+                                                                slow_event_pending.pop(
+                                                                    0
+                                                                )
+                                                                + '\n'
+                                                            )
+                                                        await _tracked_write(
+                                                            (
+                                                                await self._pii_process_sse_line(
+                                                                    _e_block
+                                                                    + 'data: '
+                                                                    + _entry,
+                                                                    active_t2p,
+                                                                    parsed_obj=_e_parsed,
+                                                                )
+                                                                + '\n\n'
+                                                            ).encode('utf-8'),
+                                                        )
+                                                    continue
+                                                payload = _entries[0]
                                                 line = 'data: ' + payload
                                                 # 空 data 行不计为有效事件，避免下游 JSONDecodeError (char 0)
                                                 if not payload.strip():
@@ -3619,6 +3790,7 @@ class LlmMixin(AuditMixin):
                                                         )
                                                         content_buf_src.clear()
                                                         reasoning_buf_src.clear()
+                                                        refusal_buf_src.clear()
                                                     elif is_anthropic_stream:
                                                         # 兼容网关可能在 anthropic 流中发 [DONE]：
                                                         # 用 anthropic 格式 flush，避免 chat 格式污染
@@ -3649,10 +3821,12 @@ class LlmMixin(AuditMixin):
                                                         )
                                                         content_buf_src.clear()
                                                         reasoning_buf_src.clear()
+                                                        refusal_buf_src.clear()
                                                     else:
                                                         await _flush(
                                                             c=content_buf,
                                                             rc=reasoning_buf,
+                                                            rf=refusal_buf,
                                                         )
                                                     seen_terminal = True
                                                     seen_global_terminal = True
@@ -3792,6 +3966,7 @@ class LlmMixin(AuditMixin):
                                                         # 保守清空（后继 chat 发射回退原最小事件，不误映射）
                                                         content_buf_src.clear()
                                                         reasoning_buf_src.clear()
+                                                        refusal_buf_src.clear()
                                                         _proto_text_ts = (
                                                             _time.monotonic()
                                                         )
@@ -3821,6 +3996,7 @@ class LlmMixin(AuditMixin):
                                                         await _flush(
                                                             c=content_buf,
                                                             rc=reasoning_buf,
+                                                            rf=refusal_buf,
                                                         )
                                                         _proto_text_ts = (
                                                             _time.monotonic()
@@ -3847,6 +4023,7 @@ class LlmMixin(AuditMixin):
                                                         )
                                                         content_buf_src.clear()
                                                         reasoning_buf_src.clear()
+                                                        refusal_buf_src.clear()
                                                         # 10.14 (API-SPEC): block_stop 时
                                                         # arg_buf 被 flush 为合成 delta 事件
                                                         # （_mk_anthropic_flush_event），
@@ -3901,10 +4078,12 @@ class LlmMixin(AuditMixin):
                                                     # 块继续使用聚合后的单一 delta 语义）
                                                     _agg_content = ''
                                                     _agg_reasoning = None
+                                                    _agg_refusal = ''
                                                     _agg_delta = None  # 10.1.1 (R-04): None 哨兵保留首个 delta
                                                     # D1 逐路采集：当前事件各路原始片段/终止原因
                                                     _idx_content: dict[int, str] = {}
                                                     _idx_reasoning: dict[int, str] = {}
+                                                    _idx_refusal: dict[int, str] = {}
                                                     _idx_finish: dict[int, str] = {}
                                                     if isinstance(parsed, dict):
                                                         slow_last_chat_parsed = parsed
@@ -4011,14 +4190,13 @@ class LlmMixin(AuditMixin):
                                                             isinstance(_ch_ref, str)
                                                             and _ch_ref
                                                         ):
-                                                            _agg_content += _ch_ref
-                                                            _idx_content[_ch_idx] = (
-                                                                _idx_content.get(
+                                                            _agg_refusal += _ch_ref
+                                                            _idx_refusal[_ch_idx] = (
+                                                                _idx_refusal.get(
                                                                     _ch_idx, ''
                                                                 )
                                                                 + _ch_ref
                                                             )
-                                                            _delta.pop('refusal', None)
                                                         _ch_rc = _delta.get(
                                                             'reasoning_content'
                                                         )
@@ -4068,6 +4246,7 @@ class LlmMixin(AuditMixin):
                                                         _tool_calls_audit_pending
                                                         and not _agg_content
                                                         and _agg_reasoning is None
+                                                        and not _agg_refusal
                                                     ):
                                                         continue
                                                     # 注：有 content 的行走 content 分支（只发 content），
@@ -4097,6 +4276,7 @@ class LlmMixin(AuditMixin):
                                                     )
                                                     content = _agg_content
                                                     rc_val = _agg_reasoning
+                                                    refusal_val = _agg_refusal
                                                     # ── finish_reason == tool_calls：审计触发点 ──
                                                     if (
                                                         _any_tool_calls_finish
@@ -4137,6 +4317,7 @@ class LlmMixin(AuditMixin):
                                                         and _any_tool_calls_finish
                                                         and not _agg_content
                                                         and _agg_reasoning is None
+                                                        and not _agg_refusal
                                                     ):
                                                         _non_tc_finish = {
                                                             _i: _fr2
@@ -4168,16 +4349,24 @@ class LlmMixin(AuditMixin):
                                                         for i, v in _idx_reasoning.items()
                                                         if v
                                                     ]
+                                                    _multi_f = [
+                                                        i
+                                                        for i, v in _idx_refusal.items()
+                                                        if v
+                                                    ]
                                                     if (
                                                         (
                                                             len(_multi_c) > 1
                                                             or len(_multi_r) > 1
+                                                            or len(_multi_f) > 1
                                                         )
                                                         and not content_buf
                                                         and not reasoning_buf
+                                                        and not refusal_buf
                                                     ):
                                                         _cbi_d: dict[int, str] = {}
                                                         _rbi_d: dict[int, str] = {}
+                                                        _fbi_d: dict[int, str] = {}
                                                         _has_pend = False
                                                         for _di in _multi_c:
                                                             _rr = await self._pii_response_process(
@@ -4209,8 +4398,23 @@ class LlmMixin(AuditMixin):
                                                                 _rbi_d[_di] = _ss
                                                             if _pp:
                                                                 _has_pend = True
+                                                        for _di in _multi_f:
+                                                            _rr = await self._pii_response_process(
+                                                                _idx_refusal[_di],
+                                                                active_t2p,
+                                                            )
+                                                            _ss, _pp = _split_safe_hold(
+                                                                _rr,
+                                                                active_t2p,
+                                                                self._pii_scope_or_none(),
+                                                            )
+                                                            _ss = _strip_partials(_ss)
+                                                            if _ss:
+                                                                _fbi_d[_di] = _ss
+                                                            if _pp:
+                                                                _has_pend = True
                                                         if not _has_pend and (
-                                                            _cbi_d or _rbi_d
+                                                            _cbi_d or _rbi_d or _fbi_d
                                                         ):
                                                             await _tracked_write(
                                                                 _mk_sse_event(
@@ -4224,6 +4428,9 @@ class LlmMixin(AuditMixin):
                                                                     finish_by_index=(
                                                                         _idx_finish
                                                                         or None
+                                                                    ),
+                                                                    refusal_by_index=(
+                                                                        _fbi_d or None
                                                                     ),
                                                                 ).encode(),
                                                             )
@@ -4317,8 +4524,11 @@ class LlmMixin(AuditMixin):
                                                                 )
                                                             )
                                                             if _ridx is None:
+                                                                # 5.3 (D6.2) 回退收敛：聚合文本跨事件，
+                                                                # 透传单行会丢历史，重建带回上游 id/model。
                                                                 _rev = _mk_sse_event(
-                                                                    reasoning_content=_rtxt
+                                                                    parsed=parsed,
+                                                                    reasoning_content=_rtxt,
                                                                 )
                                                             else:
                                                                 _rev = _mk_sse_event(
@@ -4333,6 +4543,7 @@ class LlmMixin(AuditMixin):
                                                         if (
                                                             finish_reason
                                                             and not content
+                                                            and not refusal_val
                                                         ):
                                                             if reasoning_buf:
                                                                 reasoning_buf = await self._pii_response_process(
@@ -4351,6 +4562,7 @@ class LlmMixin(AuditMixin):
                                                                 )
                                                                 if _ridx2 is None:
                                                                     _rev2 = _mk_sse_event(
+                                                                        parsed=parsed,
                                                                         reasoning_content=reasoning_buf,
                                                                         finish_reason=finish_reason,
                                                                     )
@@ -4467,7 +4679,8 @@ class LlmMixin(AuditMixin):
                                                             )
                                                             if _cidx is None:
                                                                 _cev = _mk_sse_event(
-                                                                    _ctxt
+                                                                    _ctxt,
+                                                                    parsed=parsed,
                                                                 )
                                                             else:
                                                                 _cev = _mk_sse_event(
@@ -4499,6 +4712,7 @@ class LlmMixin(AuditMixin):
                                                                     _cev2 = _mk_sse_event(
                                                                         content_buf,
                                                                         finish_reason,
+                                                                        parsed=parsed,
                                                                     )
                                                                 else:
                                                                     _cev2 = _mk_sse_event(
@@ -4529,14 +4743,168 @@ class LlmMixin(AuditMixin):
                                                                         ),
                                                                     ).encode()
                                                                 )
+                                                    if refusal_val:
+                                                        _rnorm = refusal_val.replace(
+                                                            '\r\n', '\n'
+                                                        ).replace('\r', '\n')
+                                                        refusal_buf += _rnorm
+                                                        refusal_buf_src.update(_multi_f)
+                                                        refusal_buf_ts = (
+                                                            _time.monotonic()
+                                                        )
+                                                        _out_f = []
+                                                        while '\n' in refusal_buf:
+                                                            _lseg, refusal_buf = (
+                                                                refusal_buf.split(
+                                                                    '\n', 1
+                                                                )
+                                                            )
+                                                            _lseg += '\n'
+                                                            _rrest = await self._pii_response_process(
+                                                                _lseg, active_t2p
+                                                            )
+                                                            _rsafe = _strip_partials(
+                                                                _rrest
+                                                            )
+                                                            if _rsafe:
+                                                                _out_f.append(_rsafe)
+                                                        _ref_extra = (
+                                                            self._extra_prefixes(
+                                                                refusal_buf[-64:]
+                                                            )
+                                                        )
+                                                        _ref_cand = (
+                                                            _has_partial_pii_candidate(
+                                                                refusal_buf[-64:],
+                                                                _ref_extra,
+                                                            )
+                                                        )
+                                                        if refusal_buf and (
+                                                            len(refusal_buf)
+                                                            > LINE_BUF_FLUSH
+                                                            or _time.monotonic()
+                                                            - refusal_buf_ts
+                                                            > LINE_BUF_MAX_AGE
+                                                            or _ref_cand
+                                                        ):
+                                                            _rrest = await self._pii_response_process(
+                                                                refusal_buf, active_t2p
+                                                            )
+                                                            _same_ref = (
+                                                                _rrest == refusal_buf
+                                                            )
+                                                            _rsafe, _rpend = (
+                                                                _split_safe_hold(
+                                                                    _rrest,
+                                                                    active_t2p,
+                                                                    self._pii_scope_or_none(),
+                                                                    extra_prefixes=_ref_extra
+                                                                    if _same_ref
+                                                                    else None,
+                                                                    hold_pii_tail=_same_ref,
+                                                                )
+                                                            )
+                                                            if _rsafe:
+                                                                _rsafe = (
+                                                                    _strip_partials(
+                                                                        _rsafe
+                                                                    )
+                                                                )
+                                                                _out_f.append(_rsafe)
+                                                                if not _ref_cand:
+                                                                    self._count_custom_other_miss()
+                                                            refusal_buf = _rpend
+                                                            refusal_buf_ts = (
+                                                                _time.monotonic()
+                                                            )
+                                                        if _out_f:
+                                                            _ftxt = ''.join(_out_f)
+                                                            _fidx = (
+                                                                _single_mapped_index(
+                                                                    refusal_buf_src,
+                                                                    _idx_refusal,
+                                                                    parsed,
+                                                                )
+                                                            )
+                                                            if _fidx is None:
+                                                                _fev = _mk_sse_event(
+                                                                    parsed=parsed,
+                                                                    refusal=_ftxt,
+                                                                )
+                                                            else:
+                                                                _fev = _mk_sse_event(
+                                                                    parsed=parsed,
+                                                                    refusal_by_index={
+                                                                        _fidx: _ftxt
+                                                                    },
+                                                                )
+                                                            await _tracked_write(
+                                                                _fev.encode()
+                                                            )
+                                                        if (
+                                                            finish_reason
+                                                            and not content
+                                                        ):
+                                                            if refusal_buf:
+                                                                refusal_buf = await self._pii_response_process(
+                                                                    refusal_buf,
+                                                                    active_t2p,
+                                                                )
+                                                                refusal_buf = (
+                                                                    _strip_partials(
+                                                                        refusal_buf
+                                                                    )
+                                                                )
+                                                                _fidx2 = _single_mapped_index(
+                                                                    refusal_buf_src,
+                                                                    _idx_refusal,
+                                                                    parsed,
+                                                                )
+                                                                if _fidx2 is None:
+                                                                    _fev2 = _mk_sse_event(
+                                                                        parsed=parsed,
+                                                                        refusal=refusal_buf,
+                                                                        finish_reason=finish_reason,
+                                                                    )
+                                                                else:
+                                                                    _fev2 = _mk_sse_event(
+                                                                        parsed=parsed,
+                                                                        refusal_by_index={
+                                                                            _fidx2: refusal_buf
+                                                                        },
+                                                                        finish_by_index=(
+                                                                            _idx_finish
+                                                                            or None
+                                                                        ),
+                                                                    )
+                                                                await _tracked_write(
+                                                                    _fev2.encode()
+                                                                )
+                                                                refusal_buf = ''
+                                                                refusal_buf_src.clear()
+                                                                refusal_buf_ts = (
+                                                                    _time.monotonic()
+                                                                )
+                                                            else:
+                                                                await _tracked_write(
+                                                                    _mk_sse_event(
+                                                                        parsed=parsed,
+                                                                        finish_by_index=(
+                                                                            _idx_finish
+                                                                            or None
+                                                                        ),
+                                                                    ).encode()
+                                                                )
                                                     elif (
                                                         'reasoning_content' not in line
                                                         and content == ''
+                                                        and refusal_val == ''
                                                     ):
                                                         # 真正的非 content 事件
                                                         await _flush(
                                                             c=content_buf,
                                                             rc=reasoning_buf,
+                                                            rf=refusal_buf,
                                                         )
                                                         # 10.14 (API-SPEC): 透传前把
                                                         # 暂存的 event:/id: 行拼入同一块
@@ -4695,6 +5063,7 @@ class LlmMixin(AuditMixin):
                                                             )
                                                             content_buf_src.clear()
                                                             reasoning_buf_src.clear()
+                                                            refusal_buf_src.clear()
                                                             continue
                                                         # ── Anthropic Messages API 事件（续行重建路径）──
                                                         if (
@@ -4725,6 +5094,7 @@ class LlmMixin(AuditMixin):
                                                             )
                                                             content_buf_src.clear()
                                                             reasoning_buf_src.clear()
+                                                            refusal_buf_src.clear()
                                                             continue
                                                         if (
                                                             parsed.get('type')
@@ -4748,10 +5118,12 @@ class LlmMixin(AuditMixin):
                                                         # choices（原 choices[0] 只取首路）
                                                         _agg_c = ''
                                                         _agg_rc = None
+                                                        _agg_f = ''
                                                         _agg_fr = None
                                                         _agg_delta = None  # 10.1.1 (R-01): 续行路径补 delta 聚合
                                                         _idx_content = {}
                                                         _idx_reasoning = {}
+                                                        _idx_refusal_c = {}
                                                         _idx_finish = {}
                                                         for _cpos, _ch in enumerate(
                                                             choices
@@ -4791,14 +5163,15 @@ class LlmMixin(AuditMixin):
                                                                 isinstance(_cref, str)
                                                                 and _cref
                                                             ):
-                                                                _agg_c += _cref
-                                                                _idx_content[_cidx] = (
-                                                                    _idx_content.get(
+                                                                _agg_f += _cref
+                                                                _idx_refusal_c[
+                                                                    _cidx
+                                                                ] = (
+                                                                    _idx_refusal_c.get(
                                                                         _cidx, ''
                                                                     )
                                                                     + _cref
                                                                 )
-                                                                _d.pop('refusal', None)
                                                             _rc = _d.get(
                                                                 'reasoning_content'
                                                             )
@@ -4846,6 +5219,7 @@ class LlmMixin(AuditMixin):
                                                                 _idx_finish[_cidx] = _fr
                                                         content = _agg_c
                                                         rc_val = _agg_rc
+                                                        refusal_c_val = _agg_f
                                                         finish_reason = _agg_fr
                                                         # 10.1.1 (R-01): 续行路径曾缺 delta 赋值
                                                         # （3303 elif 引用 NameError/陈旧值）
@@ -4878,10 +5252,12 @@ class LlmMixin(AuditMixin):
                                                             )
                                                             if _rridx is None:
                                                                 _rrev = _mk_sse_event(
+                                                                    parsed=parsed,
                                                                     reasoning_content=rc_restored,
                                                                     finish_reason=(
                                                                         finish_reason
                                                                         if not content
+                                                                        and not refusal_c_val
                                                                         else None
                                                                     ),
                                                                 )
@@ -4895,6 +5271,7 @@ class LlmMixin(AuditMixin):
                                                                         _idx_finish
                                                                         or None
                                                                         if not content
+                                                                        and not refusal_c_val
                                                                         else None
                                                                     ),
                                                                 )
@@ -4924,6 +5301,7 @@ class LlmMixin(AuditMixin):
                                                             )
                                                             if _ccidx is None:
                                                                 _cev3 = _mk_sse_event(
+                                                                    parsed=parsed,
                                                                     content=restored,
                                                                     finish_reason=finish_reason,
                                                                 )
@@ -4941,14 +5319,65 @@ class LlmMixin(AuditMixin):
                                                             await _tracked_write(
                                                                 _cev3.encode(),
                                                             )
+                                                        if refusal_c_val:
+                                                            _fcombined = (
+                                                                refusal_buf
+                                                                + refusal_c_val
+                                                            )
+                                                            _fcidx = (
+                                                                _single_mapped_index(
+                                                                    refusal_buf_src,
+                                                                    _idx_refusal_c,
+                                                                    parsed,
+                                                                )
+                                                            )
+                                                            refusal_buf = ''
+                                                            refusal_buf_src.clear()
+                                                            _frestored = await self._pii_response_process(
+                                                                _fcombined, active_t2p
+                                                            )
+                                                            _frestored = (
+                                                                _strip_partials(
+                                                                    _frestored
+                                                                )
+                                                            )
+                                                            if _fcidx is None:
+                                                                _fev3 = _mk_sse_event(
+                                                                    parsed=parsed,
+                                                                    refusal=_frestored,
+                                                                    finish_reason=(
+                                                                        finish_reason
+                                                                        if not content
+                                                                        else None
+                                                                    ),
+                                                                )
+                                                            else:
+                                                                _fev3 = _mk_sse_event(
+                                                                    parsed=parsed,
+                                                                    refusal_by_index={
+                                                                        _fcidx: _frestored
+                                                                    },
+                                                                    finish_by_index=(
+                                                                        _idx_finish
+                                                                        or None
+                                                                        if not content
+                                                                        else None
+                                                                    ),
+                                                                )
+                                                            await _tracked_write(
+                                                                _fev3.encode(),
+                                                            )
                                                         elif (
                                                             'reasoning_content'
                                                             not in delta
+                                                            and not content
+                                                            and not refusal_c_val
                                                         ):
                                                             # 非 content 事件
                                                             await _flush(
                                                                 c=content_buf,
                                                                 rc=reasoning_buf,
+                                                                rf=refusal_buf,
                                                             )
                                                             await _tracked_write(
                                                                 (
@@ -5071,16 +5500,22 @@ class LlmMixin(AuditMixin):
                                     # 原 3284-3301 在 c4750dc §7 重构时被误缩进进 while True
                                     # 体内，体内 5 分支全 continue/break 无一 fallthrough →
                                     # del 永不执行，byte_buf 单调增长致正常流误判截断+重复 DONE)
+                                    # pos==0 说明本轮无完整行：不得 del（等后续 chunk
+                                    # 补齐成行），由下方 SSE_MAX_BUF 截断接管（与快链同口径）。
                                     if pos > 0:
                                         del byte_buf[:pos]
                                     if len(byte_buf) > SSE_MAX_BUF:
                                         logger.warning(
                                             'SSE 缓冲区超过 1MB 上限，保留最后一个部分行'
                                         )
+                                        # 5.5 (D6.5): 截断补 \r 边界，与快链
+                                        # max(\n,\r) 同口径（\r/\r\n 分隔流对齐）
                                         last_nl = byte_buf.rfind(b'\n')
-                                        if last_nl >= 0:
+                                        last_cr = byte_buf.rfind(b'\r')
+                                        last_safe = max(last_nl, last_cr)
+                                        if last_safe >= 0:
                                             byte_buf = bytearray(
-                                                byte_buf[last_nl + 1 :]
+                                                byte_buf[last_safe + 1 :]
                                             )
                                         if len(byte_buf) > SSE_MAX_BUF:
                                             byte_buf = bytearray()
@@ -5212,11 +5647,20 @@ class LlmMixin(AuditMixin):
                                         # 「交由下方统一处理」落空，快链 3922 有 dispatch
                                         # 慢链没有 → 双链不对称）
                                         if data_buffer:
-                                            _cr_payload = '\n'.join(data_buffer)
+                                            # 5.5 (D6.4): 直迭代条目，不拼接后整体解析
+                                            _cr_entries = [
+                                                _e
+                                                for _e in list(data_buffer)
+                                                if _e.strip()
+                                            ]
                                             data_buffer.clear()
-                                            if _cr_payload.strip():
-                                                sse_event_count += 1
-                                                if _cr_payload.strip() == '[DONE]':
+                                            if _cr_entries:
+                                                sse_event_count += len(_cr_entries)
+                                                if (
+                                                    len(_cr_entries) == 1
+                                                    and _cr_entries[0].strip()
+                                                    == '[DONE]'
+                                                ):
                                                     seen_global_terminal = True
                                                 # 9.4 补 (F-04): CR-only 行若含
                                                 # finish_reason（chat）或终止事件类型
@@ -5225,17 +5669,12 @@ class LlmMixin(AuditMixin):
                                                 # 绕过主循环 JSON 解析，finish_reason
                                                 # 不会被 _seen_any_finish 捕获）
                                                 else:
-                                                    # 10.8.1 (F-08): join 后一次
-                                                    # json.loads 对多 data 行（WHATWG
-                                                    # 同事件多行 `{a}\n{b}`）必失败 →
-                                                    # 逐个条目分别解析判断终止，任一
-                                                    # 含 finish_reason/终止类型即置位
-                                                    # （data_buffer 已 clear，用
-                                                    # _cr_payload 按行切回条目）
+                                                    # 10.8.1 (F-08): 多 data 行（WHATWG
+                                                    # 同事件多行）逐个条目分别解析判断终止，
+                                                    # 任一含 finish_reason/终止类型即置位
+                                                    # （5.5 直迭代 _cr_entries，不拼接）
                                                     _cr_term_found = False
-                                                    for _cr_entry in _cr_payload.split(
-                                                        '\n'
-                                                    ):
+                                                    for _cr_entry in _cr_entries:
                                                         _cr_entry_plain = (
                                                             _cr_entry.strip()
                                                         )
@@ -5304,9 +5743,7 @@ class LlmMixin(AuditMixin):
                                                 # [DONE] 在后；不能整体 join 后单次传
                                                 # —— [DONE] 行会丢 data: 前缀混入
                                                 # content 块（SDK JSONDecodeError）。
-                                                for _cr_line_out in _cr_payload.split(
-                                                    '\n'
-                                                ):
+                                                for _cr_line_out in _cr_entries:
                                                     if not _cr_line_out.strip():
                                                         continue
                                                     # 10.14.1 (API-SPEC FIX):
@@ -5471,7 +5908,7 @@ class LlmMixin(AuditMixin):
                                     active_t2p,
                                     keep_pending=False,
                                 )
-                            elif content_buf or reasoning_buf:
+                            elif content_buf or reasoning_buf or refusal_buf:
                                 if content_buf:
                                     content_buf = await self._pii_response_process(
                                         content_buf, active_t2p
@@ -5482,7 +5919,12 @@ class LlmMixin(AuditMixin):
                                         reasoning_buf, active_t2p
                                     )
                                     reasoning_buf = _strip_partials(reasoning_buf)
-                                if content_buf or reasoning_buf:
+                                if refusal_buf:
+                                    refusal_buf = await self._pii_response_process(
+                                        refusal_buf, active_t2p
+                                    )
+                                    refusal_buf = _strip_partials(refusal_buf)
+                                if content_buf or reasoning_buf or refusal_buf:
                                     # D1 流末残余改走结构保留重建（单路可映射时；
                                     # 多路/无映射回退原最小事件，不丢文本）
                                     _eec = _single_mapped_index(
@@ -5495,11 +5937,21 @@ class LlmMixin(AuditMixin):
                                         {},
                                         slow_last_chat_parsed,
                                     )
+                                    _eef = _single_mapped_index(
+                                        refusal_buf_src,
+                                        {},
+                                        slow_last_chat_parsed,
+                                    )
                                     if (
                                         isinstance(slow_last_chat_parsed, dict)
-                                        and (_eec is not None or _eer is not None)
+                                        and (
+                                            _eec is not None
+                                            or _eer is not None
+                                            or _eef is not None
+                                        )
                                         and (not content_buf or _eec is not None)
                                         and (not reasoning_buf or _eer is not None)
+                                        and (not refusal_buf or _eef is not None)
                                     ):
                                         _eev = _mk_sse_event(
                                             parsed=slow_last_chat_parsed,
@@ -5513,11 +5965,18 @@ class LlmMixin(AuditMixin):
                                                 if _eer is not None
                                                 else None
                                             ),
+                                            refusal_by_index=(
+                                                {_eef: refusal_buf}
+                                                if _eef is not None
+                                                else None
+                                            ),
                                         )
                                     else:
                                         _eev = _mk_sse_event(
+                                            parsed=slow_last_chat_parsed,
                                             content=content_buf,
                                             reasoning_content=reasoning_buf,
+                                            refusal=refusal_buf,
                                         )
                                     try:
                                         await _tracked_write(_eev.encode())
@@ -5842,9 +6301,11 @@ class LlmMixin(AuditMixin):
                             fast_line_buf: str = ''
                             fast_line_buf_ts = _time.monotonic()
                             # 3.1 (D5): 快链 reasoning 独立缓冲实例，与 content 共用
-                            # 同一 16KB/30s 阈值语义（不另设阈值）；refusal 并入 content
+                            # 同一 16KB/30s 阈值语义（不另设阈值）；5.4 refusal 独立缓冲同阈值
                             fast_reasoning_buf: str = ''
                             fast_reasoning_buf_ts = _time.monotonic()
+                            fast_refusal_buf: str = ''
+                            fast_refusal_buf_ts = _time.monotonic()
                             # D1 流末合成重建用：最近一次 chat chunk 解析对象
                             fast_last_chat_parsed = None
 
@@ -5871,6 +6332,7 @@ class LlmMixin(AuditMixin):
                                 nonlocal fast_seen_terminal, fast_seen_global_terminal
                                 nonlocal fast_line_buf, fast_line_buf_ts
                                 nonlocal fast_reasoning_buf, fast_reasoning_buf_ts
+                                nonlocal fast_refusal_buf, fast_refusal_buf_ts
                                 nonlocal fast_last_chat_parsed
                                 nonlocal resp_log_path, _debug_saved
                                 # 终止判定（结构化解析，7.3 语义）
@@ -5954,13 +6416,15 @@ class LlmMixin(AuditMixin):
                                 else:
                                     # 提取 content/reasoning/refusal 文本累积行缓冲
                                     # （仅 chat/completions choices delta；其他载荷走
-                                    # 完整 JSON-aware）。refusal 并入 content（与慢链
-                                    # 同语义：pop 后合并，逐路累积）；reasoning 独立
-                                    # 累积，与 content 共用同一 16KB/30s 阈值语义。
+                                    # 完整 JSON-aware）。5.4 refusal 独立累积独立重建，
+                                    # 不并入 content；reasoning/refusal 均与 content 共用
+                                    # 同一 16KB/30s 阈值语义（缓冲实例独立）。
                                     _fast_text = ''
                                     _fast_reason = ''
+                                    _fast_ref = ''
                                     _fp_idx_text: dict[int, str] = {}
                                     _fp_idx_reason: dict[int, str] = {}
+                                    _fp_idx_ref: dict[int, str] = {}
                                     _fp = None
                                     try:
                                         _fp = json.loads(_payload)
@@ -5977,20 +6441,19 @@ class LlmMixin(AuditMixin):
                                                     continue
                                                 _fidx = _chat_choice_index(_ch, _fpos)
                                                 _ct = _d.get('content')
-                                                _cref = _d.get('refusal')
-                                                if isinstance(_cref, str) and _cref:
-                                                    _d.pop('refusal', None)
-                                                    _ct = (
-                                                        (_ct or '') + _cref
-                                                        if isinstance(_ct, str)
-                                                        else _cref
-                                                    )
                                                 if isinstance(_ct, str) and _ct:
                                                     _fp_idx_text[_fidx] = (
                                                         _fp_idx_text.get(_fidx, '')
                                                         + _ct
                                                     )
                                                     _fast_text += _ct
+                                                _cref = _d.get('refusal')
+                                                if isinstance(_cref, str) and _cref:
+                                                    _fp_idx_ref[_fidx] = (
+                                                        _fp_idx_ref.get(_fidx, '')
+                                                        + _cref
+                                                    )
+                                                    _fast_ref += _cref
                                                 _rc = _d.get('reasoning_content')
                                                 if _rc is None:
                                                     _rc = _d.get('reasoning')
@@ -6003,11 +6466,13 @@ class LlmMixin(AuditMixin):
                                     except Exception:
                                         _fast_text = ''
                                         _fast_reason = ''
+                                        _fast_ref = ''
                                         _fp_idx_text = {}
                                         _fp_idx_reason = {}
+                                        _fp_idx_ref = {}
                                     if isinstance(_fp, dict) and _fp.get('choices'):
                                         fast_last_chat_parsed = _fp
-                                    if _fast_text or _fast_reason:
+                                    if _fast_text or _fast_reason or _fast_ref:
                                         # D1 逐路还原：多路 chunk 各路文本独立还原，
                                         # 禁止拼合后广播同一文本（n=2 串扰）。
                                         async def _restore_idx_text(
@@ -6033,11 +6498,20 @@ class LlmMixin(AuditMixin):
                                             if _fast_reason
                                             else None
                                         )
+                                        _bypass_extra_f = (
+                                            self._extra_prefixes(_fast_ref[-64:])
+                                            if _fast_ref
+                                            else None
+                                        )
                                         if (
                                             not self._pii_active()
                                             and not fast_line_buf
                                             and not fast_reasoning_buf
-                                            and len(_fast_text) + len(_fast_reason) < 64
+                                            and not fast_refusal_buf
+                                            and len(_fast_text)
+                                            + len(_fast_reason)
+                                            + len(_fast_ref)
+                                            < 64
                                             and not _has_partial_pii_candidate(
                                                 _fast_text[-64:] if _fast_text else '',
                                                 _bypass_extra_t,
@@ -6047,6 +6521,10 @@ class LlmMixin(AuditMixin):
                                                 if _fast_reason
                                                 else '',
                                                 _bypass_extra_r,
+                                            )
+                                            and not _has_partial_pii_candidate(
+                                                _fast_ref[-64:] if _fast_ref else '',
+                                                _bypass_extra_f,
                                             )
                                         ):
                                             _safe_by_idx = {}
@@ -6059,16 +6537,35 @@ class LlmMixin(AuditMixin):
                                                 _s = await _restore_idx_text(_ft)
                                                 if _s:
                                                     _safe_reason_by_idx[_fi] = _s
-                                            if _safe_by_idx or _safe_reason_by_idx:
+                                            _safe_ref_by_idx = {}
+                                            for _fi, _ft in _fp_idx_ref.items():
+                                                _s = await _restore_idx_text(_ft)
+                                                if _s:
+                                                    _safe_ref_by_idx[_fi] = _s
+                                            if (
+                                                _safe_by_idx
+                                                or _safe_reason_by_idx
+                                                or _safe_ref_by_idx
+                                            ):
                                                 _restored_payload = _fast_rebuild_chunk(
                                                     _fp,
                                                     _safe_by_idx,
                                                     _safe_reason_by_idx or None,
+                                                    _safe_ref_by_idx or None,
                                                 )
                                             else:
                                                 return
-                                        elif len(_fp_idx_text) > 1 or (
-                                            not _fast_text and len(_fp_idx_reason) > 1
+                                        elif (
+                                            len(_fp_idx_text) > 1
+                                            or (
+                                                not _fast_text
+                                                and len(_fp_idx_reason) > 1
+                                            )
+                                            or (
+                                                not _fast_text
+                                                and not _fast_reason
+                                                and len(_fp_idx_ref) > 1
+                                            )
                                         ):
                                             _safe_by_idx: dict[int, str] = {}
                                             for _fi, _ft in _fp_idx_text.items():
@@ -6080,7 +6577,16 @@ class LlmMixin(AuditMixin):
                                                 _s = await _restore_idx_text(_ft)
                                                 if _s:
                                                     _safe_reason_by_idx[_fi] = _s
-                                            if _safe_by_idx or _safe_reason_by_idx:
+                                            _safe_ref_by_idx: dict[int, str] = {}
+                                            for _fi, _ft in _fp_idx_ref.items():
+                                                _s = await _restore_idx_text(_ft)
+                                                if _s:
+                                                    _safe_ref_by_idx[_fi] = _s
+                                            if (
+                                                _safe_by_idx
+                                                or _safe_reason_by_idx
+                                                or _safe_ref_by_idx
+                                            ):
                                                 # 10.14 (API-SPEC): 保留 chunk JSON 结构，
                                                 # 按 choices[i].index 逐路替换 delta.content
                                                 # （原实现把整个 payload 换成裸文本，
@@ -6090,6 +6596,7 @@ class LlmMixin(AuditMixin):
                                                     _fp,
                                                     _safe_by_idx,
                                                     _safe_reason_by_idx or None,
+                                                    _safe_ref_by_idx or None,
                                                 )
                                             else:
                                                 return
@@ -6226,11 +6733,81 @@ class LlmMixin(AuditMixin):
                                                     _emit_reason_map = {
                                                         _single_ridx: ''.join(_out_r)
                                                     }
-                                            if _emit_content_map or _emit_reason_map:
+                                            _emit_ref_map = None
+                                            if _fast_ref:
+                                                fast_refusal_buf += _fast_ref
+                                                fast_refusal_buf_ts = _time.monotonic()
+                                                _out_f = []
+                                                while '\n' in fast_refusal_buf:
+                                                    _seg, fast_refusal_buf = (
+                                                        fast_refusal_buf.split('\n', 1)
+                                                    )
+                                                    _seg += '\n'
+                                                    _rest = await self._pii_response_process(
+                                                        _seg, active_t2p
+                                                    )
+                                                    _safe = _strip_partials(_rest)
+                                                    if _safe:
+                                                        _out_f.append(_safe)
+                                                _ref_extra_2 = self._extra_prefixes(
+                                                    fast_refusal_buf[-64:]
+                                                )
+                                                _ref_cand_2 = (
+                                                    _has_partial_pii_candidate(
+                                                        fast_refusal_buf[-64:],
+                                                        _ref_extra_2,
+                                                    )
+                                                )
+                                                if fast_refusal_buf and (
+                                                    len(fast_refusal_buf)
+                                                    > LINE_BUF_FLUSH
+                                                    or _time.monotonic()
+                                                    - fast_refusal_buf_ts
+                                                    > LINE_BUF_MAX_AGE
+                                                    or _ref_cand_2
+                                                ):
+                                                    _rest = await self._pii_response_process(
+                                                        fast_refusal_buf,
+                                                        active_t2p,
+                                                    )
+                                                    _same_ref_2 = (
+                                                        _rest == fast_refusal_buf
+                                                    )
+                                                    _safe, _pend = _split_safe_hold(
+                                                        _rest,
+                                                        active_t2p,
+                                                        self._pii_scope_or_none(),
+                                                        extra_prefixes=_ref_extra_2
+                                                        if _same_ref_2
+                                                        else None,
+                                                        hold_pii_tail=_same_ref_2,
+                                                    )
+                                                    if _safe:
+                                                        _safe = _strip_partials(_safe)
+                                                        _out_f.append(_safe)
+                                                        if not _ref_cand_2:
+                                                            self._count_custom_other_miss()
+                                                    fast_refusal_buf = _pend
+                                                    fast_refusal_buf_ts = (
+                                                        _time.monotonic()
+                                                    )
+                                                if _out_f:
+                                                    _single_fidx = next(
+                                                        iter(_fp_idx_ref), 0
+                                                    )
+                                                    _emit_ref_map = {
+                                                        _single_fidx: ''.join(_out_f)
+                                                    }
+                                            if (
+                                                _emit_content_map
+                                                or _emit_reason_map
+                                                or _emit_ref_map
+                                            ):
                                                 _restored_payload = _fast_rebuild_chunk(
                                                     _fp,
                                                     _emit_content_map or {},
                                                     _emit_reason_map,
+                                                    _emit_ref_map,
                                                 )
                                             else:
                                                 # 无完整行可发：跳过本次 emit（行内持有）
@@ -6326,36 +6903,36 @@ class LlmMixin(AuditMixin):
                                             errors='replace',
                                         )
                                         if line == '':
-                                            # 空行：dispatch 聚合的 data_buffer
+                                            # 空行：dispatch 聚合的 fast_data_buffer
+                                            # 5.5 (D6.4): 逐条独立还原按原序输出，不拼接整体 loads
                                             if fast_data_buffer:
-                                                _fast_payload = '\n'.join(
-                                                    fast_data_buffer
-                                                )
+                                                _fast_entries = list(fast_data_buffer)
                                                 fast_data_buffer.clear()
-                                                # 空 data 行不计为有效事件
-                                                if not _fast_payload.strip():
-                                                    continue
-                                                fast_sse_event_count += 1
-                                                # 可观测性：捕获 usage（fast 链）
-                                                _capture_usage_ctx(
-                                                    _fast_payload,
-                                                    _metrics_ctx,
-                                                    'anthropic'
-                                                    if tail.rstrip('/').endswith(
-                                                        'v1/messages'
-                                                    )
-                                                    else (
-                                                        'responses'
+                                                for _single in _fast_entries:
+                                                    # 空 data 行不计为有效事件
+                                                    if not _single.strip():
+                                                        continue
+                                                    fast_sse_event_count += 1
+                                                    # 可观测性：捕获 usage（fast 链逐条）
+                                                    _capture_usage_ctx(
+                                                        _single,
+                                                        _metrics_ctx,
+                                                        'anthropic'
                                                         if tail.rstrip('/').endswith(
-                                                            'v1/responses'
+                                                            'v1/messages'
                                                         )
-                                                        else 'openai'
-                                                    ),
-                                                )
-                                                if _fast_payload.strip() == '[DONE]':
-                                                    fast_seen_terminal = True
-                                                    fast_seen_global_terminal = True
-                                                await _fast_emit_data(_fast_payload)
+                                                        else (
+                                                            'responses'
+                                                            if tail.rstrip(
+                                                                '/'
+                                                            ).endswith('v1/responses')
+                                                            else 'openai'
+                                                        ),
+                                                    )
+                                                    if _single.strip() == '[DONE]':
+                                                        fast_seen_terminal = True
+                                                        fast_seen_global_terminal = True
+                                                    await _fast_emit_data(_single)
                                             continue
                                         if line.startswith(':'):
                                             await _tracked_write(
@@ -6520,16 +7097,17 @@ class LlmMixin(AuditMixin):
                                                     + '\n\n'
                                                 ).encode('utf-8')
                                             )
-                            # data_buffer 残留 → dispatch
+                            # fast_data_buffer 残留 → 逐条 dispatch（5.5，不拼接）
                             if fast_data_buffer:
-                                _fast_payload = '\n'.join(fast_data_buffer)
+                                _fast_tail = list(fast_data_buffer)
                                 fast_data_buffer.clear()
-                                if _fast_payload.strip():
-                                    fast_sse_event_count += 1
-                                    if _fast_payload.strip() == '[DONE]':
-                                        fast_seen_terminal = True
-                                        fast_seen_global_terminal = True
-                                    await _fast_emit_data(_fast_payload)
+                                for _single in _fast_tail:
+                                    if _single.strip():
+                                        fast_sse_event_count += 1
+                                        if _single.strip() == '[DONE]':
+                                            fast_seen_terminal = True
+                                            fast_seen_global_terminal = True
+                                        await _fast_emit_data(_single)
                             # 10.13 (F-12): 流末 event_pending 残留透传 ——
                             # data 行始终没来（异常流）时，不能把 event 行闷掉；
                             # 透传保留原始信息，客户端自行容错。
@@ -6619,6 +7197,41 @@ class LlmMixin(AuditMixin):
                                         )
                                     await _tracked_write(_tail_ev.encode('utf-8'))
                                 fast_reasoning_buf = ''
+                            if fast_refusal_buf:
+                                _rest = await self._pii_response_process(
+                                    fast_refusal_buf, active_t2p
+                                )
+                                _safe = _strip_partials(_rest)
+                                if _safe:
+                                    fast_sse_event_count += 1
+                                    if isinstance(fast_last_chat_parsed, dict):
+                                        _tail_fbi: dict[int, str] | None = {}
+                                        try:
+                                            _tail_choices = (
+                                                fast_last_chat_parsed.get('choices')
+                                                or []
+                                            )
+                                        except AttributeError:
+                                            _tail_choices = []
+                                        for _tpos, _tch in enumerate(_tail_choices):
+                                            if not isinstance(_tch, dict):
+                                                continue
+                                            _td = _tch.get('delta')
+                                            if isinstance(_td, dict) and isinstance(
+                                                _td.get('refusal'), str
+                                            ):
+                                                _tail_fbi[
+                                                    _chat_choice_index(_tch, _tpos)
+                                                ] = _safe
+                                                break
+                                        _tail_ev = _mk_sse_event(
+                                            parsed=fast_last_chat_parsed,
+                                            refusal_by_index=_tail_fbi or None,
+                                        )
+                                    else:
+                                        _tail_ev = _mk_sse_event(refusal=_safe)
+                                    await _tracked_write(_tail_ev.encode('utf-8'))
+                                fast_refusal_buf = ''
                             # ── fast 截断检测 ──
                             _fast_truncated = False
                             # 11.2 (TSS-01): 已 complete（fast_seen_global_terminal=true）

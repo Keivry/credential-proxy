@@ -645,6 +645,48 @@ class TestNestedToolArgsSpecialChars:
         assert inner_parsed['key'] == pwd
 
     @pytest.mark.asyncio
+    async def test_nested_quote_argbuf_accumulated(self, proxy):
+        """5.2 整段还原断言必需：partial_json 两段累积后双层 loads 语义一致。"""
+        pwd = 'p@ss"quote'
+        tok = '__VG_CRED_000001__'
+        active = {tok: pwd}
+        mid = len(tok) // 2
+        frag1 = '{"key": "' + tok[:mid]
+        frag2 = tok[mid:] + '"}'
+        arg_accumulated = frag1 + frag2
+        assert _json.loads(arg_accumulated) == {'key': tok}
+        payload = _json.dumps(
+            {
+                'choices': [
+                    {
+                        'delta': {
+                            'tool_calls': [
+                                {
+                                    'index': 0,
+                                    'function': {
+                                        'name': 'x',
+                                        'arguments': arg_accumulated,
+                                    },
+                                }
+                            ]
+                        },
+                        'index': 0,
+                    }
+                ],
+                'object': 'chat.completion.chunk',
+            },
+            ensure_ascii=False,
+            separators=(',', ':'),
+        )
+        out_line = await proxy._pii_process_sse_line('data: ' + payload, active)
+        assert out_line.startswith('data: ')
+        outer_parsed = _json.loads(out_line[5:].lstrip())
+        args_str = outer_parsed['choices'][0]['delta']['tool_calls'][0]['function'][
+            'arguments'
+        ]
+        assert _json.loads(args_str) == {'key': pwd}
+
+    @pytest.mark.asyncio
     async def test_nested_with_u_escape_and_backslash(self):
         """\\u 转义 + \\ 嵌套同路径不破坏."""
         cp = _CredProxy()

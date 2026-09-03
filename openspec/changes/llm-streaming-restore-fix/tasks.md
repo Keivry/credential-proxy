@@ -30,7 +30,7 @@
 
 ## 3. 跨片 token 安全（D5）
 
-- [x] 3.1 扩展候选感知并对齐快慢链：`_has_partial_pii_candidate` 覆盖内置全类型 + `__VG_CRED__/__PII__` 前缀，自定义 best-effort，移除 fast <64 直接透传快路，`reasoning/refusal` 纳入同行缓冲
+- [x] 3.1 扩展候选感知并对齐快慢链：`_has_partial_pii_candidate` 覆盖内置全类型 + `__VG_CRED__/__PII__` 前缀，自定义按已加载前缀持有、未命中透传并计数，移除 fast <64 直接透传快路，`reasoning/refusal` 纳入同行缓冲
   - Verify: 行为断言：`user@exa` + `mple.com` 跨 `data:` 切分时前段 `bytes_written` 不增（不提前发出），重组后下游 `json.loads` 成功（新增跨片用例通过）
   - Verify: 行为断言：完整响应期 token 尾不被 `_strip_partials` 误删，下游零 `__PII__` 残留（保留语义用例通过）
   - Verify: 行为断言：`__VG_CRED_000` + `001__` 跨包重组后整体还原，下游 `json.loads` 成功
@@ -44,8 +44,30 @@
 
 ## 4. 回归验证
 
-- [x] 4.1 三协议回归 + 规范检查：跑全量相关测试与 lint（实测：701 passed / 9 env-missing(openai/anthropic可选依赖) + 1 flaky(test_redos_consecutive_disable负载抖动)）
+- [x] 4.1 三协议回归 + 规范检查：跑全量相关测试与 lint（实测：707 passed / 9 env-missing(openai/anthropic可选依赖) + 1 flaky(0.1s连续超时时序抖动，同树一挂一过)）
   <!-- 备注（仅参考，不作验收依据）：历史某次全量约 699 passed / 9 env-missing(openai/anthropic可选依赖) + 1 flaky(test_redos_consecutive_disable负载抖动) -->
   - Verify: `PYTHONPATH="." pytest -q tests/sse_stream_loop_test.py tests/llm_test.py tests/pii_stream_integration_test.py tests/api_spec_conformance_test.py` 全绿
   - Verify: `ruff check` 与 `ruff format --check` 通过
   - Verify: `openspec validate --change llm-streaming-restore-fix` 通过（无 zero-delta 报错）
+
+## 5. 返工收尾（D6）
+
+- [x] 5.1 死代码 `_release_pending_once` 删除或接线：二选一收敛，`tasks.md` 1.3 描述与代码调用关系一致
+  - Verify: 白名单 grep：`grep -rn "_release_pending_once" _llm.py` 输出为空（已删除），或放行路径唯一经由它做单次还原（`grep tool_calls_pending_events` 审计还原调用点唯一且与其接线）
+  - Verify: 行为断言：`tasks.md` 1.3 的任务描述与 `_llm.py` 实际调用关系一致（删除则不描述经由它还原，接线则描述其为唯一还原点），占位符缓冲放行后下游 `json.loads` 成功且零残留
+
+- [x] 5.2 补齐三个最小断言：`id/usage` 一致、`n=2` 独立（用例落 `tests/sse_stream_loop_test.py`）、`p@ss"quote` 整段还原（用例落 `tests/pii_llm_test.py` 整段语义等价）
+  - Verify: 行为断言：含 `id/created/model/usage` 的上游 chunk 经还原后下游同事件 `id/created/model` 逐字节一致且 `usage` 数值不变（新增用例通过）
+  - Verify: 行为断言：`n=2` 双路不同占位符文本经还原后各路为各自明文且 `finish_reason` 按 `index` 保留（新增逐路用例通过）；`p@ss"quote` 参数经攒整段 flush 后下游 `json.loads` 成功且语义一致（新增用例通过）
+
+- [x] 5.3 收敛回退语义为透传原行：`_single_mapped_index` 为 None 时透传原行或带回 `id/model`
+  - Verify: 行为断言：`index` 缺失的畸形 chunk 经处理后下游收到的 `id/model/choices` 与上游一致（透传分支），下游 `json.loads` 成功
+  - Verify: 行为断言：若走重建分支，重建出的 `data:` 含上游 `id/model` 字段；白名单 grep：回退路径无裸最小事件拼装（`grep -n "_mk_sse_event\|_build_block_event" _llm.py` 回退分支零命中或全带 `id/model` 回填）
+
+- [x] 5.4 明确 refusal 独立字段语义：独立重建不并入 `content`，或维持合并则写明下游契约变更
+  - Verify: 行为断言：`delta.refusal` 含占位符的分片经还原后下游 `delta.refusal` 独立存在且为还原文本，同期 `delta.content` 不混入 refusal 文本（新增用例通过）
+  - Verify: 若维持合并实现：`specs/rework-followup/spec.md` 内 refusal Requirement 已同步写明合并语义与下游契约变更，且对应用例按合并语义断言（无独立 `delta.refusal` 断言残留）
+
+- [x] 5.5 多 data 行逐条解析 + 慢链截断补 `\r`：与快链 `max(\n,\r)` 对齐
+  - Verify: 行为断言：同事件多行 `data:` 各行含占位符时逐行还原按原序输出，下游每行 `json.loads` 成功且零残留（新增用例通过）；白名单 grep：`data_buffer` 聚合路径无 `\n` 拼接后整体 `loads`（`grep -n "join" _llm.py` 聚合分支零命中）
+  - Verify: 行为断言：`\r` / `\r\n` 分隔流触发 `SSE_MAX_BUF` 截断后快慢链切出行数一致，残留不与后续事件叠加（连续两流 `bytes_written` 独立计数无串扰）

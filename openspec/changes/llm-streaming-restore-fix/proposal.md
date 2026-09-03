@@ -17,6 +17,7 @@ LLM 脱敏反向代理在 SSE 流式还原路径上存在结构破坏与语义�
 - `streaming-restore-fidelity`: SSE 流式还原的结构保真（事件重建保留上游结构、多行块逐行还原、序列化口径统一）。
 - `tool-call-integrity`: 工具调用完整性（参数攒整段、完成事件单次 flush、阻断后不泄漏残缺参数、不误杀正常 content）。
 - `cross-shard-token-safety`: 跨分片 token 安全（残缺前缀 hold、候选感知扩展、fast/slow 行缓冲对齐、无换行持有上限）。
+- `rework-followup`: 返工收尾（死代码去留收敛、最小断言三件套、回退透传语义、refusal 独立重建、多 data 行逐条解析与截断对齐）。
 
 ### Modified Capabilities
 

@@ -134,6 +134,40 @@ async def make_upstream():
                 ).encode()
             )
             await resp.write(b'data: [DONE]\n\n')
+        elif case == 'refusal_restore':
+            # 5.4：请求期 token 在 refusal 独立字段回显 → 还原为明文且不并入 content
+            await resp.write(
+                (
+                    'data: {"choices":[{"index":0,"delta":{"content":"正常内容"}}]}\n\n'
+                ).encode()
+            )
+            await resp.write(
+                (
+                    'data: {"choices":[{"index":0,"delta":{"refusal":"拒绝 '
+                    + tok
+                    + '"}}]}\n\n'
+                ).encode()
+            )
+            await resp.write(
+                b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+            )
+            await resp.write(b'data: [DONE]\n\n')
+        elif case == 'multi_data_restore':
+            # 5.5：同事件多行 data 逐条还原（慢链）：两行各带占位符同一事件块
+            await resp.write(
+                (
+                    'data: {"choices":[{"index":0,"delta":{"content":"第一段 '
+                    + tok
+                    + '"}}]}\n'
+                    'data: {"choices":[{"index":0,"delta":{"content":"第二段 '
+                    + tok
+                    + '"}}]}\n\n'
+                ).encode()
+            )
+            await resp.write(
+                b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+            )
+            await resp.write(b'data: [DONE]\n\n')
         elif case == 'cr_only_eof':
             # 9.4 (F-04): CR-only 行（无 LF）在流末正确 dispatch——
             # 末行以 \r 结尾且带 finish_reason=stop（终止事件），EOF 时
@@ -315,6 +349,45 @@ async def test_integration_refusal_line_buffer():
         assert '13800138000' not in raw
         assert '拒绝' in raw
         assert 'data: [DONE]' in raw
+
+
+@pytest.mark.asyncio
+async def test_integration_refusal_independent_restore():
+    """5.4：refusal 独立字段还原 —— 占位符分片经还原后下游 delta.refusal
+    独立存在且为还原文本，同期 delta.content 不混入 refusal 文本。"""
+    async with env(), ClientSession() as s:
+        body = json.dumps(
+            {
+                'case': 'refusal_restore',
+                'messages': [{'role': 'user', 'content': '我的号码是 13800138000'}],
+            }
+        )
+        async with s.post(CHAT_BASE, headers=HEADERS, data=body) as r:
+            assert r.status == 200
+            raw = await r.text()
+    assert '__PII_' not in raw
+    data_lines = [ln for ln in raw.splitlines() if ln.startswith('data:')]
+    objs = [
+        json.loads(ln[5:].lstrip())
+        for ln in data_lines
+        if ln[5:].lstrip().startswith('{')
+    ]
+    refusals = [
+        c['delta']['refusal']
+        for o in objs
+        for c in o.get('choices', [])
+        if isinstance(c.get('delta'), dict) and 'refusal' in c['delta']
+    ]
+    assert refusals, f'下游缺 delta.refusal 独立字段: {raw!r}'
+    assert any('拒绝 13800138000' in v for v in refusals)
+    contents = [
+        c['delta']['content']
+        for o in objs
+        for c in o.get('choices', [])
+        if isinstance(c.get('delta'), dict) and 'content' in c['delta']
+    ]
+    assert any('正常内容' in v for v in contents)
+    assert all('拒绝' not in v for v in contents), f'content 混入 refusal: {raw!r}'
 
 
 @pytest.mark.asyncio
@@ -531,3 +604,40 @@ async def test_integration_cr_only_done():
         # 无合成截断（[DONE] 恰 1 个，来自 CR-only 透传）
         assert 'TRUNCATED_MESSAGE' not in raw and '被截断' not in raw
         assert raw.count('data: [DONE]') == 1, f'[DONE] 数量异常: {raw!r}'
+
+
+@pytest.mark.asyncio
+async def test_multi_data_lines_restore_in_order():
+    """5.5：同事件多行 data 各行占位符逐条还原，按原序输出零残留。"""
+    async with env(), ClientSession() as s:
+        body = json.dumps(
+            {
+                'case': 'multi_data_restore',
+                'messages': [{'role': 'user', 'content': '我的号码是 13800138000'}],
+            }
+        )
+        async with s.post(CHAT_BASE, headers=HEADERS, data=body) as r:
+            assert r.status == 200
+            raw = await r.text()
+        assert '__PII_' not in raw, f'多 data 行还原残留: {raw!r}'
+        assert '__VG_CRED_' not in raw, f'多 data 行还原残留: {raw!r}'
+        data_lines = [ln for ln in raw.splitlines() if ln.startswith('data:')]
+        assert len(data_lines) >= 3
+        for ln in data_lines:
+            if ln[5:].lstrip() == '[DONE]':
+                continue
+            json.loads(ln[5:].lstrip())
+        contents = []
+        for ln in data_lines:
+            if ln[5:].lstrip() == '[DONE]':
+                continue
+            obj = json.loads(ln[5:].lstrip())
+            if isinstance(obj, dict):
+                for c in obj.get('choices', []) or []:
+                    d = c.get('delta', {}) if isinstance(c, dict) else {}
+                    if isinstance(d, dict) and isinstance(d.get('content'), str):
+                        contents.append(d['content'])
+        i1 = next(i for i, t in enumerate(contents) if '第一段' in t)
+        i2 = next(i for i, t in enumerate(contents) if '第二段' in t)
+        assert i1 < i2, f'多 data 行未按原序输出: {contents!r}'
+        assert sum(t.count('13800138000') for t in contents) >= 2

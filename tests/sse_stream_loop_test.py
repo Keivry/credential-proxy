@@ -89,6 +89,29 @@ async def make_upstream():
                 b'"delta":{"type":"text_delta","text":"spaced"}}\n\n'
             )
             await resp.write(b'data: {"type":"message_stop"}\n\n')
+        elif case == 'restore_fidelity':
+            # 5.2 事件重建保真：上游 chunk 含 id/created/model/usage
+            await resp.write(
+                b'data: {"id":"chatcmpl_1","object":"chat.completion.chunk",'
+                b'"created":1234567890,"model":"gpt-4o","choices":[{"index":0,'
+                b'"delta":{"content":"hello"},"finish_reason":null}]}\n\n'
+            )
+            await resp.write(
+                b'data: {"id":"chatcmpl_1","object":"chat.completion.chunk",'
+                b'"created":1234567890,"model":"gpt-4o","choices":[{"index":0,'
+                b'"delta":{"content":" world"},"finish_reason":"stop"}],'
+                b'"usage":{"prompt_tokens":10,"completion_tokens":5,'
+                b'"total_tokens":15}}\n\n'
+            )
+        elif case == 'choices_n2':
+            # 5.2 n=2 双路：同事件两路不同 content/finish_reason
+            await resp.write(
+                b'data: {"id":"chatcmpl_1","object":"chat.completion.chunk",'
+                b'"created":1234567890,"model":"gpt-4o","choices":[{"index":0,'
+                b'"delta":{"content":"alpha"},"finish_reason":"stop"},'
+                b'{"index":1,'
+                b'"delta":{"content":"beta"},"finish_reason":"tool_calls"}]}\n\n'
+            )
         elif case == 'whatwg_cr':
             # 3.2 CR-only 分隔流：\r 与 \n 同为行分隔符
             # （每事件 data 行后跟 \r 空行分隔，与 LF 流等价）
@@ -101,6 +124,15 @@ async def make_upstream():
                 b'"delta":{"type":"text_delta","text":"cr-two"}}\r\r'
             )
             await resp.write(b'data: {"type":"message_stop"}\r\r')
+        elif case == 'multi_data_lines':
+            # 5.5 同事件多行 data：两 data 行同属一事件块（一次空行分隔）
+            await resp.write(
+                b'data: {"type":"content_block_delta","index":0,'
+                b'"delta":{"type":"text_delta","text":"multi-one"}}\n'
+                b'data: {"type":"content_block_delta","index":0,'
+                b'"delta":{"type":"text_delta","text":"multi-two"}}\n\n'
+            )
+            await resp.write(b'data: {"type":"message_stop"}\n\n')
         await resp.write_eof()
         return resp
 
@@ -223,6 +255,65 @@ async def test_fast_cr_split_parity():
             raw = await r.text()
     assert '"text":"cr-one"' in raw
     assert '"text":"cr-two"' in raw
+    data_lines = [ln for ln in raw.splitlines() if ln.startswith('data:')]
+    assert len(data_lines) >= 3
+    for ln in data_lines:
+        json.loads(ln[5:].lstrip())
+
+
+@pytest.mark.asyncio
+async def test_restore_fidelity_fields():
+    """5.2 保真断言必需：下游同事件 id/created/model 一致、usage 数值不变。"""
+    async with env(), ClientSession() as s:
+        body = json.dumps({'case': 'restore_fidelity'})
+        async with s.post(BASE, headers=HEADERS, data=body) as r:
+            assert r.status == 200
+            raw = await r.text()
+    data_lines = [ln for ln in raw.splitlines() if ln.startswith('data:')]
+    assert len(data_lines) >= 2
+    objs = [json.loads(ln[5:].lstrip()) for ln in data_lines]
+    for obj in objs:
+        assert obj['id'] == 'chatcmpl_1'
+        assert obj['created'] == 1234567890
+        assert obj['model'] == 'gpt-4o'
+    usages = [o.get('usage') for o in objs if o.get('usage') is not None]
+    assert len(usages) >= 1
+    assert usages[-1] == {
+        'prompt_tokens': 10,
+        'completion_tokens': 5,
+        'total_tokens': 15,
+    }
+
+
+@pytest.mark.asyncio
+async def test_choices_n2_no_broadcast():
+    """5.2 独立断言必需：n=2 各路各自文本且 finish_reason 按 index 保留。"""
+    async with env(), ClientSession() as s:
+        body = json.dumps({'case': 'choices_n2'})
+        async with s.post(BASE, headers=HEADERS, data=body) as r:
+            assert r.status == 200
+            raw = await r.text()
+    data_lines = [ln for ln in raw.splitlines() if ln.startswith('data:')]
+    assert len(data_lines) >= 1
+    obj = json.loads(data_lines[0][5:].lstrip())
+    by_index = {c['index']: c for c in obj['choices']}
+    assert by_index[0]['delta']['content'] == 'alpha'
+    assert by_index[0]['finish_reason'] == 'stop'
+    assert by_index[1]['delta']['content'] == 'beta'
+    assert by_index[1]['finish_reason'] == 'tool_calls'
+    assert 'beta' not in by_index[0]['delta']['content']
+    assert 'alpha' not in by_index[1]['delta']['content']
+
+
+@pytest.mark.asyncio
+async def test_multi_data_lines_dispatched_per_line():
+    """5.5 多 data 行逐条解析：同事件两 data 行按原序输出，每行可解析。"""
+    async with env(), ClientSession() as s:
+        body = json.dumps({'case': 'multi_data_lines'})
+        async with s.post(BASE, headers=HEADERS, data=body) as r:
+            assert r.status == 200
+            raw = await r.text()
+    assert raw.index('multi-one') < raw.index('multi-two')
     data_lines = [ln for ln in raw.splitlines() if ln.startswith('data:')]
     assert len(data_lines) >= 3
     for ln in data_lines:
