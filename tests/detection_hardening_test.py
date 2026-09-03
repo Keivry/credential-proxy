@@ -75,6 +75,22 @@ async def test_redos_does_not_hang(monkeypatch):
 @pytest.mark.asyncio
 async def test_redos_consecutive_disable(monkeypatch):
     monkeypatch.setenv('PII_DETECTION_HARDENING', '1')
+    # 确定性超时：timeout 上下文恒抛 TimeoutError，
+    # 测连续计数→停用逻辑本身，不依赖回溯耗时抖动
+    # （计时机制由 test_redos_does_not_hang 用真实超时覆盖）
+    import asyncio as _asyncio
+
+    class _AlwaysTimeout:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            raise TimeoutError
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(_asyncio, 'timeout', _AlwaysTimeout)
     d = _detector()
     d.load_custom_patterns([('slow', r'(?P<slow>^(a|aa)+$)')])
     for _ in range(3):

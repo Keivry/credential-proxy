@@ -6327,6 +6327,9 @@ class LlmMixin(AuditMixin):
                                 False  # 是否已收到终止事件（fast 路径）
                             )
                             fast_seen_global_terminal = False  # 全局终止（fast）
+                            _cr_deferred_terminal: list[
+                                str
+                            ] = []  # CR 余行终止标记挂起，持存刷新后按序补发保行序
                             # ── 8.8 修复（F-09）：快链复用 WHATWG 帧状态机 ──
                             fast_pending_cr = False  # 上 chunk 末孤立 \r 跨块粘合
                             fast_bom_seen = False  # 流首 BOM 单次剥离
@@ -7085,13 +7088,38 @@ class LlmMixin(AuditMixin):
                                         # 10.14.1 (API-SPEC FIX): CR-only 多行
                                         # 流保持行序 dispatch——content 行立即
                                         # 走 _fast_emit_data（还原+透传），
-                                        # [DONE] 行最后透传（不得提前，否则
-                                        # SDK 收到 [DONE] 即结束流，后续
-                                        # content 全丢）。
+                                        # 终止标记只置位并挂起（_cr_deferred_terminal），
+                                        # 持存刷新后统一补写在最后——立即写会
+                                        # 反超仍在 fast_data_buffer/line_buf
+                                        # 里排队的前面 content 行（SDK 收到
+                                        # 终止标记即结束流，后续 content 全丢）。
+                                        # chat [DONE] / anthropic message_stop·error /
+                                        # responses response.completed·failed·
+                                        # incomplete·error 同属终止标记。
+                                        _cr_is_terminal = False
                                         if _pl.strip() == '[DONE]':
+                                            _cr_is_terminal = True
+                                        else:
+                                            try:
+                                                _cr_p = json.loads(_pl.strip())
+                                                if isinstance(_cr_p, dict) and (
+                                                    _cr_p.get('type')
+                                                    in (
+                                                        'message_stop',
+                                                        'error',
+                                                        'response.completed',
+                                                        'response.failed',
+                                                        'response.incomplete',
+                                                        'response.error',
+                                                    )
+                                                ):
+                                                    _cr_is_terminal = True
+                                            except Exception:
+                                                pass
+                                        if _cr_is_terminal:
                                             fast_seen_terminal = True
                                             fast_seen_global_terminal = True
-                                            await _tracked_write(b'data: [DONE]\n\n')
+                                            _cr_deferred_terminal.append(_pl)
                                         elif _pl.strip():
                                             fast_sse_event_count += 1
                                             # 可观测性：捕获 usage（fast CR 链）
@@ -7149,16 +7177,6 @@ class LlmMixin(AuditMixin):
                                             fast_seen_terminal = True
                                             fast_seen_global_terminal = True
                                         await _fast_emit_data(_single)
-                            # 10.13 (F-12): 流末 event_pending 残留透传 ——
-                            # data 行始终没来（异常流）时，不能把 event 行闷掉；
-                            # 透传保留原始信息，客户端自行容错。
-                            # 10.14.1 (API-SPEC FIX): 逐条透传独立块。
-                            if fast_event_pending:
-                                for _pend in fast_event_pending:
-                                    await _tracked_write(
-                                        (_pend + '\n\n').encode('utf-8'),
-                                    )
-                                fast_event_pending.clear()
                             # 9.5 (F-05): 快链 line_buf 流末 flush（持有行不丢）
                             if fast_line_buf:
                                 _rest = await self._pii_response_process(
@@ -7273,6 +7291,22 @@ class LlmMixin(AuditMixin):
                                         _tail_ev = _mk_sse_event(refusal=_safe)
                                     await _tracked_write(_tail_ev.encode('utf-8'))
                                 fast_refusal_buf = ''
+                            if _cr_deferred_terminal:
+                                for _cr_dt in _cr_deferred_terminal:
+                                    await _fast_emit_data(_cr_dt)
+                                _cr_deferred_terminal = []
+                            # 10.13 (F-12): 流末 event_pending 残留透传 ——
+                            # data 行始终没来（异常流）时，不能把 event 行闷掉；
+                            # 透传保留原始信息，客户端自行容错。
+                            # 10.14.1 (API-SPEC FIX): 逐条透传独立块。
+                            # 排序：必须在延迟终止标记补发之后——提前会吞掉
+                            # 待配对的 event 行，导致终止 data 行裸奔错配。
+                            if fast_event_pending:
+                                for _pend in fast_event_pending:
+                                    await _tracked_write(
+                                        (_pend + '\n\n').encode('utf-8'),
+                                    )
+                                fast_event_pending.clear()
                             # ── fast 截断检测 ──
                             _fast_truncated = False
                             # 11.2 (TSS-01): 已 complete（fast_seen_global_terminal=true）

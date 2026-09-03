@@ -358,8 +358,23 @@ async def test_custom_word_boundary_rejected():
 
 
 @pytest.mark.asyncio
-async def test_custom_consecutive_timeout_disables():
+async def test_custom_consecutive_timeout_disables(monkeypatch):
     """连续 3 次超时临时停用该规则。"""
+    # 确定性超时：timeout 上下文恒抛 TimeoutError，
+    # 测连续计数→停用逻辑本身，不依赖回溯耗时抖动
+    import asyncio as _asyncio
+
+    class _AlwaysTimeout:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            raise TimeoutError
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(_asyncio, 'timeout', _AlwaysTimeout)
     d = _detector()
     d.load_custom_patterns([('slow', r'(?P<slow>^(a|aa)+$)')])
     # 连续 3 次超时后停用
