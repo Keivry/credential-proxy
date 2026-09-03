@@ -29,6 +29,12 @@ HOP_HEADERS = frozenset(
     }
 )
 
+# WHATWG 三层缓冲阈值（与 README 流式阈值声明一致，_llm.py 复用此处唯一源）
+SSE_MAX_BUF = 1_048_576
+LINE_BUF_FLUSH = 16384
+LINE_BUF_MAX_AGE = 30
+KEEPALIVE_INTERVAL = 10
+
 # Matrix reaction 常量（与 _matrix.py 保持一致，供 _credential.py 在不引入 nio 时使用）
 REACTION_APPROVE = '\u2705'
 REACTION_REJECT = '\u274e'

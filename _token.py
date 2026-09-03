@@ -21,11 +21,13 @@ from collections import OrderedDict
 try:
     from utils.json_walk import _jdumps as _shared_jdumps  # type: ignore
     from utils.json_walk import _jloads as _shared_jloads  # type: ignore
+    from utils.json_walk import _strip_bom as _shared_strip_bom  # type: ignore
     from utils.json_walk import json_walk as _shared_json_walk  # type: ignore
     from utils.json_walk import (
         json_walk_async as _shared_json_walk_async,  # type: ignore
     )
 except ImportError:
+    _shared_strip_bom = None  # type: ignore
     _shared_json_walk = None  # type: ignore
     _shared_json_walk_async = None  # type: ignore
     _shared_jloads = None  # type: ignore
@@ -41,6 +43,12 @@ try:
 except ImportError:  # pragma: no cover - 回退路径
     _orjson = None  # type: ignore
     _USE_ORJSON = False
+
+
+def _strip_bom(s: str) -> str:
+    if _shared_strip_bom is not None:  # type: ignore[truthy-function]
+        return _shared_strip_bom(s)  # type: ignore
+    return s.lstrip('﻿')
 
 
 def _jloads(s: str):
@@ -65,15 +73,15 @@ def _validate_json_roundtrip(original: str, output: str, label: str) -> str:
     失败时打 warning（带前后预览，便于 debug）并回退到原始文本，
     保证下游不收到 JSONDecodeError。预览截断 4000 字符，避免超大体撑爆日志。
     """
-    stripped = original.lstrip('\ufeff').lstrip()
+    stripped = _strip_bom(original).lstrip()
     if not (stripped.startswith('{') or stripped.startswith('[')):
         return output
     try:
-        _json.loads(original.lstrip('\ufeff'))
+        _json.loads(_strip_bom(original))
     except Exception:
         return output
     try:
-        _json.loads(output.lstrip('\ufeff'))
+        _json.loads(_strip_bom(output))
         return output
     except Exception as exc:
         logger.warning(
@@ -169,7 +177,7 @@ def _cred_json_walk(obj, redact_func, path: str = '$', _depth: int = 0):
         return obj
     if isinstance(obj, str):
         # 嵌套 JSON 字符串递归（tool_calls.arguments 等）
-        inner_stripped = obj.lstrip('\ufeff').strip()
+        inner_stripped = _strip_bom(obj).strip()
         if inner_stripped.startswith(('{', '[')):
             try:
                 inner = _jloads(inner_stripped)
@@ -619,11 +627,11 @@ class TokenMixin:
         )
         if not _mapping:
             return text
-        stripped = text.lstrip('\ufeff').lstrip()
+        stripped = _strip_bom(text).lstrip()
         if not (stripped.startswith(('{', '['))):
             return self._redact(text, pwd_to_token)
         try:
-            obj = _jloads(text.lstrip('\ufeff'))
+            obj = _jloads(_strip_bom(text))
         except Exception:
             return self._redact(text, pwd_to_token)
         # 为字符串节点构造单次编译的 redact 函数（显式 mapping 场景）
@@ -702,11 +710,11 @@ class TokenMixin:
         )
         if not mapping:
             return text
-        stripped = text.lstrip('\ufeff').lstrip()
+        stripped = _strip_bom(text).lstrip()
         if not (stripped.startswith(('{', '['))):
             return self._restore(text, token_to_pwd)
         try:
-            obj = _jloads(text.lstrip('\ufeff'))
+            obj = _jloads(_strip_bom(text))
         except Exception:
             return self._restore(text, token_to_pwd)
         if token_to_pwd is not None:

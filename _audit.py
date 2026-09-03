@@ -1026,6 +1026,13 @@ def redact_summary(text: str, max_len: int = 120) -> str:
     """
     if not text:
         return ''
+    try:
+        from _metrics import redacted_tag as _tag  # type: ignore
+    except Exception:
+
+        def _tag(kind: str) -> str:  # type: ignore[no-redef]
+            return f'[REDACTED:{kind}]'
+
     redacted = text
     for label, pat in _SECRET_PATTERNS:
         # email 正则无锚定且可变长：无 @ 时 sub() 逐位置重试 O(n²)
@@ -1036,13 +1043,11 @@ def redact_summary(text: str, max_len: int = 120) -> str:
         # 替换时保留结构只替换值本体；无捕获组模式直接整体替换。
         if pat.groups:
             redacted = pat.sub(
-                lambda m, _label=label: (
-                    m.group(1) + m.group(2) + f'[REDACTED:{_label}]'
-                ),
+                lambda m, _label=label: m.group(1) + m.group(2) + _tag(_label),
                 redacted,
             )
         else:
-            redacted = pat.sub(f'[REDACTED:{label}]', redacted)
+            redacted = pat.sub(_tag(label), redacted)
     if len(redacted) <= max_len:
         return redacted
     # 截断边界半字符保护：回退到最后一个完整字符

@@ -31,6 +31,9 @@ TRUNCATED_MESSAGE = '上游流式响应被截断（未收到终止事件），�
 
 # ── utils/json_walk 共享导入（design D1，存在则复用）──
 try:
+    from utils.json_walk import (
+        PROTECTED_TOKEN_RE as _SHARED_PROTECTED_RE,  # type: ignore
+    )
     from utils.json_walk import _jdumps as _shared_jdumps  # type: ignore
     from utils.json_walk import _jloads as _shared_jloads  # type: ignore
     from utils.json_walk import _strip_bom as _shared_strip_bom  # type: ignore
@@ -44,6 +47,7 @@ try:
 
     _SHARED_WALK_AVAILABLE = True
 except ImportError:  # pragma: no cover
+    _SHARED_PROTECTED_RE = None  # type: ignore
     _shared_json_walk = None  # type: ignore
     _shared_json_walk_async = None  # type: ignore
     _shared_jloads = None  # type: ignore
@@ -62,6 +66,12 @@ except ImportError:  # pragma: no cover
     _USE_ORJSON = False
 
 
+def _strip_bom(s: str) -> str:
+    if _shared_strip_bom is not None:  # type: ignore[truthy-function]
+        return _shared_strip_bom(s)  # type: ignore
+    return s.lstrip('﻿')
+
+
 def _jloads(s: str):
     if _shared_jloads is not None:  # type: ignore[truthy-function]
         return _shared_jloads(s)  # type: ignore
@@ -78,17 +88,19 @@ def _jdumps(obj) -> str:
     return json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
 
 
-# ── json-aware 后置校验（与 _token._validate_json_roundtrip 同语义）──
+# ── json-aware 后置校验（deprecated：保留作 utils 缺失兜底，正本见 utils.json_walk）──
 def _llm_validate_json_roundtrip(original: str, output: str, label: str) -> str:
-    stripped = original.lstrip('\ufeff').lstrip()
+    if _shared_validate is not None:  # type: ignore[truthy-function]
+        return _shared_validate(original, output, label)  # type: ignore
+    stripped = _strip_bom(original).lstrip()
     if not (stripped.startswith('{') or stripped.startswith('[')):
         return output
     try:
-        json.loads(original.lstrip('\ufeff'))
+        json.loads(_strip_bom(original))
     except Exception:
         return output
     try:
-        json.loads(output.lstrip('\ufeff'))
+        json.loads(_strip_bom(output))
         return output
     except Exception as exc:
         logger.warning(
@@ -135,10 +147,18 @@ UPSTREAM_CONNECT_TIMEOUT = 30  # 上游连接超时 (s)
 MAX_UPSTREAM_RETRIES = 3  # 上游连接重试次数（含首次）
 UPSTREAM_RETRY_BACKOFF = 0.5  # 上游连接重试退避基数 (s)，指数增长
 SSE_CHUNK_SIZE = 4096  # SSE 分片大小
-SSE_MAX_BUF = 1_048_576  # SSE 缓冲区上限 (1MB)
-LINE_BUF_FLUSH = 16384  # 单逻辑行超长强制阈值 (16KB)
-LINE_BUF_MAX_AGE = 30  # 持有超长阈值 (30s)
-KEEPALIVE_INTERVAL = 10  # 保活间隔 (10s, `: keepalive\\n\\n` comment)
+try:
+    from _sse import (
+        KEEPALIVE_INTERVAL,  # type: ignore
+        LINE_BUF_FLUSH,  # type: ignore
+        LINE_BUF_MAX_AGE,  # type: ignore
+        SSE_MAX_BUF,  # type: ignore
+    )
+except ImportError:  # pragma: no cover
+    SSE_MAX_BUF = 1_048_576
+    LINE_BUF_FLUSH = 16384
+    LINE_BUF_MAX_AGE = 30
+    KEEPALIVE_INTERVAL = 10
 # 流末清理：匹配 token 前缀/残缺形态（含完整但未还原的幻觉 token）。
 # 真实 token 会被 _restore 先行还原为明文，不会落此正则。
 # 8.9 修复（F-10）：结尾 `(?:$|(?=\s|[^\w]))` 覆盖行中残缺形态。
@@ -932,11 +952,11 @@ def _strip_token_forms_json_aware(content: str) -> str:
       utils/json_walk 的语义漂移：dict/list 深度语义/RecursionError 兜底/
       叶子级校验统一由共享实现负责）。
     """
-    stripped = content.lstrip('\ufeff').lstrip()
+    stripped = _strip_bom(content).lstrip()
     if not (stripped.startswith(('{', '['))):
         return _strip_token_forms(content)
     try:
-        obj = _jloads(content.lstrip('\ufeff'))
+        obj = _jloads(_strip_bom(content))
     except Exception:
         return _strip_token_forms(content)
 
@@ -1130,28 +1150,46 @@ def _split_safe_hold(
 
 
 def _sanitize_json(text: str) -> str:
-    """Replace unescaped control chars within JSON string values."""
+    """Replace unescaped control chars within JSON string values.
+
+    映射表：CRLF->LF（\\r\\n 合并为单个 \\n），TAB 保留为 \\t，
+    其余 <0x20 与 0x7f 替换为 \\n。
+    """
     result = []
     in_string = False
     escape = False
-    for ch in text:
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
         if escape:
             result.append(ch)
             escape = False
+            i += 1
             continue
         if ch == '\\':
             result.append(ch)
             escape = True
+            i += 1
             continue
         if ch == '"':
             in_string = not in_string
             result.append(ch)
+            i += 1
             continue
         if in_string and (ord(ch) < 0x20 or ch == '\x7f'):
-            # Unescaped control char inside string → replace with escaped \\n
-            result.append('\\n')
+            if ch == '\t':
+                result.append('\\t')
+            elif ch == '\r':
+                result.append('\\n')
+                if i + 1 < n and text[i + 1] == '\n':
+                    i += 1
+            else:
+                result.append('\\n')
+            i += 1
             continue
         result.append(ch)
+        i += 1
     return ''.join(result)
 
 
@@ -1235,10 +1273,9 @@ def _extract_tool_calls_non_stream(
             name = block.get('name')
             inp = block.get('input')
             if isinstance(name, str) and name:
-                # 非流式审计参数提取：审计语义冻结，不动序列化口径
                 args = ''
                 if inp is not None:
-                    args = json.dumps(inp, ensure_ascii=False)  # _jdumps-whitelist
+                    args = _jdumps(inp)
                 calls.append((name, args))
         return calls
 
@@ -1263,9 +1300,11 @@ def _extract_tool_calls_non_stream(
 _SEP_NORMALIZE_RE = _re.compile(r'[-. ]')
 
 
-def re_sub_seps(value: str) -> str:
-    """去除分隔符（[-. ]）后返回，用于还原产物规范化等价比较。"""
+def _norm_seps(value: str) -> str:
     return _SEP_NORMALIZE_RE.sub('', value)
+
+
+re_sub_seps = _norm_seps
 
 
 class LlmMixin(AuditMixin):
@@ -1934,12 +1973,12 @@ class LlmMixin(AuditMixin):
         - 8.10 优化（F-11）：`parsed_obj` 传入调用方已解析的对象（主循环
           `json.loads(payload)` 的结果），跳过首层二次 loads。
         """
-        stripped = text.lstrip('\ufeff').lstrip()
+        stripped = _strip_bom(text).lstrip()
         if not (stripped.startswith(('{', '['))):
             return await self._pii_response_process(text, active_t2p)
         if parsed_obj is None:
             try:
-                obj = _jloads(text.lstrip('\ufeff'))
+                obj = _jloads(_strip_bom(text))
             except Exception:
                 return await self._pii_response_process(text, active_t2p)
         else:
@@ -1991,7 +2030,7 @@ class LlmMixin(AuditMixin):
                 return node
             if isinstance(node, str):
                 # 嵌套 JSON 字符串递归（tool_calls.arguments 等）
-                inner_stripped = node.lstrip('\ufeff').strip()
+                inner_stripped = _strip_bom(node).strip()
                 if inner_stripped.startswith(('{', '[')):
                     try:
                         inner = _jloads(inner_stripped)
@@ -2047,7 +2086,7 @@ class LlmMixin(AuditMixin):
         """SSE 行的 JSON-aware 处理：剥离 data: 前缀后对 payload 做 JSON-aware。
 
         - 对 data: {JSON} 形态：payload = split(":",1)[1].lstrip(" \t") 后，
-          对 payload.lstrip('\ufeff').strip() 判空 / "[DONE]" 早退，
+          对 _strip_bom(payload).strip() 判空 / "[DONE]" 早退，
           非 { / [ 开头回退 plain，否则 payload 走
           _pii_response_process_json_aware（含嵌套与 BOM）。
         - fast path（active_t2p==0 且无 PII/审计）由调用方守门，本 helper
@@ -2080,12 +2119,13 @@ class LlmMixin(AuditMixin):
                         payload = stripped.split(':', 1)[1].lstrip(' \t')
                     except Exception:
                         payload = stripped
-                    stripped_payload = payload.lstrip('\ufeff').strip()
+                    stripped_payload = _strip_bom(payload).strip()
                     if stripped_payload in ('', '[DONE]'):
                         out_parts.append(part)
                     elif not stripped_payload.startswith(('{', '[')):
                         out_parts.append(
-                            await self._pii_response_process(stripped, active_t2p)
+                            'data: '
+                            + await self._pii_response_process(payload, active_t2p)
                         )
                     else:
                         try:
@@ -2099,7 +2139,8 @@ class LlmMixin(AuditMixin):
                                 exc_info=True,
                             )
                             out_parts.append(
-                                await self._pii_response_process(stripped, active_t2p)
+                                'data: '
+                                + await self._pii_response_process(payload, active_t2p)
                             )
                 else:
                     # event:/id:/retry:/注释等非 data 行原样保留（不进还原）
@@ -2113,11 +2154,11 @@ class LlmMixin(AuditMixin):
             payload = line.split(':', 1)[1].lstrip(' \t')
         except Exception:
             return await self._pii_response_process(line, active_t2p)
-        stripped_payload = payload.lstrip('\ufeff').strip()
+        stripped_payload = _strip_bom(payload).strip()
         if stripped_payload in ('', '[DONE]'):
             return line
         if not stripped_payload.startswith(('{', '[')):
-            return await self._pii_response_process(line, active_t2p)
+            return 'data: ' + await self._pii_response_process(payload, active_t2p)
         try:
             payload_aware = await self._pii_response_process_json_aware(
                 payload, active_t2p, parsed_obj=parsed_obj
@@ -2125,7 +2166,7 @@ class LlmMixin(AuditMixin):
             return 'data: ' + payload_aware
         except Exception:
             logger.debug('_pii_process_sse_line 回退', exc_info=True)
-            return await self._pii_response_process(line, active_t2p)
+            return 'data: ' + await self._pii_response_process(payload, active_t2p)
 
     # ── Anthropic Messages API SSE 事件处理 ──
 
@@ -7446,6 +7487,29 @@ class LlmMixin(AuditMixin):
                         # 仅对话接口转 502，非对话（如 /v1/models）空体按原样透传
                         _is_empty = not resp_text.strip()
                         _is_invalid_json = False
+                        if len(resp_body) > SSE_MAX_BUF and is_chat_tail(tail):
+                            logger.warning(
+                                'LLM 非流式超限 fail-closed: len=%d limit=%d tail=%s',
+                                len(resp_body),
+                                SSE_MAX_BUF,
+                                tail,
+                            )
+                            try:
+                                _metrics_ctx['status'] = 502
+                            except Exception:
+                                pass
+                            return web.Response(
+                                body=_jdumps(
+                                    {
+                                        'error': {
+                                            'message': 'response too large',
+                                            'type': 'response_too_large',
+                                        }
+                                    }
+                                ).encode('utf-8'),
+                                status=502,
+                                headers={'Content-Type': 'application/json'},
+                            )
                         if not _is_empty:
                             try:
                                 _resp_parsed = json.loads(resp_text)
@@ -7528,87 +7592,6 @@ class LlmMixin(AuditMixin):
                                 status=502,
                                 headers={'Content-Type': 'application/json'},
                             )
-                        # 非流式整包审计（design D4：不因缺 SSE 完成事件跳过）
-                        blocked = False
-                        if self.audit_enabled() and resp_text:
-                            try:
-                                _resp_json = json.loads(resp_text)
-                                _calls = _extract_tool_calls_non_stream(
-                                    _resp_json,
-                                    tail,
-                                )
-                                for _name, _args in _calls:
-                                    _verdict = await self.audit_tool_call(_name, _args)
-                                    if _verdict == 'deny':
-                                        blocked = True
-                            except json.JSONDecodeError:
-                                pass
-                        if blocked:
-                            # 阻断：用拒绝消息替换整个响应体（design D4）
-                            _tail_norm = tail.rstrip('/')
-                            if _tail_norm.endswith('chat/completions'):
-                                _block_body = json.dumps(  # _jdumps-whitelist: 非流式阻断合成占位构造
-                                    {
-                                        'choices': [
-                                            {
-                                                'index': 0,
-                                                'message': {
-                                                    'role': 'assistant',
-                                                    'content': BLOCK_MESSAGE,
-                                                },
-                                                'finish_reason': 'stop',
-                                            }
-                                        ]
-                                    },
-                                    ensure_ascii=False,
-                                )
-                            elif _tail_norm.endswith(('messages', 'v1/messages')):
-                                _block_body = json.dumps(  # _jdumps-whitelist: 非流式阻断合成占位构造
-                                    {
-                                        'id': 'blocked',
-                                        'type': 'message',
-                                        'role': 'assistant',
-                                        'content': [
-                                            {
-                                                'type': 'text',
-                                                'text': BLOCK_MESSAGE,
-                                            }
-                                        ],
-                                        'stop_reason': 'end_turn',
-                                        'usage': {
-                                            'input_tokens': 0,
-                                            'output_tokens': 1,
-                                        },
-                                    },
-                                    ensure_ascii=False,
-                                )
-                            else:  # Responses API
-                                _block_body = json.dumps(  # _jdumps-whitelist: 非流式阻断合成占位构造
-                                    {
-                                        'id': 'blocked',
-                                        'status': 'completed',
-                                        'output': [
-                                            {
-                                                'type': 'message',
-                                                'role': 'assistant',
-                                                'content': [
-                                                    {
-                                                        'type': 'output_text',
-                                                        'text': BLOCK_MESSAGE,
-                                                    }
-                                                ],
-                                            }
-                                        ],
-                                    },
-                                    ensure_ascii=False,
-                                )
-                            return web.Response(
-                                body=_block_body.encode('utf-8'),
-                                status=200,
-                                headers=filter_hop_headers(
-                                    dict(upstream_resp.headers),
-                                ),
-                            )
                         # JSON-aware：仅对字符串节点做还原/检测，避免纯文本替换破坏 \\u 转义（Invalid \\escape）
                         # 7.4: 非对话尾透传不 walk
                         if not is_dialog_tail:
@@ -7630,14 +7613,16 @@ class LlmMixin(AuditMixin):
                             out_text = _strip_token_forms_json_aware(out_text)
                         except NameError:
                             out_text = _strip_token_forms(out_text)
-                        # ── 响应还原后置校验：仅 active_t2p 非空时触发，失败先叶子重建仍失败才全量回退 ──
-                        if active_t2p:
+                        # ── 响应还原后置校验：active_t2p 或 PII 参与时触发 ──
+                        _pii_scope_resp = self._pii_scope_or_none()
+                        _has_pii_resp = bool(_pii_scope_resp)
+                        if active_t2p or _has_pii_resp:
                             try:
-                                _rs = resp_text.lstrip('\ufeff').lstrip()
+                                _rs = _strip_bom(resp_text).lstrip()
                                 if _rs.startswith(('{', '[')):
                                     try:
-                                        _jloads(resp_text.lstrip('\ufeff'))
-                                        _jloads(out_text.lstrip('\ufeff'))
+                                        _jloads(_strip_bom(resp_text))
+                                        _jloads(_strip_bom(out_text))
                                     except Exception as _je:
                                         logger.warning(
                                             'response restore broke JSON, fallback to original: error=%s '
@@ -7651,6 +7636,98 @@ class LlmMixin(AuditMixin):
                                         out_text = resp_text
                             except Exception:
                                 pass
+                        blocked = False
+                        if self.audit_enabled() and out_text:
+                            try:
+                                _resp_json = _jloads(_strip_bom(out_text))
+                                _calls = _extract_tool_calls_non_stream(
+                                    _resp_json,
+                                    tail,
+                                )
+                                for _name, _args in _calls:
+                                    _verdict = await self.audit_tool_call(_name, _args)
+                                    if _verdict == 'deny':
+                                        blocked = True
+                            except Exception:
+                                pass
+                        if blocked:
+                            _tail_norm = tail.rstrip('/')
+                            _block_model = None
+                            try:
+                                _m = (
+                                    _resp_json.get('model')
+                                    if isinstance(_resp_json, dict)
+                                    else None
+                                )
+                                if isinstance(_m, str) and _m:
+                                    _block_model = _m
+                                elif _req_model != 'unknown_model':
+                                    _block_model = _req_model
+                            except Exception:
+                                _block_model = None
+                            if _tail_norm.endswith('chat/completions'):
+                                _block_obj: dict = {
+                                    'choices': [
+                                        {
+                                            'index': 0,
+                                            'message': {
+                                                'role': 'assistant',
+                                                'content': BLOCK_MESSAGE,
+                                            },
+                                            'finish_reason': 'stop',
+                                        }
+                                    ]
+                                }
+                                if _block_model:
+                                    _block_obj['model'] = _block_model
+                                _block_body = _jdumps(_block_obj)
+                            elif _tail_norm.endswith(('messages', 'v1/messages')):
+                                _block_obj = {
+                                    'id': 'blocked',
+                                    'type': 'message',
+                                    'role': 'assistant',
+                                    'content': [
+                                        {
+                                            'type': 'text',
+                                            'text': BLOCK_MESSAGE,
+                                        }
+                                    ],
+                                    'stop_reason': 'end_turn',
+                                    'usage': {
+                                        'input_tokens': 0,
+                                        'output_tokens': 1,
+                                    },
+                                }
+                                if _block_model:
+                                    _block_obj['model'] = _block_model
+                                _block_body = _jdumps(_block_obj)
+                            else:
+                                _block_obj = {
+                                    'id': 'blocked',
+                                    'status': 'completed',
+                                    'output': [
+                                        {
+                                            'type': 'message',
+                                            'role': 'assistant',
+                                            'content': [
+                                                {
+                                                    'type': 'output_text',
+                                                    'text': BLOCK_MESSAGE,
+                                                }
+                                            ],
+                                        }
+                                    ],
+                                }
+                                if _block_model:
+                                    _block_obj['model'] = _block_model
+                                _block_body = _jdumps(_block_obj)
+                            return web.Response(
+                                body=_block_body.encode('utf-8'),
+                                status=200,
+                                headers=filter_hop_headers(
+                                    dict(upstream_resp.headers),
+                                ),
+                            )
                         if is_chat_tail(tail):
                             logger.info(
                                 'LLM 剥离后诊断: %s %s status=%d empty_after_strip=%s out_len=%d tail=%s',

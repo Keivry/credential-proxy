@@ -66,7 +66,7 @@
 ## 6. 审查补漏（2026-08-26 5路并行审查增量，覆盖全部 HIGH/MEDIUM 待修）—— 本节为 apply 阶段必修
 
 - [x] 6.1 `json_walk` 全量二次校验接线（HIGH json-H1，`spec:json-walk-consolidation` 违背）：`utils:39/_token:62/_pii:73/_llm:81` 四处 `def _validate_json_roundtrip` 定义零调用，外层 `json_aware` 直接 `return _jdumps(obj)`。改三处包装出口统一 `return _validate(original_text, _jdumps(obj), label)`（`utils` 走 `_validate_json_roundtrip`，`_token`/`_pii`/`_llm` 走共享 `_shared_validate`），`utils` 内层 `return _jdumps(walked)` 加 `try/except` 或经 `_validate`，`inner _walk` 保持 `lstrip("\ufeff").strip()` 后 `startswith({,[)` 再 `loads`，失败回退该叶原串。仅该叶回退不影响整包，覆盖 `output 非法回退原串` 场景。
-  - 验收：`grep -rn _validate_json_roundtrip --include="*.py"` 命中 ≥4 调用点（含 `_token.py`/`_pii.py`/`_llm.py`/`utils/json_walk.py` 各 1），`test_json_walk_output_illegal_fallback` 仍绿，新增 `original 合法 output 非法 → 回退原串` 用例，`_pii_process_sse_line` 非 JSON 早退不误判 `data:[DONE]`
+  - 验收：`grep -rn _validate_json_roundtrip --include="*.py"` 命中 ≥4 调用点（含 `_token.py`/`_pii.py`/`_llm.py`/`utils/json_walk.py` 各 1），`test_json_walk_output_illegal_fallback` 仍绿，新增 `original 合法 output 非法 → 回退原串` 用例，`_pii_process_sse_line` 非 JSON 早退不误判 `data:[DONE]` —— 后续重标（fix-llm-redact-restore 4.1）：三私有 validator 改为 deprecated 薄转发（有共享走 `_shared_validate`），三包装出口一致性由 `tests/vault_stable_test.py::test_three_validators_fallback_contract` 锁定
 
 - [x] 6.2 `byte_buf` WHATWG 帧重建补齐（HIGH H1/H2/H3，`spec:streaming-residual-hardening` 阻断 3 项）：现 `2225 byte_buf.find(b"\n")+2235 rstrip("\r")` 仅处理 `\n`，`CR` 永不 dispatch；`BOM 0xEFBBBF` 字节级无处理；无 `data_buffer` 聚合逐行即 `loads`。改 `byte_buf: bytearray + pending_cr: bool + bom_seen: bool + data_buffer: list[str] + event_fields: dict` 状态机：`extend(chunk)` 后处理 `pending_cr` 粘合（上 chunk 末 `\r` + 本 chunk 首 `\n` → 合并为单 `\n`），流首 `bom_seen==False` 时累积 ≥3B 后判定 `0xEFBBBF` 单次剥离，其后 `bytes→decode` 前 `replace(b"\r\n",b"\n").replace(b"\r",b"\n")` 归一再按 `b"\n"` 分行，空行 `dispatch` 时 `"\n".join(data_buffer)` 再单次 `payload.lstrip("\ufeff").strip()` 判空/`[DONE]`/非 JSON 早退后走共享 walk，`data:` 值 `line.split(":",1)[1]` 后仅剥单空格 `U+0020`（`removeprefix(" ")`），`retry:` 仅 ASCII 数字全串透传否则丢弃，`:` 注释行与空行直接 `_tracked_write(line+"\n")` 不计 `sse_event_count` 不走 `walk/_strip_partials`。
   - 验收：`specs/streaming-residual-hardening/spec.md` 的 CRLF 跨 chunk/CR 单行/`BOM EF|BB BF` 分片/多 `data:` 行 `a\n\nb` 聚合/`retry` 非数字丢弃/`comment` 透传 6 场景全绿；`residual_hardening_test.py` 新增 `CRLF split chunk` 与 `BOM split` 用例
@@ -184,7 +184,7 @@
 ### 9.6 共享 walk 外层 _validate 缺失（P1，审查 F-06 🟡，`_llm.py:1302/1371`）
 
 - [x] 9.6 共享 walk 路径 `return _jdumps(walked)`（1302）与 fallback 路径 `return _jdumps(new_obj)`（1371）均未包装 `_validate(original, _jdumps(obj))`（tasks 6.1 声称三处包装出口统一但 `_llm` 响应侧未接；对比 `_token.py:580,652` / `_pii.py:1079` 已正确包装）→ 叶级非法 JSON 不回退原串，违反 spec json-walk-consolidation「output 非法回退原串」。修复：共享路径 `out=_jdumps(walked); return _shared_validate(text, out, 'llm_response_json_aware') if _shared_validate else out`；fallback 同理
-  - 验收：`grep -rn _shared_validate _llm.py` 命中 ≥2 调用点；`test_json_walk_output_illegal_fallback` 新增 `_llm` 响应侧用例；`pytest` 全绿
+  - 验收：`grep -rn _shared_validate _llm.py` 命中 ≥2 调用点；`test_json_walk_output_illegal_fallback` 新增 `_llm` 响应侧用例；`pytest` 全绿 —— 后续重标（fix-llm-redact-restore 2.1/4.2）：响应侧校验补 `has_pii` 分支，三包装出口由 `tests/vault_stable_test.py::test_three_wrappers_nasty_values_stay_valid_json` 锁定
 
 ### 9.7 慢链每行 restore→scan 全链性能（P2，审查 F-07 🟡，`_llm.py:2867/2885/2912/3470` + `_token.py:596-598`）
 

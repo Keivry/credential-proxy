@@ -8,8 +8,11 @@
 import inspect as _inspect
 import json as _json
 import logging
+import re as _re
 
 logger = logging.getLogger(__name__)
+
+PROTECTED_TOKEN_RE = _re.compile(r'__VG_CRED_\d{4,}__|__PII_\d+_[0-9a-fA-F]{8}__')
 
 try:
     import orjson as _orjson  # type: ignore
@@ -253,6 +256,7 @@ async def _json_walk_async_impl(
 
 
 __all__ = [
+    'PROTECTED_TOKEN_RE',
     '_jdumps',
     '_jloads',
     '_strip_bom',

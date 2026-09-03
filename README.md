@@ -23,17 +23,22 @@ Hermes Agent / 脚本  ── get 二进制 ──▶  Credential Proxy (Docker)
 
 ## 架构
 
-### Python 服务端（7 文件 Mixin 模式）
+### Python 服务端（Mixin 模式）
 
 ```
 proxy.py            主入口 + CredentialProxy 主类
 _credential.py      凭据 HTTP API（/credential /health）+ 三因子认证
 _token.py           凭据脱敏/还原 — __VG_CRED_NNNNNN__ token
+_pii.py             PII 脱敏/还原 — __PII_<seq>_<rand8>__ token + 自定义规则
 _tpm.py             TPM 硬件解封 KeePass 主密码
 _matrix.py          Matrix Bot — 审批、解锁、注册审批
 _registry.py        Caller 注册表 + 自动放行认证
 _llm.py             LLM 反向代理 — SSE 流式 + JSON-aware token 还原
-_sse.py             SSE 共享常量
+_sse.py             SSE 共享常量（三层缓冲阈值 + 逐跳头过滤）
+_audit.py           输出审计 — block/approve + 审计日志
+_metrics.py         可观测性 — 指标聚合 + redact_summary + 大盘 API
+_admin.py           管理接口 — /_admin 健康/指标/事件/SSE
+utils/json_walk.py  共享 JSON walk（_jloads/_jdumps/_strip_bom/roundtrip 校验正本）
 ```
 
 轻量入口（无 Matrix/TPM/KeePass，仅 aiohttp）：
@@ -440,14 +445,19 @@ cd get && go build -o get .
 ├── _matrix.py            Matrix Bot
 ├── _registry.py          Caller 注册表
 ├── _llm.py               LLM 脱敏代理
-├── _sse.py               SSE 共享常量
-├── credential-proxy-only.py  轻量版（自动批准）
-├── llm-proxy-only.py         极简版（仅 LLM 代理）
+├── _sse.py               SSE 共享常量（三层缓冲阈值 + 逐跳头过滤）
+├── _pii.py               PII 脱敏/还原 + 自定义规则
+├── _audit.py             输出审计 + 审计日志
+├── _metrics.py           可观测性指标 + 大盘 API
+├── _admin.py             管理接口 /_admin
+├── utils/json_walk.py    共享 JSON walk 正本
+├── credential-proxy-only.py  轻量版（无 Matrix 审批能力，approve 降级 block）
+├── llm-proxy-only.py         极简版（仅 LLM 代理，approve 降级 block）
 ├── get/                  Go 客户端二进制
 │   ├── main.go
 │   ├── cmd/
 │   └── internal/
-├── test_*.py             测试
+├── tests/*_test.py        测试（58 文件，pytest）
 ├── Dockerfile
 ├── docker-compose.yml
 └── .github/workflows/    CI/CD

@@ -15,15 +15,12 @@ from _pii import PiiDetector, RequestScopedTokens, mask_pii_value, parse_pii_env
 
 class TestMaskPiiValue:
     def test_phone(self):
-        # placeholder masks via first3****last4
+        assert mask_pii_value('phone', '13812348000') == '138****8000'
         assert mask_pii_value('phone', '__PII_82_8f6a798b__') == '__P****8b__'
         assert mask_pii_value('phone', '__PII_73_456a6eab__') == '__P****ab__'
         assert mask_pii_value('phone', '') == '***'
-        # real phone（占位符形态输入走占位符掩码 first3****last4）
-        assert mask_pii_value('phone', '__PII_82_8f6a798b__') == '__P****8b__'
         assert mask_pii_value('phone', '__PII_40_45aa7dbb__') == '__P****bb__'
         assert mask_pii_value('phone', '__PII_82_8f6a798b__') != '__PII_82_8f6a798b__'
-        assert mask_pii_value('phone', '__PII_82_8f6a798b__') == '__P****8b__'
 
     def test_email(self):
         # new mask hides local/domain first char: ***@***.suffix (防 a***@b.com 侧信道)
@@ -48,12 +45,10 @@ class TestMaskPiiValue:
         assert mask_pii_value('other', '') == '***'
 
     def test_api_key(self):
-        # api_key 8 char -> 前4****后4, 其他<6 时 前1****后1
-        assert '****' in mask_pii_value('api_key', '«redacted:sk-…»')
+        assert mask_pii_value('api_key', '«redacted:sk-…»') == '«red****k-…»'
         assert mask_pii_value('other', 'hello_world') == 'hel****rld'
-        assert mask_pii_value(
-            'api_key', 'abcd1234'
-        ) == 'abcd****1234' or '****' in mask_pii_value('api_key', 'abcd1234')
+        assert mask_pii_value('api_key', 'abcd1234') == 'abcd****1234'
+        assert mask_pii_value('api_key', 'abc12') == 'a****2'
 
     def test_truncate(self):
         long_val = 'a' * 100 + '@b.com'

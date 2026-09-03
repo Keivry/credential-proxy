@@ -31,17 +31,33 @@ logger = logging.getLogger('credential-proxy')
 
 # ── utils/json_walk 共享导入（design D1，存在则复用）──
 try:
+    from utils.json_walk import (
+        PROTECTED_TOKEN_RE as _SHARED_PROTECTED_RE,  # type: ignore
+    )
     from utils.json_walk import _jdumps as _shared_jdumps  # type: ignore
     from utils.json_walk import _jloads as _shared_jloads  # type: ignore
+    from utils.json_walk import _strip_bom as _shared_strip_bom  # type: ignore
+    from utils.json_walk import (
+        _validate_json_roundtrip as _shared_validate,  # type: ignore
+    )
     from utils.json_walk import json_walk as _shared_json_walk  # type: ignore
     from utils.json_walk import (
         json_walk_async as _shared_json_walk_async,  # type: ignore
     )
 except ImportError:
+    _SHARED_PROTECTED_RE = None  # type: ignore
+    _shared_strip_bom = None  # type: ignore
+    _shared_validate = None  # type: ignore
     _shared_json_walk = None  # type: ignore
     _shared_json_walk_async = None  # type: ignore
     _shared_jloads = None  # type: ignore
     _shared_jdumps = None  # type: ignore
+
+_PROTECTED_TOKEN_RE = (
+    _SHARED_PROTECTED_RE
+    if _SHARED_PROTECTED_RE is not None
+    else _re.compile(r'__VG_CRED_\d{4,}__|__PII_\d+_[0-9a-fA-F]{8}__')
+)
 
 # ── orjson 加速封装（与 _token 同口径，行为保持 ensure_ascii=False 语义等价）──
 try:
@@ -51,6 +67,12 @@ try:
 except ImportError:  # pragma: no cover
     _orjson = None  # type: ignore
     _USE_ORJSON = False
+
+
+def _strip_bom(s: str) -> str:
+    if _shared_strip_bom is not None:  # type: ignore[truthy-function]
+        return _shared_strip_bom(s)  # type: ignore
+    return s.lstrip('﻿')
 
 
 def _jloads(s: str):
@@ -69,17 +91,19 @@ def _jdumps(obj) -> str:
     return _json.dumps(obj, ensure_ascii=False, separators=(',', ':'))
 
 
-# ── json-aware 后置校验（与 _token._validate_json_roundtrip 同语义）──
+# ── json-aware 后置校验（deprecated：保留作 utils 缺失兜底，正本见 utils.json_walk）──
 def _pii_validate_json_roundtrip(original: str, output: str, label: str) -> str:
-    stripped = original.lstrip('\ufeff').lstrip()
+    if _shared_validate is not None:  # type: ignore[truthy-function]
+        return _shared_validate(original, output, label)  # type: ignore
+    stripped = _strip_bom(original).lstrip()
     if not (stripped.startswith('{') or stripped.startswith('[')):
         return output
     try:
-        _json.loads(original.lstrip('\ufeff'))
+        _json.loads(_strip_bom(original))
     except Exception:
         return output
     try:
-        _json.loads(output.lstrip('\ufeff'))
+        _json.loads(_strip_bom(output))
         return output
     except Exception as exc:
         logger.warning(
@@ -370,7 +394,7 @@ async def _pii_json_walk(
             return new_s
         return obj
     if isinstance(obj, str):
-        inner_stripped = obj.lstrip('\ufeff').strip()
+        inner_stripped = _strip_bom(obj).strip()
         if inner_stripped.startswith(('{', '[')):
             try:
                 inner = _jloads(inner_stripped)
@@ -917,8 +941,12 @@ def _id_card_ok(value: str) -> bool:
 
 
 def _mask_placeholder(value: str, kind: str) -> str:
-    """构造 [REDACTED:<type>] 形态（审计/审批摘要用）。"""
-    return f'[REDACTED:{kind}]'
+    try:
+        from _metrics import redacted_tag as _tag  # type: ignore
+
+        return _tag(kind)
+    except Exception:
+        return f'[REDACTED:{kind}]'
 
 
 # ── pii value sample: mask & enable guard (dashboard-pii-value-details) ──
@@ -963,14 +991,18 @@ def _pii_value_hash(value: str) -> str:
 def mask_pii_value(kind: str, value: str) -> str:
     """按 kind 掩码明文值（不含 hash，仅 masked_sample）。
 
-    - phone: 138****8000 (first3****last4)
+    真实值形态：
+    - phone: 138****8000 (first3****last4，len>=7)
     - email: ***@***.com (不透 local/domain 首字符；suffix 保留，防 a***@b.com 侧信道)
     - bank_card: **** **** **** 6789 (仅后4，BIN不保留)
-    - ipv4: 192.168.**.**
-    - ipv6/api_key: 前4****后4
+    - ipv4: 192.168.**.** (非4段时按长度规则)
+    - ipv6/api_key: len>=8 时前4****后4；len 6-7 时前3****后3
     - other: 前3****后3 且 <6 时 前1****后1
     - empty -> ***
     - masked 长度上限 64，超长截断
+
+    占位符形态输入（如 __PII_82_8f6a798b__）同样按长度规则掩码
+    （如 phone 占位符 len=18 → __P****8b__），不还原为真实值形态。
     """
     if not value:
         return '***'
@@ -1278,30 +1310,31 @@ class PiiDetector:
                 for s, e in protected_spans
             )
 
-        hardening = True  # ReDoS 防护常开（硬化总闸不影响超时防护，7.6 保留常开，门控差异化仅影响 CJK/分块语义）
-        # 7.6: 分块迭代 — 2MB 按 1M 块扫描不丢尾
-        _chunks = (
-            [
-                text[i : i + PII_SCAN_INPUT_LIMIT]
-                for i in range(0, len(text), PII_SCAN_INPUT_LIMIT)
-            ]
-            if len(text) > PII_SCAN_INPUT_LIMIT
-            else [text]
-        )
-        # 保护区间需按 chunk 偏移调整：对每块单独计算 overlaps（简化：每块用原始 protected_spans 但按 chunk 内 offset 判断）
+        hardening = True
+        overlap = 256
+        try:
+            longest = 0
+            for _, _, _src in self.custom_patterns:
+                if _src and len(_src) > longest:
+                    longest = len(_src)
+            if longest > overlap:
+                overlap = min(longest, 4096)
+        except Exception:
+            overlap = 256
+        step = PII_SCAN_INPUT_LIMIT - overlap
+        _chunks: list[tuple[int, str]] = []
+        if len(text) > PII_SCAN_INPUT_LIMIT:
+            for off in range(0, len(text), step):
+                _chunks.append((off, text[off : off + PII_SCAN_INPUT_LIMIT]))
+        else:
+            _chunks = [(0, text)]
+        seen_spans: set[tuple[int, int]] = set()
         for name, compiled, _src in self.custom_patterns:
             if name in self.custom_disabled:
                 continue
             try:
                 if hardening:
-                    # 关键：finditer 是惰性迭代器，迭代（消费）同样可能阻塞——
-                    # 必须把「编译+完整迭代收集」整体放进 executor。
-                    # 注意：wait_for 对 run_in_executor 的 future 在 3.12 不可靠
-                    # （executor future 不可取消，wait_for 会等到底）——
-                    # 用 asyncio.timeout() 上下文管理器，定时器到时必抛 TimeoutError
-                    # 7.6: 分块迭代，逐块 executor 收集并按绝对偏移判重叠
-                    for _chunk_idx, _chunk in enumerate(_chunks):
-                        _chunk_offset = _chunk_idx * PII_SCAN_INPUT_LIMIT
+                    for _chunk_offset, _chunk in _chunks:
                         async with asyncio.timeout(PII_RE_DOS_BUDGET):
                             _found = await loop.run_in_executor(
                                 self._executor,
@@ -1310,18 +1343,22 @@ class PiiDetector:
                         for m in _found:
                             abs_s = _chunk_offset + m.start()
                             abs_e = _chunk_offset + m.end()
+                            if (abs_s, abs_e) in seen_spans:
+                                continue
                             if _overlaps(abs_s, abs_e):
                                 continue
+                            seen_spans.add((abs_s, abs_e))
                             hits.append((name, m.group(0)))
                 else:
-                    # 非硬化：直跑（bypass 守卫），保证基础脱敏仍生效
-                    for _chunk_idx, _chunk in enumerate(_chunks):
-                        _chunk_offset = _chunk_idx * PII_SCAN_INPUT_LIMIT
+                    for _chunk_offset, _chunk in _chunks:
                         for m in compiled.finditer(_chunk):
                             abs_s = _chunk_offset + m.start()
                             abs_e = _chunk_offset + m.end()
+                            if (abs_s, abs_e) in seen_spans:
+                                continue
                             if _overlaps(abs_s, abs_e):
                                 continue
+                            seen_spans.add((abs_s, abs_e))
                             hits.append((name, m.group(0)))
                 # 成功：清零超时计数（硬化时才有 strikes）
                 if hardening:
@@ -1451,6 +1488,170 @@ class PiiDetector:
 
     # ── 主扫描 ──
 
+    def _credential_spans(
+        self, text: str, credential_p2t: dict | None
+    ) -> list[tuple[int, int]]:
+        """凭据值在文本中的位置区间（位置化优先的基础）。"""
+        if not credential_p2t or not text:
+            return []
+        spans: list[tuple[int, int]] = []
+        for cred_value in credential_p2t:
+            if not cred_value or cred_value not in text:
+                continue
+            start = 0
+            while True:
+                idx = text.find(cred_value, start)
+                if idx == -1:
+                    break
+                spans.append((idx, idx + len(cred_value)))
+                start = idx + 1
+        return spans
+
+    async def scan_spans(
+        self,
+        text: str,
+        credential_p2t: dict | None = None,
+        tail: str | None = None,
+    ) -> list[tuple[str, str, int, int]]:
+        """检测文本中的 PII，返回 [(type, value, start, end)] 位置列表。
+
+        与 `scan` 同语义，差异仅为携带位置并按位置做凭据优先：
+        仅落在凭据区间内的匹配跳过，同值非凭据位置正常返回。
+        长跨度优先 + 重叠仲裁由调用方（detect_and_redact）执行，
+        此处保留原始命中顺序。
+        """
+        if not text:
+            return []
+        protected_spans: list[tuple[int, int]] = []
+        for m in _DATA_URL_RE.finditer(text):
+            protected_spans.append((m.start(), m.end()))
+        for m in _PROTECTED_TOKEN_RE.finditer(text):
+            protected_spans.append((m.start(), m.end()))
+
+        def _overlaps_protected(start: int, end: int) -> bool:
+            return any(
+                s <= start < e or s < end <= e or (start <= s and e <= end)
+                for s, e in protected_spans
+            )
+
+        cred_spans = self._credential_spans(text, credential_p2t)
+
+        def _overlaps_cred(start: int, end: int) -> bool:
+            return any(
+                s <= start < e or s < end <= e or (start <= s and e <= end)
+                for s, e in cred_spans
+            )
+
+        spans: list[tuple[str, str, int, int]] = []
+        has_coarse = bool(_COARSE_FILTER_RE.search(text))
+        if has_coarse:
+            for m in _get_combined_re().finditer(text):
+                if _overlaps_protected(m.start(), m.end()):
+                    continue
+                kind = m.lastgroup
+                value = m.group(0)
+                if kind is None:
+                    continue
+                if kind == 'ipv6':
+                    core = value.rstrip('.,;)]}')
+                    if core and _is_valid_ipv6(core):
+                        value = core
+                    elif not _is_valid_ipv6(value):
+                        continue
+                if kind == 'ipv4':
+                    core = value.rstrip('.,;)]}')
+                    if core and _is_valid_ipv4(core):
+                        value = core
+                    elif not _is_valid_ipv4(value):
+                        continue
+                if kind == 'bank_card':
+                    ctx_start = max(0, m.start() - 64)
+                    ctx_end = min(len(text), m.end() + 16)
+                    if _URL_QUERY_PARAM_RE.search(text[ctx_start:ctx_end]):
+                        continue
+                if kind == 'id_card' and not _id_card_ok(value):
+                    continue
+                if kind == 'bank_card' and not _luhn_ok(value):
+                    continue
+                if kind in ('ipv4', 'ipv6') and _is_reserved_ip(value, kind):
+                    continue
+                s, e = m.start(), m.start() + len(value)
+                if _overlaps_cred(s, e):
+                    continue
+                spans.append((kind, value, s, e))
+        if self.custom_patterns:
+            custom_hits = await self._scan_custom_spans(
+                text, protected_spans, cred_spans
+            )
+            spans.extend(custom_hits)
+        if self.dict_re:
+            dict_hits = self._scan_dict_spans(text, credential_p2t, cred_spans)
+            spans.extend(dict_hits)
+        return spans
+
+    async def _scan_custom_spans(
+        self,
+        text: str,
+        protected_spans: list[tuple[int, int]] | None = None,
+        cred_spans: list[tuple[int, int]] | None = None,
+    ) -> list[tuple[str, str, int, int]]:
+        """自定义正则的位置化扫描（供 scan_spans 复用，含分块绝对偏移）。"""
+        raw = await self._scan_custom(text, protected_spans)
+        if not raw:
+            return []
+        out: list[tuple[str, str, int, int]] = []
+        cursor = 0
+        for name, value in raw:
+            idx = text.find(value, cursor)
+            if idx == -1:
+                idx = text.find(value)
+            if idx == -1:
+                continue
+            s, e = idx, idx + len(value)
+            if cred_spans and any(
+                cs <= s < ce or cs < e <= ce or (s <= cs and ce <= e)
+                for cs, ce in cred_spans
+            ):
+                cursor = e
+                continue
+            out.append((name, value, s, e))
+            cursor = e
+        return out
+
+    def _scan_dict_spans(
+        self,
+        text: str,
+        credential_p2t: dict | None = None,
+        cred_spans: list[tuple[int, int]] | None = None,
+    ) -> list[tuple[str, str, int, int]]:
+        """字典的位置化扫描（边界判定与 _scan_dict 同语义）。"""
+        if not self.dict_re or not text:
+            return []
+        if cred_spans is None:
+            cred_spans = self._credential_spans(text, credential_p2t)
+        out: list[tuple[str, str, int, int]] = []
+        seen_spans: set[tuple[int, int]] = set()
+        for m in self.dict_re.finditer(text):
+            name = m.group(0)
+            s, e = m.start(), m.end()
+            if (s, e) in seen_spans:
+                continue
+            if cred_spans and any(
+                cs <= s < ce or cs < e <= ce or (s <= cs and ce <= e)
+                for cs, ce in cred_spans
+            ):
+                continue
+            typ = 'name'
+            for n, t in self.dict_entries:
+                if n == name:
+                    typ = t
+                    break
+            if not self._dict_boundary_ok(text, s, e, typ):
+                continue
+            seen_spans.add((s, e))
+            out.append((typ, name, s, e))
+        return out
+
     async def scan(
         self,
         text: str,
@@ -1469,13 +1670,15 @@ class PiiDetector:
         for m in _DATA_URL_RE.finditer(text):
             protected_spans.append((m.start(), m.end()))
         # 占位符区间重叠排除（硬性）：PII 不得作用于 __VG_CRED_*__/__PII_*__ 区间
-        for m in _re.finditer(r'__VG_CRED_\d{4,}__|__PII_\d+_[0-9a-fA-F]{8}__', text):
+        for m in _PROTECTED_TOKEN_RE.finditer(text):
             protected_spans.append((m.start(), m.end()))
 
         hits: list[tuple[str, str]] = []
-        # 粗筛：无 [\dA-Za-z@.\-] 的纯文本跳过内置+自定义（25x 加速）。
-        # 字典扫描独立于粗筛（纯中文文本含人名，粗筛会误跳过）
+        # 粗筛：无 [\dA-Za-z@.\-] 的纯文本跳过内置（25x 加速）。
+        # custom 独立豁免：纯中文自定义正则仍需扫描；字典独立于粗筛。
         if not _COARSE_FILTER_RE.search(text):
+            if self.custom_patterns:
+                hits.extend(await self._scan_custom(text, protected_spans))
             if self.dict_re:
                 hits.extend(self._scan_dict(text, credential_p2t))
             self._count_detected(hits)
@@ -1628,29 +1831,45 @@ class PiiDetector:
         """检测并替换 PII 为占位符（注册到请求级映射）。"""
         if not text:
             return text
-        hits = await self.scan(text, credential_p2t, tail=tail)
-        if not hits:
+        spans = await self.scan_spans(text, credential_p2t, tail=tail)
+        if not spans:
             return text
-        # 去重 + 替换（长值优先防子串碰撞）
-        seen: set[str] = set()
-        items = []
-        for typ, value in hits:
-            if value in seen:
+        spans.sort(key=lambda x: (-(x[3] - x[2]), x[2]))
+        selected: list[tuple[str, str, int, int]] = []
+        occupied: list[tuple[int, int]] = []
+        for kind, value, s, e in spans:
+            if any(
+                os <= s < oe or os < e <= oe or (s <= os and oe <= e)
+                for os, oe in occupied
+            ):
                 continue
-            seen.add(value)
-            items.append((len(value), typ, value))
-        items.sort(key=lambda x: x[0], reverse=True)
+            occupied.append((s, e))
+            selected.append((kind, value, s, e))
+        selected.sort(key=lambda x: x[2])
         if self.request_tokens is None:
-            # 无请求映射：直接替换为 [REDACTED:<type>]（降级路径）
-            out = text
-            for _, typ, value in items:
-                out = out.replace(value, _mask_placeholder(value, typ))
-            return out
-        for _, typ, value in items:
-            token = await self.request_tokens.register(value, response_side)
-            if token != value:
-                text = text.replace(value, token)
-        return text
+            parts: list[str] = []
+            cursor = 0
+            for kind, value, s, e in selected:
+                parts.append(text[cursor:s])
+                parts.append(_mask_placeholder(value, kind))
+                cursor = e
+            parts.append(text[cursor:])
+            return ''.join(parts)
+        token_by_value: dict[str, str] = {}
+        for _, value, _, _ in selected:
+            if value not in token_by_value:
+                token_by_value[value] = await self.request_tokens.register(
+                    value, response_side
+                )
+        parts = []
+        cursor = 0
+        for _, value, s, e in selected:
+            token = token_by_value[value]
+            parts.append(text[cursor:s])
+            parts.append(token if token != value else value)
+            cursor = e
+        parts.append(text[cursor:])
+        return ''.join(parts)
 
     def close(self):
         """关闭独立线程池。"""
@@ -1817,11 +2036,11 @@ class PiiMixin:
         """
         if not self.pii_enabled or not text:
             return text
-        stripped = text.lstrip('\ufeff').lstrip()
+        stripped = _strip_bom(text).lstrip()
         if not (stripped.startswith(('{', '['))):
             return await self.pii_redact(text, response_side, tail=tail)
         try:
-            obj = _jloads(text.lstrip('\ufeff'))
+            obj = _jloads(_strip_bom(text))
         except Exception:
             return await self.pii_redact(text, response_side, tail=tail)
         cred_p2t = getattr(self, 'pwd_to_token', None)
@@ -1908,6 +2127,17 @@ class PiiMixin:
         # 无法定位可注入结构：不注入
         return False
 
+    @staticmethod
+    def _pii_placeholder_schema_ok(obj, protocol: str = 'openai') -> bool:
+        if not isinstance(obj, dict):
+            return False
+        if protocol == 'anthropic':
+            sys_field = obj.get('system')
+            return sys_field is None or isinstance(sys_field, (str, list))
+        if protocol == 'responses':
+            return isinstance(obj.get('input'), list)
+        return isinstance(obj.get('messages'), list)
+
     def inject_placeholder_prompt(self, body_text: str, protocol: str = 'openai'):
         """向脱敏后的请求 body 注入占位符说明提示词（同步纯函数）。
 
@@ -1920,11 +2150,11 @@ class PiiMixin:
         """
         if not body_text or not getattr(self, 'pii_placeholder_prompt_enabled', True):
             return body_text
-        stripped = body_text.lstrip('\ufeff').lstrip()
+        stripped = _strip_bom(body_text).lstrip()
         if not (stripped.startswith(('{', '['))):
             return body_text  # 非 JSON：透传不注入
         try:
-            obj = _jloads(body_text.lstrip('\ufeff'))
+            obj = _jloads(_strip_bom(body_text))
         except Exception:
             logger.debug(
                 'inject_placeholder_prompt 解析失败，透传原 body', exc_info=True
@@ -1935,6 +2165,18 @@ class PiiMixin:
         prompt = self._pii_placeholder_text()
         try:
             if self._pii_placeholder_inject_obj(obj, prompt, protocol):
+                if not self._pii_placeholder_schema_ok(obj, protocol):
+                    logger.warning(
+                        'inject_placeholder_prompt schema 校验失败，回退不注入: protocol=%s',
+                        protocol,
+                    )
+                    try:
+                        self._inject_schema_failed = (
+                            getattr(self, '_inject_schema_failed', 0) + 1
+                        )
+                    except Exception:
+                        pass
+                    return body_text
                 return _jdumps(obj)
         except Exception:
             logger.exception('inject_placeholder_prompt 注入异常，透传原 body')

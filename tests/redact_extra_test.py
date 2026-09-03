@@ -14,7 +14,6 @@ import time
 
 import pytest
 
-from _llm import is_chat_tail
 from _metrics import FLUSH_DEBOUNCE_S, MetricsCollector, redact_summary
 
 
@@ -222,10 +221,3 @@ class TestModelColon:
         assert m['requests'] == 1
         assert 'gpt-4o:2024-08-06' in m['tokens']
         assert 'unknown_model' not in m['tokens']
-
-
-class TestIsChatTailY11:
-    def test_suffix_variants(self):
-        assert is_chat_tail('/v1/chat/completions/') is True
-        assert is_chat_tail('/v1/chat/completions/custom') is True
-        assert is_chat_tail('/v1/chat/completions/a/b') is False

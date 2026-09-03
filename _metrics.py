@@ -332,11 +332,15 @@ def _redact_extra_pii(out: str) -> str:
                     continue
             if kind in ('ipv4', 'ipv6') and _is_reserved_ip(value, kind):
                 continue
-            out = out.replace(value, f'[REDACTED:{kind}]')
+            out = out.replace(value, redacted_tag(kind))
     except Exception:
         # fail-closed：脱敏兜底层异常不得放行明文（宁可标记摘要）
         return '[REDACTED:unverified]'
     return out
+
+
+def redacted_tag(kind: str) -> str:
+    return f'[REDACTED:{kind}]'
 
 
 def redact_summary(raw: str, limit: int = 120) -> str:
@@ -354,12 +358,12 @@ def redact_summary(raw: str, limit: int = 120) -> str:
     # 余量保证截断窗口内敏感值完整可识别；小文本直接全量走
     if len(raw) > limit * 3 + 512:
         raw = raw[: limit * 3 + 512]
-    out = _PII_TOKEN_RE.sub('[REDACTED:token]', raw)
+    out = _PII_TOKEN_RE.sub(redacted_tag('token'), raw)
     # _CRED_TOKEN_RE 已被 _PII_TOKEN_RE 覆盖（__VG_CRED_\d{4,}__ 是后者的子集），
     # 删除冗余 sub 避免死分支（保留正则定义供诊断/测试引用）
-    out = _API_KEY_RE.sub('[REDACTED:key]', out)
-    out = _EMAIL_RE.sub('[REDACTED:email]', out)
-    out = _PHONE_RE.sub('[REDACTED:phone]', out)
+    out = _API_KEY_RE.sub(redacted_tag('key'), out)
+    out = _EMAIL_RE.sub(redacted_tag('email'), out)
+    out = _PHONE_RE.sub(redacted_tag('phone'), out)
     out = _redact_extra_pii(out)
     if len(out) <= limit:
         return out

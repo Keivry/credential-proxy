@@ -292,3 +292,68 @@ async def test_json_walk_async_depth_bomb_native_nested():
     await json_walk_async(deep3, aleaf)
     assert len(calls) >= 1
     assert len(calls) <= 6
+
+
+@pytest.mark.asyncio
+async def test_three_wrappers_nasty_values_stay_valid_json():
+    from _pii import PiiDetector, PiiMixin
+    from _token import RequestScopedTokens, TokenMixin
+
+    nasty = json.dumps(
+        {
+            'pwd': 'p@ss"quote',
+            'uni': 'a1b',
+            'nested': json.dumps({'k': 'v1'}),
+            'list': ['x', 'y'],
+        }
+    )
+
+    token_obj = TokenMixin.__new__(TokenMixin)
+    token_obj.pwd_to_token = {'p@ss"quote': '__VG_CRED_000001__'}
+    token_obj.token_to_pwd = {'__VG_CRED_000001__': 'p@ss"quote'}
+    redacted = token_obj._redact_json_aware(nasty, token_obj.pwd_to_token)
+    assert json.loads(redacted)['pwd'] == '__VG_CRED_000001__'
+    restored = token_obj._restore_json_aware(redacted, token_obj.token_to_pwd)
+    assert json.loads(restored)['pwd'] == 'p@ss"quote'
+
+    class _PiiHarness(PiiMixin):
+        pass
+
+    pii_obj = _PiiHarness.__new__(_PiiHarness)
+    pii_obj.pii_enabled = True
+    pii_obj.pwd_to_token = None
+    pii_obj._pii_detector = PiiDetector(request_tokens=RequestScopedTokens())
+    pii_out = await pii_obj.pii_redact_json_aware(json.dumps({'phone': '13812345678'}))
+    assert '__PII_' in pii_out
+    assert json.loads(pii_out)
+
+    from _llm import LlmMixin as _LM
+    from _token import TokenMixin as _TM
+
+    class _Harness(_LM, _TM):
+        pass
+
+    llm_obj = _Harness.__new__(_Harness)
+    llm_obj.token_to_pwd = {'__VG_CRED_000001__': 'p@ss"quote'}
+    llm_out = await llm_obj._pii_response_process_json_aware(
+        json.dumps({'msg': 'hi __VG_CRED_000001__'}),
+        {'__VG_CRED_000001__': 'p@ss"quote'},
+    )
+    assert json.loads(llm_out)['msg'] == 'hi p@ss"quote'
+
+
+def test_three_validators_fallback_contract():
+    from _llm import _llm_validate_json_roundtrip
+    from _pii import _pii_validate_json_roundtrip
+    from _token import _validate_json_roundtrip
+
+    orig = '{"a":1}'
+    bad = '{"a":}'
+    for fn in (
+        _validate_json_roundtrip,
+        _llm_validate_json_roundtrip,
+        _pii_validate_json_roundtrip,
+        _validate_json_roundtrip,
+    ):
+        assert fn(orig, bad, 't') == orig
+        assert fn('plain', bad, 't') == bad
