@@ -357,3 +357,37 @@ def test_three_validators_fallback_contract():
     ):
         assert fn(orig, bad, 't') == orig
         assert fn('plain', bad, 't') == bad
+
+
+def test_nonstream_oversize_boundary():
+    from _llm import NONSTREAM_MAX_BYTES, _is_nonstream_oversize
+
+    assert NONSTREAM_MAX_BYTES == 8 * 1024 * 1024
+    assert _is_nonstream_oversize(2 * 1024 * 1024, '/v1/chat/completions') is False
+    assert _is_nonstream_oversize(9 * 1024 * 1024, '/v1/chat/completions') is True
+    assert _is_nonstream_oversize(9 * 1024 * 1024, '/v1/models') is False
+
+
+def test_block_body_shapes_and_model_passthrough():
+    import json as _json
+
+    from _llm import _build_block_body
+
+    chat = _json.loads(_build_block_body('/v1/chat/completions', 'gpt-4o'))
+    assert chat['choices'][0]['message']['role'] == 'assistant'
+    assert chat['choices'][0]['finish_reason'] == 'stop'
+    assert chat['model'] == 'gpt-4o'
+    chat_nomodel = _json.loads(_build_block_body('/v1/chat/completions', None))
+    assert 'model' not in chat_nomodel
+
+    msg = _json.loads(_build_block_body('/v1/messages', 'claude-x'))
+    assert msg['type'] == 'message'
+    assert msg['stop_reason'] == 'end_turn'
+    assert msg['model'] == 'claude-x'
+    assert msg['usage'] == {'input_tokens': 0, 'output_tokens': 1}
+
+    resp = _json.loads(_build_block_body('/v1/responses', None))
+    assert resp['id'] == 'blocked'
+    assert resp['status'] == 'completed'
+    assert resp['output'][0]['content'][0]['type'] == 'output_text'
+    assert 'model' not in resp

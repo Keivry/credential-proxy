@@ -1285,32 +1285,39 @@ class PiiDetector:
         self,
         text: str,
         protected_spans: list[tuple[int, int]] | None = None,
-    ) -> list[tuple[str, str]]:
-        """扫描自定义正则（带 ReDoS 守卫）。返回 [(type, value)]。
+        cred_spans: list[tuple[int, int]] | None = None,
+    ) -> list[tuple[str, str, int, int]]:
+        """扫描自定义正则（带 ReDoS 守卫）。返回 [(type, value, start, end)]。
+
+        位置为含分块偏移的绝对区间；调用方不得再用 str.find 重定位
+        （重复值/重叠值下错位）。分块 overlap 区同一 span 按 (s,e) 去重。
 
         硬化闸：PII_DETECTION_HARDENING=1 时用 ThreadPoolExecutor + asyncio.timeout(0.1)
         单规则预算 + 连续 3 次停用；默认 0 时直跑 finditer（bypass）以保既有用例
         仍绿但不具超时防护（spec 要求默认关闭不改现有行为，硬化场景才卡死防护）。
         超时 → 跳过该规则 + 记告警（fail-open 但必报）；连续 3 次停用。
         protected_spans: 占位符区间（重叠排除）。
+        cred_spans: 凭据区间（位置化优先，落入则跳过）。
         """
         if not self.custom_patterns or not text:
             return []
-        # 超长输入限制：分块（≤1MB）— 超限按 1M 分块迭代而非截断丢尾（7.6）
-        # 非超限直接跑单 chunk；超限分块循环在下方 for chunk 中处理
         loop = asyncio.get_running_loop()
-        hits: list[tuple[str, str]] = []
+        hits: list[tuple[str, str, int, int]] = []
 
         def _overlaps(start: int, end: int) -> bool:
-            if not protected_spans:
-                return False
-            # 双向：匹配端点落入占位符区间，或占位符区间落在匹配内部
-            return any(
-                s <= start < e or s < end <= e or (start <= s and e <= end)
-                for s, e in protected_spans
-            )
+            for spans in (protected_spans, cred_spans):
+                if not spans:
+                    continue
+                if any(
+                    s <= start < e or s < end <= e or (start <= s and e <= end)
+                    for s, e in spans
+                ):
+                    return True
+            return False
 
         hardening = True
+        # 跨界保证上限：overlap 取 max(256, 最长 custom 源串, 上限 4096)；
+        # 单个匹配跨度超过 overlap 仍可能被分块切断漏检（已知限制）。
         overlap = 256
         try:
             longest = 0
@@ -1348,7 +1355,7 @@ class PiiDetector:
                             if _overlaps(abs_s, abs_e):
                                 continue
                             seen_spans.add((abs_s, abs_e))
-                            hits.append((name, m.group(0)))
+                            hits.append((name, m.group(0), abs_s, abs_e))
                 else:
                     for _chunk_offset, _chunk in _chunks:
                         for m in compiled.finditer(_chunk):
@@ -1359,7 +1366,7 @@ class PiiDetector:
                             if _overlaps(abs_s, abs_e):
                                 continue
                             seen_spans.add((abs_s, abs_e))
-                            hits.append((name, m.group(0)))
+                            hits.append((name, m.group(0), abs_s, abs_e))
                 # 成功：清零超时计数（硬化时才有 strikes）
                 if hardening:
                     self.custom_strikes.pop(name, None)
@@ -1427,33 +1434,13 @@ class PiiDetector:
     ) -> list[tuple[str, str]]:
         """独立扫描字典（不并入联合正则，防 alternation 分支爆炸）。
 
-        硬化闸：PII_DETECTION_HARDENING=1 时独立扫描 + CJK 边界 + dict_ver 缓存；
-        默认 0 时仍独立扫描（不并入联合）但走简化边界，5000 名单 ≤1ms 锚点仍满足。
-        凭据重叠值策略：字典命中的值若在凭据注册表中 → 跳过（凭据优先）。
+        2-tuple 兼容薄层，正本见 _scan_dict_spans（位置化区间语义；
+        凭据区间落入跳过，同值非凭据位置正常返回）。
         """
-        if not self.dict_re or not text:
-            return []
-        hits: list[tuple[str, str]] = []
-        seen: set[str] = set()
-        for m in self.dict_re.finditer(text):
-            name = m.group(0)
-            if name in seen:
-                continue
-            if credential_p2t and name in credential_p2t:
-                continue
-            # 边界判定按类型：中文人名（name 类型）用 CJK 边界
-            # （张三不误伤张三丰）；数字/主机名类（emp_no/hostname 等）
-            # 只挡 ASCII 字母数字粘连（员工4999在 应命中）
-            typ = 'name'
-            for n, t in self.dict_entries:
-                if n == name:
-                    typ = t
-                    break
-            if not self._dict_boundary_ok(text, m.start(), m.end(), typ):
-                continue
-            seen.add(name)
-            hits.append((typ, name))
-        return hits
+        return [
+            (typ, name)
+            for typ, name, _, _ in self._scan_dict_spans(text, credential_p2t)
+        ]
 
     @staticmethod
     def _dict_boundary_ok(text: str, start: int, end: int, typ: str) -> bool:
@@ -1580,43 +1567,12 @@ class PiiDetector:
                     continue
                 spans.append((kind, value, s, e))
         if self.custom_patterns:
-            custom_hits = await self._scan_custom_spans(
-                text, protected_spans, cred_spans
-            )
+            custom_hits = await self._scan_custom(text, protected_spans, cred_spans)
             spans.extend(custom_hits)
         if self.dict_re:
             dict_hits = self._scan_dict_spans(text, credential_p2t, cred_spans)
             spans.extend(dict_hits)
         return spans
-
-    async def _scan_custom_spans(
-        self,
-        text: str,
-        protected_spans: list[tuple[int, int]] | None = None,
-        cred_spans: list[tuple[int, int]] | None = None,
-    ) -> list[tuple[str, str, int, int]]:
-        """自定义正则的位置化扫描（供 scan_spans 复用，含分块绝对偏移）。"""
-        raw = await self._scan_custom(text, protected_spans)
-        if not raw:
-            return []
-        out: list[tuple[str, str, int, int]] = []
-        cursor = 0
-        for name, value in raw:
-            idx = text.find(value, cursor)
-            if idx == -1:
-                idx = text.find(value)
-            if idx == -1:
-                continue
-            s, e = idx, idx + len(value)
-            if cred_spans and any(
-                cs <= s < ce or cs < e <= ce or (s <= cs and ce <= e)
-                for cs, ce in cred_spans
-            ):
-                cursor = e
-                continue
-            out.append((name, value, s, e))
-            cursor = e
-        return out
 
     def _scan_dict_spans(
         self,
@@ -1660,87 +1616,18 @@ class PiiDetector:
     ) -> list[tuple[str, str]]:
         """检测文本中的 PII，返回 [(type, value)] 列表（不替换）。
 
-        credential_p2t: 全局凭据映射（重叠值策略：凭据命中的值 PII 跳过）。
+        2-tuple 兼容薄层，正本见 scan_spans（位置化区间语义）。
+        credential_p2t: 全局凭据映射（凭据区间落入跳过，同值非凭据位置正常返回）。
         tail: 请求路径尾（is_chat_tail 守门，值级采样仅对话路径；None 时不采样）。
         """
         if not text:
             return []
-        # base64 data URL 排除（对 base64 跑正则误报会损坏图像数据）
-        protected_spans: list[tuple[int, int]] = []
-        for m in _DATA_URL_RE.finditer(text):
-            protected_spans.append((m.start(), m.end()))
-        # 占位符区间重叠排除（硬性）：PII 不得作用于 __VG_CRED_*__/__PII_*__ 区间
-        for m in _PROTECTED_TOKEN_RE.finditer(text):
-            protected_spans.append((m.start(), m.end()))
-
-        hits: list[tuple[str, str]] = []
-        # 粗筛：无 [\dA-Za-z@.\-] 的纯文本跳过内置（25x 加速）。
-        # custom 独立豁免：纯中文自定义正则仍需扫描；字典独立于粗筛。
-        if not _COARSE_FILTER_RE.search(text):
-            if self.custom_patterns:
-                hits.extend(await self._scan_custom(text, protected_spans))
-            if self.dict_re:
-                hits.extend(self._scan_dict(text, credential_p2t))
-            self._count_detected(hits)
-            return hits
-
-        def _overlaps_protected(start: int, end: int) -> bool:
-            """双向重叠：端点落入占位符区间，或占位符区间落在匹配内部。"""
-            return any(
-                s <= start < e or s < end <= e or (start <= s and e <= end)
-                for s, e in protected_spans
+        hits: list[tuple[str, str]] = [
+            (kind, value)
+            for kind, value, _, _ in await self.scan_spans(
+                text, credential_p2t, tail=tail
             )
-
-        # 内置联合正则
-        for m in _get_combined_re().finditer(text):
-            if _overlaps_protected(m.start(), m.end()):
-                continue
-            kind = m.lastgroup
-            value = m.group(0)
-            if kind is None:
-                continue
-            # IPv6：正则粗筛后用标准库二次校验（用户要求：粗筛→标准库）
-            if kind == 'ipv6':
-                # 粗筛尾部 `[0-9a-fA-F:.]*` 贪婪可能粘连句子标点（如 `2001:db8::1.`），
-                # 剥掉尾随标点后再校验，避免合法 IPv6 因粘连标点被误判非法而漏脱敏
-                core = value.rstrip('.,;)]}')
-                if core and _is_valid_ipv6(core):
-                    value = core
-                elif not _is_valid_ipv6(value):
-                    continue
-            # IPv4：正则粗筛后用标准库二次校验（0-255 逐段），防 999.999.999.999 误脱敏
-            if kind == 'ipv4':
-                core = value.rstrip('.,;)]}')
-                if core and _is_valid_ipv4(core):
-                    value = core
-                elif not _is_valid_ipv4(value):
-                    continue
-            # URL 上下文防误报：?id= 等参数长数字不判银行卡。
-            # `_URL_QUERY_PARAM_RE.search(value)` 对纯数字卡号恒 False（死码）——
-            # 须检查 match 前后的 URL 参数上下文（与 _metrics.redact_summary Y-13b 同法）
-            if kind == 'bank_card':
-                ctx_start = max(0, m.start() - 64)
-                ctx_end = min(len(text), m.end() + 16)
-                if _URL_QUERY_PARAM_RE.search(text[ctx_start:ctx_end]):
-                    continue
-            # 校验位/上下文强化
-            if kind == 'id_card' and not _id_card_ok(value):
-                continue
-            if kind == 'bank_card' and not _luhn_ok(value):
-                continue
-            # 保留地址豁免
-            if kind in ('ipv4', 'ipv6') and _is_reserved_ip(value, kind):
-                continue
-            # 重叠值策略：凭据注册表命中的值优先走凭据路径
-            if credential_p2t and value in credential_p2t:
-                continue
-            hits.append((kind, value))
-        # 自定义正则（带占位符区间重叠排除）
-        if self.custom_patterns:
-            hits.extend(await self._scan_custom(text, protected_spans))
-        # 字典（独立扫描，凭据重叠值同样跳过）
-        if self.dict_re:
-            hits.extend(self._scan_dict(text, credential_p2t))
+        ]
         self._count_detected(hits)
         # ── 值级掩码采样（dashboard-pii-value-details 2.2）──
         # 明文仅在命中回调作用域内可见，仅掩码+hash 进 ContextVar

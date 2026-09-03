@@ -843,6 +843,15 @@ class AuditMixin:
                 TypeError,
             ) as e:  # pragma: no cover — scope 异常不影响审计
                 logger.debug('审计日志脱敏 scope 访问异常: %s', e)
+        try:
+            cred_map = getattr(self, 'token_to_pwd', None) or {}
+            if cred_map:
+                ordered = sorted(cred_map.items(), key=lambda kv: -len(kv[1] or ''))
+                for tok, plain in ordered:
+                    if tok and plain and plain in text:
+                        text = text.replace(plain, tok)
+        except Exception:  # pragma: no cover — 凭据回掩失败不影响审计
+            logger.debug('审计日志凭据回掩异常', exc_info=True)
         return redact_summary(text)
 
     async def _audit_log_event(

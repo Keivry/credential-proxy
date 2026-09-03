@@ -430,6 +430,20 @@ class TestAuditLog:
         assert '[REDACTED:api_key]' in text
 
     @pytest.mark.asyncio
+    async def test_restored_credential_not_in_log(self, tmp_path):
+        stub = self._stub(tmp_path)
+        stub.token_to_pwd = {'__VG_CRED_000001__': 'MyS3cret!NoPattern'}
+        await stub._audit_log_event(
+            'deny',
+            'bash',
+            '{"cmd":"deploy MyS3cret!NoPattern now"}',
+            'dangerous-shell',
+        )
+        text = (tmp_path / 'audit.log').read_text()
+        assert 'MyS3cret!NoPattern' not in text
+        assert '__VG_CRED_000001__' in text
+
+    @pytest.mark.asyncio
     async def test_ctrl_chars_stripped(self, tmp_path):
         """控制字符被剥离（防日志注入伪造条目）。"""
         stub = self._stub(tmp_path)

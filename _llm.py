@@ -159,6 +159,12 @@ except ImportError:  # pragma: no cover
     LINE_BUF_FLUSH = 16384
     LINE_BUF_MAX_AGE = 30
     KEEPALIVE_INTERVAL = 10
+try:
+    NONSTREAM_MAX_BYTES = int(os.environ.get('NONSTREAM_MAX_BYTES', '8388608'))
+    if NONSTREAM_MAX_BYTES < 1:
+        NONSTREAM_MAX_BYTES = 8388608
+except (ValueError, TypeError):
+    NONSTREAM_MAX_BYTES = 8388608
 # 流末清理：匹配 token 前缀/残缺形态（含完整但未还原的幻觉 token）。
 # 真实 token 会被 _restore 先行还原为明文，不会落此正则。
 # 8.9 修复（F-10）：结尾 `(?:$|(?=\s|[^\w]))` 覆盖行中残缺形态。
@@ -272,6 +278,10 @@ def is_chat_tail(tail: str) -> bool:
             if suffix and '/' not in suffix:
                 return True
     return False
+
+
+def _is_nonstream_oversize(length: int, tail: str) -> bool:
+    return length > NONSTREAM_MAX_BYTES and is_chat_tail(tail)
 
 
 def _capture_usage_ctx(payload: str, metrics_ctx: dict, protocol: str) -> None:
@@ -1294,6 +1304,64 @@ def _extract_tool_calls_non_stream(
         return calls
 
     return []
+
+
+def _build_block_body(tail_norm: str, block_model: str | None) -> str:
+    if tail_norm.endswith('chat/completions'):
+        obj: dict = {
+            'choices': [
+                {
+                    'index': 0,
+                    'message': {
+                        'role': 'assistant',
+                        'content': BLOCK_MESSAGE,
+                    },
+                    'finish_reason': 'stop',
+                }
+            ]
+        }
+        if block_model:
+            obj['model'] = block_model
+        return _jdumps(obj)
+    if tail_norm.endswith(('messages', 'v1/messages')):
+        obj = {
+            'id': 'blocked',
+            'type': 'message',
+            'role': 'assistant',
+            'content': [
+                {
+                    'type': 'text',
+                    'text': BLOCK_MESSAGE,
+                }
+            ],
+            'stop_reason': 'end_turn',
+            'usage': {
+                'input_tokens': 0,
+                'output_tokens': 1,
+            },
+        }
+        if block_model:
+            obj['model'] = block_model
+        return _jdumps(obj)
+    obj = {
+        'id': 'blocked',
+        'status': 'completed',
+        'output': [
+            {
+                'type': 'message',
+                'role': 'assistant',
+                'content': [
+                    {
+                        'type': 'output_text',
+                        'text': BLOCK_MESSAGE,
+                    }
+                ],
+            }
+        ],
+    }
+    if block_model:
+        obj['model'] = block_model
+    return _jdumps(obj)
 
 
 # 规范化分隔符集合（design D2 skip 判定）：[-. ] 连字符、点、空格
@@ -7116,6 +7184,23 @@ class LlmMixin(AuditMixin):
                                                     _cr_is_terminal = True
                                             except Exception:
                                                 pass
+                                            if (
+                                                not _cr_is_terminal
+                                                and fast_event_pending
+                                            ):
+                                                _cr_ev_head = fast_event_pending[-1]
+                                                if isinstance(_cr_ev_head, str) and (
+                                                    _cr_ev_head.strip()
+                                                    in (
+                                                        'event: message_stop',
+                                                        'event: error',
+                                                        'event: response.completed',
+                                                        'event: response.failed',
+                                                        'event: response.incomplete',
+                                                        'event: response.error',
+                                                    )
+                                                ):
+                                                    _cr_is_terminal = True
                                         if _cr_is_terminal:
                                             fast_seen_terminal = True
                                             fast_seen_global_terminal = True
@@ -7521,11 +7606,11 @@ class LlmMixin(AuditMixin):
                         # 仅对话接口转 502，非对话（如 /v1/models）空体按原样透传
                         _is_empty = not resp_text.strip()
                         _is_invalid_json = False
-                        if len(resp_body) > SSE_MAX_BUF and is_chat_tail(tail):
+                        if _is_nonstream_oversize(len(resp_body), tail):
                             logger.warning(
                                 'LLM 非流式超限 fail-closed: len=%d limit=%d tail=%s',
                                 len(resp_body),
-                                SSE_MAX_BUF,
+                                NONSTREAM_MAX_BYTES,
                                 tail,
                             )
                             try:
@@ -7699,62 +7784,11 @@ class LlmMixin(AuditMixin):
                                     _block_model = _req_model
                             except Exception:
                                 _block_model = None
-                            if _tail_norm.endswith('chat/completions'):
-                                _block_obj: dict = {
-                                    'choices': [
-                                        {
-                                            'index': 0,
-                                            'message': {
-                                                'role': 'assistant',
-                                                'content': BLOCK_MESSAGE,
-                                            },
-                                            'finish_reason': 'stop',
-                                        }
-                                    ]
-                                }
-                                if _block_model:
-                                    _block_obj['model'] = _block_model
-                                _block_body = _jdumps(_block_obj)
-                            elif _tail_norm.endswith(('messages', 'v1/messages')):
-                                _block_obj = {
-                                    'id': 'blocked',
-                                    'type': 'message',
-                                    'role': 'assistant',
-                                    'content': [
-                                        {
-                                            'type': 'text',
-                                            'text': BLOCK_MESSAGE,
-                                        }
-                                    ],
-                                    'stop_reason': 'end_turn',
-                                    'usage': {
-                                        'input_tokens': 0,
-                                        'output_tokens': 1,
-                                    },
-                                }
-                                if _block_model:
-                                    _block_obj['model'] = _block_model
-                                _block_body = _jdumps(_block_obj)
-                            else:
-                                _block_obj = {
-                                    'id': 'blocked',
-                                    'status': 'completed',
-                                    'output': [
-                                        {
-                                            'type': 'message',
-                                            'role': 'assistant',
-                                            'content': [
-                                                {
-                                                    'type': 'output_text',
-                                                    'text': BLOCK_MESSAGE,
-                                                }
-                                            ],
-                                        }
-                                    ],
-                                }
-                                if _block_model:
-                                    _block_obj['model'] = _block_model
-                                _block_body = _jdumps(_block_obj)
+                            if not _block_model:
+                                logger.debug(
+                                    '阻断包缺省 model（上游与请求均无 model，严格 SDK 自行容错）'
+                                )
+                            _block_body = _build_block_body(_tail_norm, _block_model)
                             return web.Response(
                                 body=_block_body.encode('utf-8'),
                                 status=200,

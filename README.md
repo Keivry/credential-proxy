@@ -417,16 +417,15 @@ get register --name "my-script" \
 ### 本地运行
 
 ```bash
-# Python 虚拟环境
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
+# uv 同步开发依赖（含 pytest/pytest-asyncio/ruff/openai/anthropic，
+# 声明于 pyproject [dependency-groups] dev）
+uv sync --group dev
 
 # 运行测试
-PYTHONPATH="." pytest -q
+uv run pytest -q
 
 # 启动开发版（自动批准，无需 Matrix）
-CREDENTIAL_MASTER_PASSWORD="your-pw" python3 credential-proxy-only.py
+CREDENTIAL_MASTER_PASSWORD="your-pw" uv run python credential-proxy-only.py
 ```
 
 ### Go 客户端构建
