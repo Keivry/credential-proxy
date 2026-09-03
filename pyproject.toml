@@ -3,10 +3,8 @@ name = "credential-proxy"
 version = "0.9.45"
 description = "三因子认证凭据代理服务 — Matrix 审批 + TPM 硬件解封 + KeePassXC 后端 + LLM 脱敏反向代理"
 requires-python = ">=3.12"
-license = {text = "MIT"}
-authors = [
-    {name = "Keivry"},
-]
+license = { text = "MIT" }
+authors = [{ name = "Keivry" }]
 dependencies = [
     "aiohttp>=3.9",
     "matrix-nio>=0.7",
@@ -18,16 +16,7 @@ dependencies = [
 Repository = "https://github.com/Keivry/credential-proxy"
 
 [project.optional-dependencies]
-dev = [
-    'pytest>=9.1.1',
-    'pytest-asyncio>=1.4.0',
-    # 仅测试：真实 SDK 端到端验证三协议 SSE 规范符合性（10.14 API-SPEC）
-    'openai>=1.60.0',
-    'anthropic>=0.40.0',
-]
-orjson = [
-    'orjson>=3.9',
-]
+orjson = ['orjson>=3.9']
 
 [build-system]
 requires = ["hatchling"]
@@ -39,17 +28,28 @@ only-include = ["proxy.py"]
 [tool.ruff.lint]
 ignore = [
     # 中文注释中的全角字符（：（）等）是正确的中文标点，不是混淆
-    'RUF001', 'RUF002', 'RUF003',
+    'RUF001',
+    'RUF002',
+    'RUF003',
     # docstring 格式（中文项目不适用英文标点规则）
-    'D400', 'D415',
+    'D400',
+    'D415',
     # 函数复杂度（历史遗留）
-    'C901', 'PLR0915',
+    'C901',
+    'PLR0915',
     # 缺少返回类型注解（历史遗留，不阻塞运行）
-    'ANN202', 'ANN201', 'ANN001', 'ANN002',
+    'ANN202',
+    'ANN201',
+    'ANN001',
+    'ANN002',
     # 盲捕获 Exception（历史遗留：debug 落盘/JSON 回退等处有意全捕获，0.16 后默认启用）
     'BLE001',
     # ruff 0.16 新增默认规则中的历史遗留噪音（意图性 pass/多重 startswith）
-    'S110', 'S113', 'SIM115', 'PIE810', 'FURB122',
+    'S110',
+    'S113',
+    'SIM115',
+    'PIE810',
+    'FURB122',
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -58,7 +58,15 @@ ignore = [
 "tests/llm_test.py" = ["D", "ANN", "S", "E402"]
 "tests/sse_stream_loop_test.py" = ["D", "ANN", "S", "E402"]
 "tests/matrix_test.py" = ["D", "ANN", "S", "E402"]
-"tests/residual_hardening_test.py" = ["D", "ANN", "S", "E402", "E741", "RUF059", "F841"]
+"tests/residual_hardening_test.py" = [
+    "D",
+    "ANN",
+    "S",
+    "E402",
+    "E741",
+    "RUF059",
+    "F841",
+]
 "scripts/sentinel_record.py" = ["D", "ANN", "S", "E402", "F841"]
 
 [tool.ruff.format]
@@ -69,4 +77,7 @@ dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.16.4",
+    # 仅测试：真实 SDK 端到端验证三协议 SSE 规范符合性（10.14 API-SPEC）
+    'openai>=1.60.0',
+    'anthropic>=0.40.0',
 ]

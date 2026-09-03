@@ -12,3 +12,4 @@ tpm/*
 db/*.kdbx
 db/*.key
 .hermes/
+.sisyphus/
